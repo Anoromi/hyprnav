@@ -28,6 +28,23 @@ typedef void (*origAddDamageB)(void*, const pixman_region32_t*);
 
 static bool g_unloading = false;
 
+static void cleanupHooks() {
+    if (g_pRenderWorkspaceHook) {
+        g_pRenderWorkspaceHook->unhook();
+        g_pRenderWorkspaceHook = nullptr;
+    }
+
+    if (g_pAddDamageHookA) {
+        g_pAddDamageHookA->unhook();
+        g_pAddDamageHookA = nullptr;
+    }
+
+    if (g_pAddDamageHookB) {
+        g_pAddDamageHookB->unhook();
+        g_pAddDamageHookB = nullptr;
+    }
+}
+
 static std::string pluginClientHash() {
     static const auto stripPatch = [](const char* ver) -> std::string {
         std::string_view v = ver;
@@ -301,10 +318,13 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
-    g_pHyprRenderer->m_renderPass.removeAllOfType("COverviewPassElement");
+    g_unloading       = true;
+    renderingOverview = false;
 
-    g_unloading = true;
+    g_pHyprRenderer->m_renderPass.removeAllOfType("COverviewPassElement");
     g_pPreviewManager.reset();
+    g_pOverview.reset();
+    cleanupHooks();
 
     g_pConfigManager->reload(); // we need to reload now to clear all the gestures
 }
