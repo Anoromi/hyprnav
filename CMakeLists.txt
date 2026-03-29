@@ -7,10 +7,13 @@ project(hyprland-plugins
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+include(CTest)
+
 add_subdirectory(borders-plus-plus)
 add_subdirectory(csgo-vulkan-fix)
 add_subdirectory(hyprbars)
 add_subdirectory(hyprexpo)
+add_subdirectory(hyprexpo-switcher)
 add_subdirectory(hyprfocus)
 add_subdirectory(hyprscrolling)
 add_subdirectory(hyprtrails)

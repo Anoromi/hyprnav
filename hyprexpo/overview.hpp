@@ -6,7 +6,6 @@
 #include <hyprland/src/desktop/DesktopTypes.hpp>
 #include <hyprland/src/render/Framebuffer.hpp>
 #include <hyprland/src/helpers/AnimatedVariable.hpp>
-#include <hyprland/src/event/EventBus.hpp>
 #include <vector>
 
 // saves on resources, but is a bit broken rn with blur.
@@ -23,7 +22,6 @@ class COverview {
     void render();
     void damage();
     void onDamageReported();
-    void onPreRender();
 
     void setClosing(bool closing);
 
@@ -42,6 +40,8 @@ class COverview {
     bool          m_isSwiping = false;
 
   private:
+    void       scheduleDeferredRedraw();
+    void       runDeferredRedraw();
     void       redrawID(int id, bool forcelowres = false);
     void       redrawAll(bool forcelowres = false);
     void       onWorkspaceChange();
@@ -52,6 +52,7 @@ class COverview {
     CHyprColor BG_COLOR    = CHyprColor{0.1, 0.1, 0.1, 1.0};
 
     bool       damageDirty = false;
+    bool       redrawQueued = false;
 
     struct SWorkspaceImage {
         CFramebuffer fb;
@@ -73,11 +74,6 @@ class COverview {
     PHLANIMVAR<Vector2D>         pos;
 
     bool                         closing = false;
-
-    CHyprSignalListener          mouseMoveHook;
-    CHyprSignalListener          mouseButtonHook;
-    CHyprSignalListener          touchMoveHook;
-    CHyprSignalListener          touchDownHook;
 
     bool                         swipe             = false;
     bool                         swipeWasCommenced = false;

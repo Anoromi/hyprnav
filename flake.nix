@@ -39,6 +39,8 @@
         hyprwinwrap
         xtra-dispatchers
         ;
+
+      hyprexpo-switcher = pkgsFor.${system}.callPackage ./hyprexpo-switcher {};
     });
 
     overlays = {
@@ -61,6 +63,8 @@
             hyprwinwrap = callPackage ./hyprwinwrap {};
             xtra-dispatchers = callPackage ./xtra-dispatchers {};
           };
+
+        hyprexpo-switcher = callPackage ./hyprexpo-switcher {};
       };
     };
 
@@ -70,7 +74,15 @@
       with pkgsFor.${system}; {
         default = mkShell.override {stdenv = gcc14Stdenv;} {
           name = "hyprland-plugins";
-          buildInputs = [hyprland.packages.${system}.hyprland];
+          buildInputs = [
+            hyprland.packages.${system}.hyprland
+            qt6.qtbase
+            qt6.qtdeclarative
+            qt6.qtwayland
+            kdePackages."layer-shell-qt"
+            pkg-config
+            cmake
+          ];
           inputsFrom = [hyprland.packages.${system}.hyprland];
         };
       });

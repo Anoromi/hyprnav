@@ -210,30 +210,6 @@ COverview::COverview(PHLWORKSPACE startedOn_, bool swipe_) : startedOn(startedOn
 
     lastMousePosLocal = g_pInputManager->getMouseCoordsInternal() - pMonitor->m_position;
 
-    auto onCursorMove = [this](Event::SCallbackInfo& info) {
-        if (closing)
-            return;
-
-        info.cancelled    = true;
-        lastMousePosLocal = g_pInputManager->getMouseCoordsInternal() - pMonitor->m_position;
-    };
-
-    auto onCursorSelect = [this](Event::SCallbackInfo& info) {
-        if (closing)
-            return;
-
-        info.cancelled = true;
-
-        selectHoveredWorkspace();
-
-        close();
-    };
-
-    mouseMoveHook = Event::bus()->m_events.input.mouse.move.listen([onCursorMove](Vector2D, Event::SCallbackInfo& info) { onCursorMove(info); });
-    touchMoveHook = Event::bus()->m_events.input.touch.motion.listen([onCursorMove](ITouch::SMotionEvent, Event::SCallbackInfo& info) { onCursorMove(info); });
-
-    mouseButtonHook = Event::bus()->m_events.input.mouse.button.listen([onCursorSelect](IPointer::SButtonEvent, Event::SCallbackInfo& info) { onCursorSelect(info); });
-    touchDownHook   = Event::bus()->m_events.input.touch.down.listen([onCursorSelect](ITouch::SDownEvent, Event::SCallbackInfo& info) { onCursorSelect(info); });
 }
 
 void COverview::selectHoveredWorkspace() {
@@ -352,6 +328,7 @@ void COverview::onDamageReported() {
     g_pHyprRenderer->damageBox(texbox);
     blockDamageReporting = false;
     g_pCompositor->scheduleFrameForMonitor(pMonitor.lock());
+    scheduleDeferredRedraw();
 }
 
 void COverview::close() {
@@ -400,11 +377,26 @@ void COverview::close() {
     size->setCallbackOnEnd([](auto) { g_pEventLoopManager->doLater([] { g_pOverview.reset(); }); });
 }
 
-void COverview::onPreRender() {
-    if (damageDirty) {
-        damageDirty = false;
-        redrawID(closing ? (closeOnID == -1 ? openedID : closeOnID) : openedID);
-    }
+void COverview::scheduleDeferredRedraw() {
+    if (redrawQueued)
+        return;
+
+    redrawQueued = true;
+    g_pEventLoopManager->doLater([] {
+        if (!g_pOverview)
+            return;
+
+        g_pOverview->runDeferredRedraw();
+    });
+}
+
+void COverview::runDeferredRedraw() {
+    redrawQueued = false;
+    if (!damageDirty)
+        return;
+
+    damageDirty = false;
+    redrawID(closing ? (closeOnID == -1 ? openedID : closeOnID) : openedID);
 }
 
 void COverview::onWorkspaceChange() {

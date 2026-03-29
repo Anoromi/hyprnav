@@ -4,6 +4,7 @@ project('hyprexpo', 'cpp',
 )
 
 cpp_compiler = meson.get_compiler('cpp')
+jpeg_dep = cpp_compiler.find_library('jpeg', required: true)
 if cpp_compiler.has_argument('-std=c++23')
   add_global_arguments('-std=c++23', language: 'cpp')
 elif cpp_compiler.has_argument('-std=c++2b')
@@ -18,10 +19,14 @@ add_project_arguments(
   ],
   language: 'cpp')
 
-globber = run_command('find', '.', '-name', '*.cpp', check: true)
-src = globber.stdout().strip().split('\n')
-
-hyprland = dependency('hyprland')
+src = files(
+  'main.cpp',
+  'overview.cpp',
+  'ExpoGesture.cpp',
+  'OverviewPassElement.cpp',
+  'PreviewManager.cpp',
+  'common.cpp',
+)
 
 shared_module(meson.project_name(), src,
   dependencies: [
@@ -33,6 +38,7 @@ shared_module(meson.project_name(), src,
     dependency('libudev'),
     dependency('wayland-server'),
     dependency('xkbcommon'),
+    jpeg_dep,
   ],
   install: true,
 )
