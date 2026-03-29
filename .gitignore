@@ -40,3 +40,7 @@ result-man
 
 build/
 .cache/
+
+# Rust / cxx-qt
+hyprexpo-switcher/target/
+hyprexpo-switcher/.current-path

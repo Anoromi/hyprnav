@@ -2,12 +2,13 @@ import QtQuick
 import QtQuick.Window
 import QtQuick.Controls
 import QtQuick.Layouts
+import com.anoromi.hyprexpo.switcher 1.0
 
 Window {
     id: root
     width: Screen.width
     height: Screen.height
-    visible: false
+    visible: Controller.visible
     color: "transparent"
     title: "Hyprexpo Switcher"
     flags: Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
@@ -18,6 +19,54 @@ Window {
         id: keyHandler
         anchors.fill: parent
         focus: true
+
+        Keys.onPressed: event => {
+            if (event.key === Qt.Key_Tab && (event.modifiers & (Qt.AltModifier | Qt.MetaModifier))) {
+                if (event.modifiers & Qt.ShiftModifier)
+                    Controller.selectPrevious()
+                else
+                    Controller.selectNext()
+                event.accepted = true
+                return
+            }
+
+            if (event.key === Qt.Key_Right || event.key === Qt.Key_Down) {
+                Controller.selectNext()
+                event.accepted = true
+                return
+            }
+
+            if (event.key === Qt.Key_Left || event.key === Qt.Key_Up) {
+                Controller.selectPrevious()
+                event.accepted = true
+                return
+            }
+
+            if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter) {
+                Controller.activateCurrent()
+                event.accepted = true
+                return
+            }
+
+            if (event.key === Qt.Key_Escape) {
+                Controller.cancel()
+                event.accepted = true
+            }
+        }
+
+        Keys.onReleased: event => {
+            if (event.key === Qt.Key_Alt || event.key === Qt.Key_Meta || event.key === Qt.Key_Super_L || event.key === Qt.Key_Super_R) {
+                Controller.handleModifierReleased()
+                event.accepted = true
+            }
+        }
+
+        Timer {
+            interval: 40
+            running: true
+            repeat: true
+            onTriggered: Controller.pumpBackendEvents()
+        }
 
         Rectangle {
             anchors.fill: parent
@@ -31,17 +80,19 @@ Window {
             property int cardHeight: 216
             property int horizontalSpacing: 14
             property int verticalSpacing: 16
+            property int cellWidth: cardWidth + horizontalSpacing
+            property int cellHeight: cardHeight + verticalSpacing
             property int workspaceCount: Math.max(0, workspaceGrid.count)
             property int columnCount: Math.max(1, Math.min(workspaceCount, root.maxGridColumns))
             property int rowCount: workspaceCount > 0 ? Math.ceil(workspaceCount / columnCount) : 1
 
             width: Math.min(
                 root.width - 72,
-                columnCount * cardWidth + Math.max(0, columnCount - 1) * horizontalSpacing + 44
+                columnCount * cellWidth + 44
             )
             height: Math.max(
                 184,
-                rowCount * cardHeight + Math.max(0, rowCount - 1) * verticalSpacing + 44
+                rowCount * cellHeight + 44
             )
             radius: 16
             color: "#e811171d"
@@ -60,9 +111,9 @@ Window {
                     Layout.preferredHeight: dialog.height - 44
                     Layout.maximumWidth: Layout.preferredWidth
                     Layout.maximumHeight: Layout.preferredHeight
-                    model: WorkspaceModel
-                    cellWidth: dialog.cardWidth + dialog.horizontalSpacing
-                    cellHeight: dialog.cardHeight + dialog.verticalSpacing
+                    model: Controller
+                    cellWidth: dialog.cellWidth
+                    cellHeight: dialog.cellHeight
                     flow: GridView.FlowLeftToRight
                     interactive: false
                     clip: true
