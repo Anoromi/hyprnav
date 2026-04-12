@@ -385,10 +385,8 @@ bool CPreviewManager::renderWorkspacePreview(PHLMONITOR monitor, int workspaceID
     if (targetWorkspace) {
         monitor->m_activeWorkspace = targetWorkspace;
         targetWorkspace->m_visible = true;
-        g_pDesktopAnimationManager->startAnimation(targetWorkspace, CDesktopAnimationManager::ANIMATION_TYPE_IN, true, true);
         g_pHyprRenderer->renderWorkspace(monitor, targetWorkspace, Time::steadyNow(), renderBox);
         targetWorkspace->m_visible = false;
-        g_pDesktopAnimationManager->startAnimation(targetWorkspace, CDesktopAnimationManager::ANIMATION_TYPE_OUT, false, true);
     } else
         g_pHyprRenderer->renderWorkspace(monitor, nullptr, Time::steadyNow(), renderBox);
 

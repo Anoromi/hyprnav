@@ -8,13 +8,13 @@
   stdenv,
 }:
 rustPlatform.buildRustPackage {
-  pname = "hyprexpo-switcher";
+  pname = "hyprnav";
   version = "0.1";
   src = builtins.path {
     name = "hyprland-plugins";
     path = ../.;
   };
-  sourceRoot = "hyprland-plugins/hyprexpo-switcher";
+  sourceRoot = "hyprland-plugins/hyprnav";
   cargoLock.lockFile = ./Cargo.lock;
   doCheck = false;
 
@@ -76,13 +76,13 @@ rustPlatform.buildRustPackage {
 
   postInstall = ''
     mkdir -p $out/share/applications
-    install -m 0644 ${./hyprexpo-switcher.desktop} $out/share/applications/hyprexpo-switcher.desktop
+    install -m 0644 ${./hyprnav.desktop} $out/share/applications/hyprnav.desktop
   '';
 
   meta = with lib; {
-    description = "Rust/QML workspace switcher for hyprexpo previews";
+    description = "Rust/QML workspace navigation server and overlay for Hyprland";
     license = licenses.bsd3;
     platforms = platforms.linux;
-    mainProgram = "hyprexpo-switcher";
+    mainProgram = "hyprnav";
   };
 }

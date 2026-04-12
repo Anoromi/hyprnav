@@ -1,7 +1,0 @@
-[Desktop Entry]
-Name=Hyprexpo Switcher
-Exec=hyprexpo-switcher daemon
-Type=Application
-StartupWMClass=hyprexpo-switcher
-Categories=Utility;
-NoDisplay=true

@@ -13,8 +13,12 @@ pub struct RuntimePaths {
     pub instance_signature: String,
     pub runtime_dir: PathBuf,
     pub preview_socket_path: PathBuf,
+    pub spawn_socket_path: PathBuf,
     pub switcher_socket_path: PathBuf,
+    pub server_socket_path: PathBuf,
     pub hypr_event_socket_path: PathBuf,
+    pub state_root: PathBuf,
+    pub state_db_path: PathBuf,
 }
 
 pub fn runtime_root() -> PathBuf {
@@ -37,7 +41,15 @@ pub fn preview_socket_path(runtime_dir: &Path, instance_signature: &str) -> Path
 }
 
 pub fn switcher_socket_path(runtime_dir: &Path, instance_signature: &str) -> PathBuf {
-    runtime_directory(runtime_dir, instance_signature).join("switcher.sock")
+    runtime_directory(runtime_dir, instance_signature).join("ui-hyprnav.sock")
+}
+
+pub fn spawn_socket_path(runtime_dir: &Path, instance_signature: &str) -> PathBuf {
+    runtime_directory(runtime_dir, instance_signature).join("spawn.sock")
+}
+
+pub fn server_socket_path(runtime_dir: &Path, instance_signature: &str) -> PathBuf {
+    runtime_directory(runtime_dir, instance_signature).join("hyprnav.sock")
 }
 
 pub fn hyprland_event_socket_path(runtime_dir: &Path, instance_signature: &str) -> PathBuf {
@@ -97,18 +109,31 @@ pub fn resolve_runtime_paths() -> RuntimePaths {
     let runtime_root = runtime_root();
     let hinted = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok();
     let instance_signature = discover_hyprland_instance_signature(&runtime_root, hinted.as_deref());
+    let state_root = state_root();
 
     RuntimePaths {
         preview_socket_path: preview_socket_path(&runtime_root, &instance_signature),
+        spawn_socket_path: spawn_socket_path(&runtime_root, &instance_signature),
         switcher_socket_path: switcher_socket_path(&runtime_root, &instance_signature),
+        server_socket_path: server_socket_path(&runtime_root, &instance_signature),
         hypr_event_socket_path: hyprland_event_socket_path(&runtime_root, &instance_signature),
         runtime_dir: runtime_directory(&runtime_root, &instance_signature),
         runtime_root,
         instance_signature,
+        state_db_path: state_db_path(&state_root),
+        state_root,
     }
 }
 
 pub fn fallback_switcher_socket_paths(runtime_dir: &Path) -> Vec<PathBuf> {
+    fallback_named_socket_paths(runtime_dir, "ui-hyprnav.sock")
+}
+
+pub fn fallback_server_socket_paths(runtime_dir: &Path) -> Vec<PathBuf> {
+    fallback_named_socket_paths(runtime_dir, "hyprnav.sock")
+}
+
+fn fallback_named_socket_paths(runtime_dir: &Path, socket_name: &str) -> Vec<PathBuf> {
     let root = runtime_dir.join("hx");
     let Ok(entries) = fs::read_dir(root) else {
         return Vec::new();
@@ -117,7 +142,7 @@ pub fn fallback_switcher_socket_paths(runtime_dir: &Path) -> Vec<PathBuf> {
     let mut entries = entries
         .flatten()
         .filter_map(|entry| {
-            let path = entry.path().join("switcher.sock");
+            let path = entry.path().join(socket_name);
             fs::metadata(&path).ok().map(|metadata| (path, metadata.mtime(), metadata.mtime_nsec()))
         })
         .collect::<Vec<_>>();
@@ -129,6 +154,34 @@ pub fn fallback_switcher_socket_paths(runtime_dir: &Path) -> Vec<PathBuf> {
 pub fn ensure_parent_dir(path: &Path) -> Result<()> {
     let parent = path.parent().context("path had no parent")?;
     fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))
+}
+
+pub fn state_root() -> PathBuf {
+    std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".local/state"))
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+        })
+        .join("hyprnav")
+}
+
+pub fn legacy_state_root() -> PathBuf {
+    std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".local/state"))
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+        })
+        .join("hyprexpo-switcher")
+}
+
+pub fn state_db_path(state_root: &Path) -> PathBuf {
+    state_root.join("state.sqlite3")
 }
 
 fn fnv1a_64(value: &str) -> u64 {

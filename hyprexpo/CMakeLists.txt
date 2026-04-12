@@ -13,6 +13,7 @@ add_library(hyprexpo SHARED
     ExpoGesture.cpp
     OverviewPassElement.cpp
     PreviewManager.cpp
+    SpawnManager.cpp
     common.cpp
 )
 

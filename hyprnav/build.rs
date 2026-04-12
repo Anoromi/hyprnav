@@ -2,7 +2,9 @@ use cxx_qt_build::{CxxQtBuilder, QmlModule};
 
 fn main() {
     CxxQtBuilder::new_qml_module(
-        QmlModule::new("com.anoromi.hyprexpo.switcher").qml_file("qml/Main.qml"),
+        QmlModule::new("com.anoromi.hyprnav")
+            .qml_file("qml/Main.qml")
+            .qml_file("qml/EnvironmentGrid.qml"),
     )
     .qt_module("Gui")
     .qt_module("Qml")

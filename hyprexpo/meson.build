@@ -25,6 +25,7 @@ src = files(
   'ExpoGesture.cpp',
   'OverviewPassElement.cpp',
   'PreviewManager.cpp',
+  'SpawnManager.cpp',
   'common.cpp',
 )
 

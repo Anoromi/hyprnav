@@ -17,6 +17,7 @@ using namespace Hyprutils::String;
 #include "overview.hpp"
 #include "ExpoGesture.hpp"
 #include "PreviewManager.hpp"
+#include "SpawnManager.hpp"
 
 // Methods
 inline CFunctionHook* g_pRenderWorkspaceHook = nullptr;
@@ -313,6 +314,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::reloadConfig();
 
     g_pPreviewManager = std::make_unique<CPreviewManager>();
+    g_pSpawnManager   = std::make_unique<CSpawnManager>();
 
     return {"hyprexpo", "A plugin for an overview", "Vaxry", "1.0"};
 }
@@ -322,6 +324,7 @@ APICALL EXPORT void PLUGIN_EXIT() {
     renderingOverview = false;
 
     g_pHyprRenderer->m_renderPass.removeAllOfType("COverviewPassElement");
+    g_pSpawnManager.reset();
     g_pPreviewManager.reset();
     g_pOverview.reset();
     cleanupHooks();

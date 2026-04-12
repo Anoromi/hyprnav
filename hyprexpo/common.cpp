@@ -238,6 +238,10 @@ std::filesystem::path socketPath(const char* runtimeDir, const char* hyprlandIns
     return runtimeDirectory(runtimeDir, hyprlandInstanceSignature) / "preview.sock";
 }
 
+std::filesystem::path spawnSocketPath(const char* runtimeDir, const char* hyprlandInstanceSignature) {
+    return runtimeDirectory(runtimeDir, hyprlandInstanceSignature) / "spawn.sock";
+}
+
 std::filesystem::path switcherSocketPath(const char* runtimeDir, const char* hyprlandInstanceSignature) {
     return runtimeDirectory(runtimeDir, hyprlandInstanceSignature) / "switcher.sock";
 }

@@ -47,6 +47,7 @@ SPreviewSize                  computePreviewSize(int sourceWidth, int sourceHeig
 std::string                   discoverHyprlandInstanceSignature(const char* runtimeDir, const char* hyprlandInstanceSignature);
 std::filesystem::path         runtimeDirectory(const char* runtimeDir, const char* hyprlandInstanceSignature);
 std::filesystem::path         socketPath(const char* runtimeDir, const char* hyprlandInstanceSignature);
+std::filesystem::path         spawnSocketPath(const char* runtimeDir, const char* hyprlandInstanceSignature);
 std::filesystem::path         switcherSocketPath(const char* runtimeDir, const char* hyprlandInstanceSignature);
 std::filesystem::path         hyprlandSocketPath(const char* runtimeDir, const char* hyprlandInstanceSignature);
 std::filesystem::path         hyprlandEventSocketPath(const char* runtimeDir, const char* hyprlandInstanceSignature);

@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Hyprnav
+Exec=hyprnav daemon
+Type=Application
+StartupWMClass=hyprnav
+Categories=Utility;
+NoDisplay=true

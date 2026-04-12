@@ -42,5 +42,5 @@ build/
 .cache/
 
 # Rust / cxx-qt
-hyprexpo-switcher/target/
-hyprexpo-switcher/.current-path
+hyprnav/target/
+hyprnav/.current-path

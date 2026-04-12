@@ -2,18 +2,32 @@ import QtQuick
 import QtQuick.Window
 import QtQuick.Controls
 import QtQuick.Layouts
-import com.anoromi.hyprexpo.switcher 1.0
+import com.anoromi.hyprnav 1.0
 
 Window {
     id: root
     width: Screen.width
     height: Screen.height
-    visible: Controller.visible
+    visible: false
+    property bool hasBeenVisible: false
     color: "transparent"
-    title: "Hyprexpo Switcher"
-    flags: Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint
+    title: "Hyprnav"
 
     property int maxGridColumns: 6
+
+    Timer {
+        interval: 1000
+        repeat: true
+        running: root.visible
+        onTriggered: Controller.refreshSnapshotIfVisible()
+    }
+
+    Timer {
+        interval: 40
+        repeat: true
+        running: root.visible
+        onTriggered: Controller.pumpSessionCommands()
+    }
 
     FocusScope {
         id: keyHandler
@@ -59,13 +73,6 @@ Window {
                 Controller.handleModifierReleased()
                 event.accepted = true
             }
-        }
-
-        Timer {
-            interval: 40
-            running: true
-            repeat: true
-            onTriggered: Controller.pumpBackendEvents()
         }
 
         Rectangle {
@@ -154,20 +161,6 @@ Window {
                             border.color: workspaceSelected ? "#111920" : (workspaceActive ? "#caa45d" : "#27323c")
                             scale: workspaceSelected ? 1.0 : 0.96
                             opacity: workspaceSelected ? 1.0 : 0.9
-
-                            Behavior on scale {
-                                NumberAnimation {
-                                    duration: 110
-                                    easing.type: Easing.OutCubic
-                                }
-                            }
-
-                            Behavior on opacity {
-                                NumberAnimation {
-                                    duration: 110
-                                    easing.type: Easing.OutCubic
-                                }
-                            }
 
                             ColumnLayout {
                                 anchors.fill: parent
@@ -268,8 +261,27 @@ Window {
 
     }
 
+    Connections {
+        target: Controller
+
+        function onVisibleChanged() {
+            if (Controller.visible)
+                root.show()
+            else
+                root.hide()
+        }
+    }
+
     onVisibleChanged: {
-        if (visible)
+        if (visible) {
+            hasBeenVisible = true
             keyHandler.forceActiveFocus()
+        } else if (hasBeenVisible) {
+            Qt.quit()
+        }
+    }
+
+    Component.onCompleted: {
+        Qt.callLater(() => Controller.initializeIfNeeded())
     }
 }

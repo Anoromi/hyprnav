@@ -1,5 +1,9 @@
 pub mod cli;
 pub mod controller;
+pub mod db;
+pub mod protocol;
 pub mod runtime_paths;
+pub mod server;
+pub mod spawn;
+pub mod ui_session;
 pub mod workspace_utils;
-
