@@ -1,6 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 
-const TOP_LEVEL_ABOUT: &str = "Workspace environment server, overlay switcher, and workspace-spawn helper for Hyprland.";
+const TOP_LEVEL_ABOUT: &str =
+    "Workspace environment server, overlay switcher, and workspace-spawn helper for Hyprland.";
 
 const TOP_LEVEL_LONG_ABOUT: &str = "\
 hyprnav has three main roles:
@@ -39,6 +40,9 @@ Examples:
   hyprnav env ensure --env demo
   hyprnav slot assign --env demo --slot 1 --workspace 5
   hyprnav slot assign --env demo --slot 2 --managed
+  hyprnav slot assign --env demo.child --slot 2 --inherit
+  hyprnav slot assign --env demo --slot 3 --managed --launch -- ghostty
+  hyprnav slot command set --env demo --slot 1 -- ghostty --class work
   hyprnav lock demo
   hyprnav goto --slot 2
   hyprnav run --slot 2 -- ghostty
@@ -176,7 +180,7 @@ pub enum ClientCommand {
 pub enum SlotCommand {
     #[command(
         about = "Bind a virtual slot to a physical workspace.",
-        long_about = "Bind a virtual slot to a physical workspace.\n\nUse --workspace for a fixed mapping or --managed to allocate a server-owned workspace from the managed pool. Environment resolution order:\n  1. --env <id>\n  2. --cwd <path>\n  3. current working directory\n  4. locked environment"
+        long_about = "Bind a virtual slot to a physical workspace.\n\nUse exactly one of --workspace, --managed, or --inherit. --managed allocates a server-owned workspace from the managed pool. --inherit keeps a local slot entry while delegating workspace resolution to the parent environment slot of the same number. Pass --launch followed by `-- <argv...>` to store a launch command for the slot. Environment resolution order:\n  1. --env <id>\n  2. --cwd <path>\n  3. current working directory\n  4. locked environment"
     )]
     Assign(SlotAssignArgs),
     #[command(
@@ -186,9 +190,29 @@ pub enum SlotCommand {
     Clear(SlotClearArgs),
     #[command(
         about = "Resolve a slot to its physical workspace.",
-        long_about = "Resolve a slot to its physical workspace.\n\nRequires either --env or a global lock."
+        long_about = "Resolve a slot to its physical workspace.\n\nNamed dotted environments resolve the same slot number through their parent chain. The returned JSON includes the requested environment, the environment that supplied the concrete workspace binding, and the environment that supplied the launch command. Requires either --env or a global lock."
     )]
     Resolve(ResolveArgs),
+    #[command(
+        about = "Set or clear the stored launch command for a slot.",
+        long_about = "Set or clear the stored launch command for a slot.\n\nThe launch command is stored as argv and can be triggered automatically when hyprnav navigates to that slot. For child-only command overrides, create a local slot row first with `slot assign --inherit`."
+    )]
+    #[command(subcommand)]
+    Command(SlotLaunchCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SlotLaunchCommand {
+    #[command(
+        about = "Store a launch command for a slot.",
+        long_about = "Store a launch command for a slot.\n\nRequires either --env or a global lock. The command after `--` is stored as raw argv and reused on future hyprnav navigation to that slot."
+    )]
+    Set(SlotCommandSetArgs),
+    #[command(
+        about = "Clear the stored launch command for a slot.",
+        long_about = "Clear the stored launch command for a slot.\n\nRequires either --env or a global lock."
+    )]
+    Clear(SlotCommandClearArgs),
 }
 
 #[derive(Debug, Args)]
@@ -219,6 +243,7 @@ pub struct ClientEnsureArgs {
 }
 
 #[derive(Debug, Args)]
+#[command(trailing_var_arg = true)]
 pub struct SlotAssignArgs {
     /// Virtual slot number inside the environment. Must be positive.
     #[arg(long)]
@@ -229,6 +254,9 @@ pub struct SlotAssignArgs {
     /// Allocate or reuse a server-managed workspace for this slot.
     #[arg(long)]
     pub managed: bool,
+    /// Resolve this slot from the parent environment slot of the same number.
+    #[arg(long)]
+    pub inherit: bool,
     /// Explicit environment ID.
     #[arg(long)]
     pub env: Option<String>,
@@ -238,6 +266,12 @@ pub struct SlotAssignArgs {
     /// Path used for environment derivation when --env is omitted.
     #[arg(long)]
     pub cwd: Option<String>,
+    /// Store the trailing argv as the slot launch command.
+    #[arg(long)]
+    pub launch: bool,
+    /// Launch command and arguments to store after `--` when --launch is used.
+    #[arg(last = true)]
+    pub command: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -251,6 +285,30 @@ pub struct SlotClearArgs {
     /// Optional client ID accepted for parity with the server API.
     #[arg(long)]
     pub client: Option<String>,
+}
+
+#[derive(Debug, Args)]
+#[command(trailing_var_arg = true)]
+pub struct SlotCommandSetArgs {
+    /// Virtual slot number to update. Must be positive.
+    #[arg(long)]
+    pub slot: i32,
+    /// Explicit environment ID. Otherwise the locked environment is used.
+    #[arg(long)]
+    pub env: Option<String>,
+    /// Command and arguments to store after `--`.
+    #[arg(last = true, required = true)]
+    pub command: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct SlotCommandClearArgs {
+    /// Virtual slot number to update. Must be positive.
+    #[arg(long)]
+    pub slot: i32,
+    /// Explicit environment ID. Otherwise the locked environment is used.
+    #[arg(long)]
+    pub env: Option<String>,
 }
 
 #[derive(Debug, Args)]

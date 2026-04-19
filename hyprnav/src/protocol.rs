@@ -27,8 +27,12 @@ pub struct SwitcherSnapshot {
 pub struct GridCellSnapshot {
     pub environment_id: String,
     pub environment_display_id: String,
+    pub binding_environment_id: Option<String>,
+    pub command_environment_id: Option<String>,
     pub slot_index: i32,
     pub physical_workspace_id: i32,
+    pub binding_kind: String,
+    pub inherited: bool,
     pub workspace_name: String,
     pub subtitle: String,
     pub app_class: String,
@@ -59,9 +63,45 @@ pub struct StatusSnapshot {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SlotResolution {
     pub environment_id: String,
+    pub binding_environment_id: String,
+    pub command_environment_id: Option<String>,
     pub slot_index: i32,
     pub physical_workspace_id: i32,
     pub binding_kind: String,
+    pub launch_argv: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum SlotAssignmentMode {
+    Fixed { workspace_id: i32 },
+    Managed,
+    Inherit,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum NavigationLaunchSkippedReason {
+    NoLaunchConfigured,
+    WorkspaceNotEmpty,
+    PendingLaunch,
+    NoSlotMapping,
+    AmbiguousSlotMapping,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct NavigationLaunchResult {
+    pub configured: bool,
+    pub attempted: bool,
+    pub skipped_reason: Option<NavigationLaunchSkippedReason>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct WorkspaceNavigationResult {
+    pub workspace_id: i32,
+    pub slot_resolution: Option<SlotResolution>,
+    pub launch: NavigationLaunchResult,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -102,15 +142,24 @@ pub enum Request {
     SlotAssign {
         env: Option<String>,
         slot: i32,
-        workspace: Option<i32>,
-        managed: bool,
+        assignment_mode: SlotAssignmentMode,
         client: Option<String>,
         cwd: Option<String>,
+        launch_argv: Option<Vec<String>>,
     },
     SlotClear {
         env: Option<String>,
         slot: i32,
         client: Option<String>,
+    },
+    SlotCommandSet {
+        env: Option<String>,
+        slot: i32,
+        argv: Vec<String>,
+    },
+    SlotCommandClear {
+        env: Option<String>,
+        slot: i32,
     },
     SlotResolve {
         env: Option<String>,
@@ -202,7 +251,8 @@ pub fn write_response<T: Serialize>(writer: &mut impl Write, response: &Response
 }
 
 pub fn send_request<R: DeserializeOwned>(path: &Path, request: &Request) -> Result<R> {
-    let mut stream = UnixStream::connect(path).with_context(|| format!("connecting to {}", path.display()))?;
+    let mut stream =
+        UnixStream::connect(path).with_context(|| format!("connecting to {}", path.display()))?;
     let encoded = serde_json::to_vec(request).context("encoding request")?;
     stream.write_all(&encoded)?;
     stream.write_all(b"\n")?;
@@ -217,7 +267,9 @@ pub fn send_request<R: DeserializeOwned>(path: &Path, request: &Request) -> Resu
 
     let response = serde_json::from_str::<Response<R>>(&line).context("decoding response")?;
     if response.ok {
-        response.result.context("missing result in success response")
+        response
+            .result
+            .context("missing result in success response")
     } else {
         let error = response.error.unwrap_or(ErrorPayload {
             code: "unknown".to_owned(),
@@ -227,7 +279,10 @@ pub fn send_request<R: DeserializeOwned>(path: &Path, request: &Request) -> Resu
     }
 }
 
-pub fn send_request_with_fallbacks<R: DeserializeOwned>(preferred_path: &Path, request: &Request) -> Result<R> {
+pub fn send_request_with_fallbacks<R: DeserializeOwned>(
+    preferred_path: &Path,
+    request: &Request,
+) -> Result<R> {
     match send_request(preferred_path, request) {
         Ok(response) => Ok(response),
         Err(primary_error) => {

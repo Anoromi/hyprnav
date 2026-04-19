@@ -24,7 +24,9 @@ pub struct RuntimePaths {
 pub fn runtime_root() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(format!("{DEFAULT_RUNTIME_ROOT}/{}", rustix_like_getuid())))
+        .unwrap_or_else(|| {
+            PathBuf::from(format!("{DEFAULT_RUNTIME_ROOT}/{}", rustix_like_getuid()))
+        })
 }
 
 pub fn rustix_like_getuid() -> u32 {
@@ -32,7 +34,11 @@ pub fn rustix_like_getuid() -> u32 {
 }
 
 pub fn runtime_directory(runtime_dir: &Path, instance_signature: &str) -> PathBuf {
-    let hashed = fnv1a_64(if instance_signature.is_empty() { "default" } else { instance_signature });
+    let hashed = fnv1a_64(if instance_signature.is_empty() {
+        "default"
+    } else {
+        instance_signature
+    });
     runtime_dir.join("hx").join(format!("{hashed:016x}"))
 }
 
@@ -53,11 +59,17 @@ pub fn server_socket_path(runtime_dir: &Path, instance_signature: &str) -> PathB
 }
 
 pub fn hyprland_event_socket_path(runtime_dir: &Path, instance_signature: &str) -> PathBuf {
-    runtime_dir.join("hypr").join(instance_signature).join(".socket2.sock")
+    runtime_dir
+        .join("hypr")
+        .join(instance_signature)
+        .join(".socket2.sock")
 }
 
 pub fn hyprland_socket_path(runtime_dir: &Path, instance_signature: &str) -> PathBuf {
-    runtime_dir.join("hypr").join(instance_signature).join(".socket.sock")
+    runtime_dir
+        .join("hypr")
+        .join(instance_signature)
+        .join(".socket.sock")
 }
 
 pub fn preview_path(runtime_dir: &Path, instance_signature: &str, workspace_id: i32) -> PathBuf {
@@ -97,7 +109,8 @@ pub fn discover_hyprland_instance_signature(runtime_dir: &Path, hinted: Option<&
         let mtime = metadata.mtime();
         let mtime_nsec = metadata.mtime_nsec();
         match &newest {
-            Some((_, best_secs, best_nsecs)) if (*best_secs, *best_nsecs) >= (mtime, mtime_nsec) => {}
+            Some((_, best_secs, best_nsecs))
+                if (*best_secs, *best_nsecs) >= (mtime, mtime_nsec) => {}
             _ => newest = Some((signature.to_owned(), mtime, mtime_nsec)),
         }
     }
@@ -143,7 +156,9 @@ fn fallback_named_socket_paths(runtime_dir: &Path, socket_name: &str) -> Vec<Pat
         .flatten()
         .filter_map(|entry| {
             let path = entry.path().join(socket_name);
-            fs::metadata(&path).ok().map(|metadata| (path, metadata.mtime(), metadata.mtime_nsec()))
+            fs::metadata(&path)
+                .ok()
+                .map(|metadata| (path, metadata.mtime(), metadata.mtime_nsec()))
         })
         .collect::<Vec<_>>();
 

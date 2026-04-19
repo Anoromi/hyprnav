@@ -5,7 +5,9 @@ use crate::protocol::{
 use crate::runtime_paths::resolve_runtime_paths;
 use crate::ui_session::{drain_switcher_session_commands, UiSessionCommand};
 use cxx_qt::CxxQtType;
-use cxx_qt_lib::{QByteArray, QHash, QHashPair_i32_QByteArray, QModelIndex, QString, QUrl, QVariant};
+use cxx_qt_lib::{
+    QByteArray, QHash, QHashPair_i32_QByteArray, QModelIndex, QString, QUrl, QVariant,
+};
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use tracing::warn;
@@ -96,7 +98,10 @@ pub mod qobject {
             uri: &QString,
             type_name: &QString,
         ) -> bool;
-        fn hyprexpo_set_quit_on_last_window_closed(app: Pin<&mut QGuiApplication>, quit_on_last_window_closed: bool);
+        fn hyprexpo_set_quit_on_last_window_closed(
+            app: Pin<&mut QGuiApplication>,
+            quit_on_last_window_closed: bool,
+        );
         fn hyprexpo_set_root_window_visible(visible: bool);
     }
 
@@ -193,7 +198,6 @@ pub mod qobject {
         #[cxx_name = "endResetModel"]
         unsafe fn end_reset_model(self: Pin<&mut Controller>);
     }
-
 }
 
 #[derive(Default)]
@@ -219,12 +223,16 @@ impl qobject::Controller {
         {
             let mut rust = self.as_mut().rust_mut();
             rust.initialized = true;
-            rust.mode = if std::env::var("HYPREXPO_SWITCHER_UI_MODE").ok().as_deref() == Some("grid") {
-                UiMode::Grid
-            } else {
-                UiMode::Switcher
-            };
-            rust.reverse = std::env::var("HYPREXPO_SWITCHER_UI_REVERSE").ok().as_deref() == Some("1");
+            rust.mode =
+                if std::env::var("HYPREXPO_SWITCHER_UI_MODE").ok().as_deref() == Some("grid") {
+                    UiMode::Grid
+                } else {
+                    UiMode::Switcher
+                };
+            rust.reverse = std::env::var("HYPREXPO_SWITCHER_UI_REVERSE")
+                .ok()
+                .as_deref()
+                == Some("1");
             rust.grid_mode = rust.mode == UiMode::Grid;
         }
 
@@ -267,7 +275,9 @@ impl qobject::Controller {
             }
             ROLE_GENERATION => QVariant::from(&(item.generation as u64)),
             ROLE_ENVIRONMENT_ID => QVariant::from(&QString::from(item.environment_id.as_str())),
-            ROLE_ENVIRONMENT_DISPLAY_ID => QVariant::from(&QString::from(item.environment_display_id.as_str())),
+            ROLE_ENVIRONMENT_DISPLAY_ID => {
+                QVariant::from(&QString::from(item.environment_display_id.as_str()))
+            }
             ROLE_SLOT_INDEX => QVariant::from(&item.slot_index),
             ROLE_PHYSICAL_WORKSPACE_ID => QVariant::from(&item.physical_workspace_id),
             ROLE_ENVIRONMENT_LOCKED => QVariant::from(&item.environment_locked),
@@ -282,14 +292,35 @@ impl qobject::Controller {
         let mut roles = QHash::<QHashPair_i32_QByteArray>::default();
         roles.insert(ROLE_ID, QByteArray::from("workspaceId".as_bytes()));
         roles.insert(ROLE_NAME, QByteArray::from("workspaceName".as_bytes()));
-        roles.insert(ROLE_SUBTITLE, QByteArray::from("workspaceSubtitle".as_bytes()));
-        roles.insert(ROLE_APP_CLASS, QByteArray::from("workspaceAppClass".as_bytes()));
-        roles.insert(ROLE_WINDOW_COUNT, QByteArray::from("workspaceWindowCount".as_bytes()));
+        roles.insert(
+            ROLE_SUBTITLE,
+            QByteArray::from("workspaceSubtitle".as_bytes()),
+        );
+        roles.insert(
+            ROLE_APP_CLASS,
+            QByteArray::from("workspaceAppClass".as_bytes()),
+        );
+        roles.insert(
+            ROLE_WINDOW_COUNT,
+            QByteArray::from("workspaceWindowCount".as_bytes()),
+        );
         roles.insert(ROLE_ACTIVE, QByteArray::from("workspaceActive".as_bytes()));
-        roles.insert(ROLE_SELECTED, QByteArray::from("workspaceSelected".as_bytes()));
-        roles.insert(ROLE_PREVIEW, QByteArray::from("workspacePreview".as_bytes()));
-        roles.insert(ROLE_GENERATION, QByteArray::from("workspaceGeneration".as_bytes()));
-        roles.insert(ROLE_ENVIRONMENT_ID, QByteArray::from("environmentId".as_bytes()));
+        roles.insert(
+            ROLE_SELECTED,
+            QByteArray::from("workspaceSelected".as_bytes()),
+        );
+        roles.insert(
+            ROLE_PREVIEW,
+            QByteArray::from("workspacePreview".as_bytes()),
+        );
+        roles.insert(
+            ROLE_GENERATION,
+            QByteArray::from("workspaceGeneration".as_bytes()),
+        );
+        roles.insert(
+            ROLE_ENVIRONMENT_ID,
+            QByteArray::from("environmentId".as_bytes()),
+        );
         roles.insert(
             ROLE_ENVIRONMENT_DISPLAY_ID,
             QByteArray::from("environmentDisplayId".as_bytes()),
@@ -308,7 +339,10 @@ impl qobject::Controller {
             QByteArray::from("showEnvironmentLabel".as_bytes()),
         );
         roles.insert(ROLE_ROW_INDEX, QByteArray::from("rowIndex".as_bytes()));
-        roles.insert(ROLE_COLUMN_INDEX, QByteArray::from("columnIndex".as_bytes()));
+        roles.insert(
+            ROLE_COLUMN_INDEX,
+            QByteArray::from("columnIndex".as_bytes()),
+        );
         roles
     }
 
@@ -382,17 +416,48 @@ impl qobject::Controller {
     }
 
     pub fn activate_current(mut self: Pin<&mut Self>) {
-        let workspace_id = self.as_ref().current_physical_workspace_id();
-        if workspace_id <= 0 {
-            return;
-        }
+        match self.as_ref().rust().mode {
+            UiMode::Grid => {
+                let Some((environment_id, slot_index)) = ({
+                    let binding = self.as_ref();
+                    let rust = binding.rust();
+                    rust.items
+                        .get(rust.current_index.max(0) as usize)
+                        .map(|item| (item.environment_id.clone(), item.slot_index))
+                }) else {
+                    return;
+                };
+                if slot_index <= 0 || environment_id.is_empty() {
+                    return;
+                }
 
-        if let Err(error) =
-            self.as_ref()
-                .send_request::<serde_json::Value>(Request::WorkspaceGotoPhysical { workspace_id })
-        {
-            warn!("failed to activate workspace {workspace_id}: {error}");
-            return;
+                if let Err(error) =
+                    self.as_ref()
+                        .send_request::<serde_json::Value>(Request::WorkspaceGoto {
+                            env: Some(environment_id.clone()),
+                            slot: slot_index,
+                        })
+                {
+                    warn!(
+                        "failed to activate environment {} slot {}: {error}",
+                        environment_id, slot_index
+                    );
+                    return;
+                }
+            }
+            UiMode::Switcher => {
+                let workspace_id = self.as_ref().current_physical_workspace_id();
+                if workspace_id <= 0 {
+                    return;
+                }
+
+                if let Err(error) = self.as_ref().send_request::<serde_json::Value>(
+                    Request::WorkspaceGotoPhysical { workspace_id },
+                ) {
+                    warn!("failed to activate workspace {workspace_id}: {error}");
+                    return;
+                }
+            }
         }
 
         self.as_mut().set_visible(false);
@@ -449,9 +514,11 @@ impl qobject::Controller {
     fn load_snapshot(mut self: Pin<&mut Self>) -> anyhow::Result<()> {
         match self.as_ref().rust().mode {
             UiMode::Switcher => {
-                let snapshot = self.as_ref().send_request::<SwitcherSnapshot>(Request::UiSnapshotSwitcher {
-                    reverse: self.as_ref().rust().reverse,
-                })?;
+                let snapshot = self.as_ref().send_request::<SwitcherSnapshot>(
+                    Request::UiSnapshotSwitcher {
+                        reverse: self.as_ref().rust().reverse,
+                    },
+                )?;
                 self.as_mut().apply_switcher_snapshot(snapshot, None);
             }
             UiMode::Grid => {
@@ -474,9 +541,11 @@ impl qobject::Controller {
         match self.as_ref().rust().mode {
             UiMode::Switcher => {
                 let selected_workspace_id = self.as_ref().current_switcher_selection_workspace_id();
-                let snapshot = self.as_ref().send_request::<SwitcherSnapshot>(Request::UiSnapshotSwitcher {
-                    reverse: self.as_ref().rust().reverse,
-                })?;
+                let snapshot = self.as_ref().send_request::<SwitcherSnapshot>(
+                    Request::UiSnapshotSwitcher {
+                        reverse: self.as_ref().rust().reverse,
+                    },
+                )?;
                 self.as_mut()
                     .apply_switcher_snapshot(snapshot, selected_workspace_id);
             }
@@ -507,7 +576,8 @@ impl qobject::Controller {
             .collect::<Vec<_>>();
         let current_index = preferred_workspace_id
             .and_then(|workspace_id| {
-                items.iter()
+                items
+                    .iter()
                     .position(|item| item.workspace_id == workspace_id)
                     .map(|index| index as i32)
             })
@@ -539,7 +609,8 @@ impl qobject::Controller {
 
         let current_index = preferred_selection
             .and_then(|selection| {
-                items.iter()
+                items
+                    .iter()
                     .position(|item| {
                         item.environment_id == selection.environment_id
                             && item.slot_index == selection.slot_index
@@ -558,7 +629,8 @@ impl qobject::Controller {
         self.as_mut().set_current_index(current_index);
         self.as_mut().set_grid_mode(true);
         self.as_mut().set_grid_row_count(snapshot.row_count);
-        self.as_mut().set_grid_column_count(snapshot.max_column_count);
+        self.as_mut()
+            .set_grid_column_count(snapshot.max_column_count);
         self.as_mut().reset_model();
     }
 
@@ -639,7 +711,10 @@ impl qobject::Controller {
     }
 
     fn current_grid_position(&self) -> Option<(i32, i32)> {
-        let item = self.rust().items.get(self.rust().current_index.max(0) as usize)?;
+        let item = self
+            .rust()
+            .items
+            .get(self.rust().current_index.max(0) as usize)?;
         Some((item.row_index, item.column_index))
     }
 

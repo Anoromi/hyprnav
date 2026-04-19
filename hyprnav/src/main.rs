@@ -1,18 +1,21 @@
+use cxx_qt_lib::{QGuiApplication, QQmlApplicationEngine, QString, QUrl};
 use hyprnav::cli::{
     parse_args, ClientCommand, Command, EnvCommand, LockArgs, ResolveArgs, RunArgs, SlotAssignArgs,
-    SlotClearArgs, SpawnArgs, SpawnInternalArgs,
+    SlotClearArgs, SlotCommand, SlotCommandClearArgs, SlotCommandSetArgs, SlotLaunchCommand,
+    SpawnArgs, SpawnInternalArgs,
 };
 use hyprnav::controller::qobject::{
-    hyprexpo_configure_root_window, hyprexpo_load_qml_from_module, hyprexpo_set_quit_on_last_window_closed,
+    hyprexpo_configure_root_window, hyprexpo_load_qml_from_module,
+    hyprexpo_set_quit_on_last_window_closed,
 };
 use hyprnav::protocol::{
-    send_request_with_fallbacks, Request, SpawnPrepared, SpawnStarted, StatusSnapshot,
+    send_request_with_fallbacks, Request, SlotAssignmentMode, SpawnPrepared, SpawnStarted,
+    StatusSnapshot,
 };
 use hyprnav::runtime_paths::resolve_runtime_paths;
 use hyprnav::server::run_server;
 use hyprnav::spawn::{current_pid, exec_command};
 use hyprnav::ui_session::{send_switcher_step_command, start_switcher_session_listener};
-use cxx_qt_lib::{QGuiApplication, QQmlApplicationEngine, QString, QUrl};
 use serde_json::Value;
 use std::io::{self, Write};
 use std::process::Command as ProcessCommand;
@@ -74,23 +77,29 @@ fn main() -> anyhow::Result<()> {
                     cwd: args.cwd,
                     client: args.client,
                 })),
-                EnvCommand::Delete(args) => print_json(send::<Value>(Request::EnvDelete { env: args.env })),
+                EnvCommand::Delete(args) => {
+                    print_json(send::<Value>(Request::EnvDelete { env: args.env }))
+                }
             }
         }
         Command::Client(command) => {
             ensure_server_running()?;
             match command {
-                ClientCommand::Ensure(args) => {
-                    print_json(send::<Value>(Request::ClientEnsure { client: args.client }))
-                }
+                ClientCommand::Ensure(args) => print_json(send::<Value>(Request::ClientEnsure {
+                    client: args.client,
+                })),
             }
         }
         Command::Slot(command) => {
             ensure_server_running()?;
             match command {
-                hyprnav::cli::SlotCommand::Assign(args) => handle_slot_assign(args),
-                hyprnav::cli::SlotCommand::Clear(args) => handle_slot_clear(args),
-                hyprnav::cli::SlotCommand::Resolve(args) => handle_resolve(args),
+                SlotCommand::Assign(args) => handle_slot_assign(args),
+                SlotCommand::Clear(args) => handle_slot_clear(args),
+                SlotCommand::Resolve(args) => handle_resolve(args),
+                SlotCommand::Command(command) => match command {
+                    SlotLaunchCommand::Set(args) => handle_slot_command_set(args),
+                    SlotLaunchCommand::Clear(args) => handle_slot_command_clear(args),
+                },
             }
         }
         Command::Goto(args) => {
@@ -116,13 +125,41 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn handle_slot_assign(args: SlotAssignArgs) -> anyhow::Result<()> {
+    let assignment_mode_count = usize::from(args.workspace.is_some())
+        + usize::from(args.managed)
+        + usize::from(args.inherit);
+    if assignment_mode_count != 1 {
+        return Err(anyhow::anyhow!(
+            "slot assign requires exactly one of --workspace, --managed, or --inherit"
+        ));
+    }
+
+    if args.launch && args.command.is_empty() {
+        return Err(anyhow::anyhow!(
+            "slot assign --launch requires a command after --"
+        ));
+    }
+
+    if !args.launch && !args.command.is_empty() {
+        return Err(anyhow::anyhow!(
+            "slot assign received trailing argv without --launch"
+        ));
+    }
+
+    let assignment_mode = match (args.workspace, args.managed, args.inherit) {
+        (Some(workspace_id), false, false) => SlotAssignmentMode::Fixed { workspace_id },
+        (None, true, false) => SlotAssignmentMode::Managed,
+        (None, false, true) => SlotAssignmentMode::Inherit,
+        _ => unreachable!("validated assignment mode count"),
+    };
+
     print_json(send::<Value>(Request::SlotAssign {
         env: args.env,
         slot: args.slot,
-        workspace: args.workspace,
-        managed: args.managed,
+        assignment_mode,
         client: args.client,
         cwd: args.cwd,
+        launch_argv: args.launch.then_some(args.command),
     }))
 }
 
@@ -136,6 +173,21 @@ fn handle_slot_clear(args: SlotClearArgs) -> anyhow::Result<()> {
 
 fn handle_resolve(args: ResolveArgs) -> anyhow::Result<()> {
     print_json(send::<Value>(Request::SlotResolve {
+        env: args.env,
+        slot: args.slot,
+    }))
+}
+
+fn handle_slot_command_set(args: SlotCommandSetArgs) -> anyhow::Result<()> {
+    print_json(send::<Value>(Request::SlotCommandSet {
+        env: args.env,
+        slot: args.slot,
+        argv: args.command,
+    }))
+}
+
+fn handle_slot_command_clear(args: SlotCommandClearArgs) -> anyhow::Result<()> {
+    print_json(send::<Value>(Request::SlotCommandClear {
         env: args.env,
         slot: args.slot,
     }))

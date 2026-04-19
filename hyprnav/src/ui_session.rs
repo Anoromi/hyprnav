@@ -1,4 +1,6 @@
-use crate::runtime_paths::{ensure_parent_dir, fallback_switcher_socket_paths, resolve_runtime_paths};
+use crate::runtime_paths::{
+    ensure_parent_dir, fallback_switcher_socket_paths, resolve_runtime_paths,
+};
 use anyhow::{Context, Result};
 use crossbeam_channel::{unbounded, Receiver};
 use std::fs;
@@ -90,8 +92,8 @@ fn start_switcher_session_listener_at(socket_path: &Path) -> Result<UiSessionHan
     ensure_parent_dir(socket_path)?;
     let _ = fs::remove_file(socket_path);
 
-    let listener =
-        UnixListener::bind(socket_path).with_context(|| format!("binding {}", socket_path.display()))?;
+    let listener = UnixListener::bind(socket_path)
+        .with_context(|| format!("binding {}", socket_path.display()))?;
     listener.set_nonblocking(true)?;
 
     let (sender, receiver) = unbounded();
@@ -123,7 +125,10 @@ fn start_switcher_session_listener_at(socket_path: &Path) -> Result<UiSessionHan
     })
 }
 
-fn handle_session_client(mut stream: UnixStream, sender: &crossbeam_channel::Sender<UiSessionCommand>) -> Result<()> {
+fn handle_session_client(
+    mut stream: UnixStream,
+    sender: &crossbeam_channel::Sender<UiSessionCommand>,
+) -> Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut line = String::new();
     reader.read_line(&mut line)?;
@@ -150,7 +155,8 @@ fn handle_session_client(mut stream: UnixStream, sender: &crossbeam_channel::Sen
 }
 
 fn send_command_to_socket(path: &Path, command: UiSessionCommand) -> Result<()> {
-    let mut stream = UnixStream::connect(path).with_context(|| format!("connecting to {}", path.display()))?;
+    let mut stream =
+        UnixStream::connect(path).with_context(|| format!("connecting to {}", path.display()))?;
     let line = match command {
         UiSessionCommand::StepForward => "STEP FORWARD\n",
         UiSessionCommand::StepReverse => "STEP REVERSE\n",

@@ -128,8 +128,13 @@ impl SpawnRegistry {
         self.operations
             .iter()
             .filter(|operation| match operation.state {
-                SpawnOperationState::Prepared => now_ms.saturating_sub(operation.created_at_ms) >= PREPARED_TIMEOUT.as_millis() as u64,
-                SpawnOperationState::Active => operation.root_pid.is_some_and(|pid| !pid_exists(pid)),
+                SpawnOperationState::Prepared => {
+                    now_ms.saturating_sub(operation.created_at_ms)
+                        >= PREPARED_TIMEOUT.as_millis() as u64
+                }
+                SpawnOperationState::Active => {
+                    operation.root_pid.is_some_and(|pid| !pid_exists(pid))
+                }
             })
             .cloned()
             .collect()
@@ -184,9 +189,9 @@ pub fn allocate_temporary_workspace_id(
     let mut blocked = live_workspace_ids.clone();
     blocked.extend(
         store
-            .list_bindings()?
+            .list_local_bindings()?
             .into_iter()
-            .map(|binding| binding.workspace_id),
+            .filter_map(|binding| binding.workspace_id),
     );
     blocked.extend(reserved_temporary_ids.iter().copied());
 
@@ -214,9 +219,11 @@ pub fn exec_command(argv: &[String]) -> Result<()> {
         return Err(anyhow!("spawn-internal requires a command"));
     }
 
-    let mut cstrings = argv
+    let cstrings = argv
         .iter()
-        .map(|arg| std::ffi::CString::new(arg.as_str()).context("spawn arguments cannot contain NUL bytes"))
+        .map(|arg| {
+            std::ffi::CString::new(arg.as_str()).context("spawn arguments cannot contain NUL bytes")
+        })
         .collect::<Result<Vec<_>>>()?;
     let mut argv_ptrs = cstrings.iter().map(|arg| arg.as_ptr()).collect::<Vec<_>>();
     argv_ptrs.push(std::ptr::null());

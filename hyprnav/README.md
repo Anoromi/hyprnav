@@ -44,12 +44,24 @@ running.
 An environment maps virtual slot numbers such as `1`, `2`, `3` to physical
 Hyprland workspaces such as `5`, `101`, or `103`.
 
-Two binding kinds exist:
+Explicit named environment IDs can also form a hierarchy:
+
+- `x`
+- `x.y`
+- `x.y.z`
+
+Only explicit named env IDs participate in this tree. Path-derived env IDs stay
+flat.
+
+Three local binding kinds exist:
 
 - `fixed`
   Maps a slot to an explicit physical workspace ID.
 - `managed`
   Allocates a server-owned workspace from the managed range starting at `101`.
+- `inherit`
+  Keeps a local slot entry but resolves the workspace from the parent
+  environment slot of the same number.
 
 State is persisted in:
 
@@ -96,6 +108,28 @@ and cleared with:
 ```bash
 hyprnav unlock
 ```
+
+## Hierarchical Slot Resolution
+
+For a named env like `x.y.z`, slot lookup walks the same slot number up the
+tree:
+
+1. `x.y.z`
+2. `x.y`
+3. `x`
+
+Workspace resolution rules:
+
+- a local `fixed` or `managed` row wins
+- a local `inherit` row keeps walking upward
+- a missing local row also keeps walking upward
+- if no ancestor provides a concrete binding, resolution fails
+
+Launch command resolution is separate:
+
+- the nearest non-null command on the same slot wins
+- a child env can override only the command by first creating
+  `slot assign --inherit`
 
 ## Command Reference
 
@@ -210,15 +244,20 @@ extension; it does not affect environment resolution by itself.
 hyprnav slot assign --slot 1 --workspace 5 --env demo
 hyprnav slot assign --slot 2 --managed --env demo
 hyprnav slot assign --slot 3 --managed --cwd /path/to/project
+hyprnav slot assign --slot 2 --inherit --env demo.child
+hyprnav slot assign --slot 4 --managed --env demo --launch -- ghostty --class work
 ```
 
 Assigns a virtual slot to a physical workspace.
 
 Rules:
 
-- use exactly one of `--workspace <id>` or `--managed`
+- use exactly one of `--workspace <id>`, `--managed`, or `--inherit`
 - `--managed` allocates from the managed pool starting at `101`
+- `--inherit` is valid only for named dotted env IDs that have a parent
 - reassigning an existing managed slot keeps its current managed workspace ID
+- `--launch -- <argv...>` stores a launch command for future hyprnav navigation to that slot
+- omitting `--launch` preserves any existing stored launch command
 
 ### `slot clear`
 
@@ -240,11 +279,42 @@ hyprnav slot resolve --slot 2
 Prints JSON describing the resolved slot binding:
 
 - `environment_id`
+- `binding_environment_id`
+- `command_environment_id`
 - `slot_index`
 - `physical_workspace_id`
 - `binding_kind`
+- `launch_argv`
 
 Without `--env`, this requires a global lock.
+
+### `slot command set`
+
+```bash
+hyprnav slot command set --slot 1 --env demo -- ghostty --class work
+hyprnav slot command set --slot 2 -- bun run dev:desktop
+```
+
+Stores a launch command for an existing slot binding.
+
+Notes:
+
+- the command after `--` is stored as raw argv
+- if you want a child env to override only the command, first create a local
+  row with `slot assign --inherit`
+- without `--env`, this requires a global lock
+
+### `slot command clear`
+
+```bash
+hyprnav slot command clear --slot 1 --env demo
+hyprnav slot command clear --slot 2
+```
+
+Clears a stored launch command from an existing slot binding.
+
+Clearing a child command exposes the next command from the parent chain, if one
+exists. Without `--env`, this requires a global lock.
 
 ### `goto`
 
@@ -254,6 +324,10 @@ hyprnav goto --slot 2
 ```
 
 Resolves a slot and switches Hyprland to the resolved physical workspace.
+
+If that slot has a stored launch command, hyprnav runs it only when the target
+workspace is currently empty. Re-entering the same workspace while the app is
+already present does not launch another copy.
 
 Without `--env`, this requires a global lock.
 
@@ -311,6 +385,17 @@ hyprnav slot assign --env demo --slot 2 --managed
 hyprnav slot assign --env demo --slot 3 --managed
 hyprnav lock demo
 hyprnav goto --slot 2
+```
+
+### Override a child command while inheriting the parent workspace
+
+```bash
+hyprnav env ensure --env x
+hyprnav env ensure --env x.y.z
+hyprnav slot assign --env x --slot 2 --managed --launch -- ghostty
+hyprnav slot assign --env x.y.z --slot 2 --inherit
+hyprnav slot command set --env x.y.z --slot 2 -- kitty
+hyprnav slot resolve --env x.y.z --slot 2
 ```
 
 ### Create an environment from the current directory
