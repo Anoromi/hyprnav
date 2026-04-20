@@ -117,26 +117,49 @@ struct LaunchSlotKey {
 
 #[derive(Debug, Default)]
 struct PendingLaunchRegistry {
-    entries: HashMap<LaunchSlotKey, u64>,
+    entries: HashMap<LaunchSlotKey, PendingLaunchEntry>,
+}
+
+#[derive(Debug)]
+struct PendingLaunchEntry {
+    started_at_ms: u64,
+    workspace_id: i32,
 }
 
 impl PendingLaunchRegistry {
     fn purge_expired(&mut self, now_ms: u64) {
-        self.entries.retain(|_, started_at_ms| {
-            now_ms.saturating_sub(*started_at_ms) < LAUNCH_PENDING_TTL_MS
-        });
+        self.entries
+            .retain(|_, entry| now_ms.saturating_sub(entry.started_at_ms) < LAUNCH_PENDING_TTL_MS);
     }
 
     fn contains(&self, key: &LaunchSlotKey) -> bool {
         self.entries.contains_key(key)
     }
 
-    fn insert(&mut self, key: LaunchSlotKey, now_ms: u64) {
-        self.entries.insert(key, now_ms);
+    fn insert(&mut self, key: LaunchSlotKey, workspace_id: i32, now_ms: u64) {
+        self.entries.insert(
+            key,
+            PendingLaunchEntry {
+                started_at_ms: now_ms,
+                workspace_id,
+            },
+        );
     }
 
     fn remove(&mut self, key: &LaunchSlotKey) {
         self.entries.remove(key);
+    }
+
+    fn has_entries(&self) -> bool {
+        !self.entries.is_empty()
+    }
+
+    fn keys_for_workspaces(&self, workspace_ids: &HashSet<i32>) -> Vec<LaunchSlotKey> {
+        self.entries
+            .iter()
+            .filter(|(_, entry)| workspace_ids.contains(&entry.workspace_id))
+            .map(|(key, _)| key.clone())
+            .collect()
     }
 }
 
@@ -272,34 +295,76 @@ fn start_spawn_cleanup_thread(runtime: Arc<ServerRuntime>) {
             registry.expired_operations(now_ms())
         };
 
-        if expired.is_empty() {
+        if !expired.is_empty() {
+            let ids = expired
+                .iter()
+                .map(|operation| operation.operation_id.clone())
+                .collect::<HashSet<_>>();
+            let removed = {
+                let mut registry = match runtime.spawn_registry.lock() {
+                    Ok(registry) => registry,
+                    Err(error) => {
+                        warn!("spawn registry poisoned during cleanup: {error}");
+                        continue;
+                    }
+                };
+                registry.remove_many(&ids)
+            };
+
+            for operation in removed {
+                if operation.state == SpawnOperationState::Active {
+                    let _ = send_plugin_spawn_request(
+                        &runtime.paths,
+                        &PluginSpawnRequest::Unwatch {
+                            operation_id: &operation.operation_id,
+                        },
+                    );
+                }
+            }
+        }
+
+        let has_pending_launches = match runtime.pending_launches.lock() {
+            Ok(pending) => pending.has_entries(),
+            Err(error) => {
+                warn!("pending launch registry poisoned: {error}");
+                false
+            }
+        };
+        if !has_pending_launches {
             continue;
         }
 
-        let ids = expired
-            .iter()
-            .map(|operation| operation.operation_id.clone())
-            .collect::<HashSet<_>>();
-        let removed = {
-            let mut registry = match runtime.spawn_registry.lock() {
-                Ok(registry) => registry,
-                Err(error) => {
-                    warn!("spawn registry poisoned during cleanup: {error}");
-                    continue;
-                }
-            };
-            registry.remove_many(&ids)
-        };
-
-        for operation in removed {
-            if operation.state == SpawnOperationState::Active {
-                let _ = send_plugin_spawn_request(
-                    &runtime.paths,
-                    &PluginSpawnRequest::Unwatch {
-                        operation_id: &operation.operation_id,
-                    },
-                );
+        let occupied_workspace_ids = match mapped_workspace_ids(&runtime.paths) {
+            Ok(ids) => ids,
+            Err(error) => {
+                warn!("failed to inspect mapped clients for pending launches: {error}");
+                continue;
             }
+        };
+        if occupied_workspace_ids.is_empty() {
+            continue;
+        }
+
+        let keys_to_clear = match runtime.pending_launches.lock() {
+            Ok(pending) => pending.keys_for_workspaces(&occupied_workspace_ids),
+            Err(error) => {
+                warn!("pending launch registry poisoned during cleanup: {error}");
+                continue;
+            }
+        };
+        if keys_to_clear.is_empty() {
+            continue;
+        }
+
+        let mut pending = match runtime.pending_launches.lock() {
+            Ok(pending) => pending,
+            Err(error) => {
+                warn!("pending launch registry poisoned during removal: {error}");
+                continue;
+            }
+        };
+        for key in keys_to_clear {
+            pending.remove(&key);
         }
     });
 }
@@ -790,7 +855,7 @@ fn attempt_slot_launch(
                 error: None,
             });
         }
-        pending.insert(launch_key.clone(), now);
+        pending.insert(launch_key.clone(), record.workspace_id, now);
     }
 
     match run_in_workspace(&runtime.paths, record.workspace_id, argv) {
@@ -1296,11 +1361,17 @@ fn live_workspace_ids(paths: &RuntimePaths) -> Result<HashSet<i32>> {
 }
 
 fn workspace_has_mapped_clients(paths: &RuntimePaths, workspace_id: i32) -> Result<bool> {
+    Ok(mapped_workspace_ids(paths)?.contains(&workspace_id))
+}
+
+fn mapped_workspace_ids(paths: &RuntimePaths) -> Result<HashSet<i32>> {
     let clients = run_hyprctl_json(paths, &["-j", "clients"])?;
     let clients = serde_json::from_slice::<Vec<ClientInfo>>(&clients).unwrap_or_default();
     Ok(clients
         .into_iter()
-        .any(|client| client.mapped && client.workspace.id == workspace_id))
+        .filter(|client| client.mapped && client.workspace.id > 0)
+        .map(|client| client.workspace.id)
+        .collect())
 }
 
 fn goto_workspace(paths: &RuntimePaths, workspace_id: i32) -> Result<()> {
@@ -1576,7 +1647,7 @@ mod tests {
             slot_index: 1,
         };
         let mut registry = PendingLaunchRegistry::default();
-        registry.insert(key.clone(), 1_000);
+        registry.insert(key.clone(), 7, 1_000);
         assert!(registry.contains(&key));
 
         registry.purge_expired(1_000 + LAUNCH_PENDING_TTL_MS - 1);
@@ -1584,5 +1655,26 @@ mod tests {
 
         registry.purge_expired(1_000 + LAUNCH_PENDING_TTL_MS);
         assert!(!registry.contains(&key));
+    }
+
+    #[test]
+    fn pending_launch_registry_returns_keys_for_occupied_workspaces() {
+        let key_a = LaunchSlotKey {
+            environment_id: "demo".to_owned(),
+            slot_index: 1,
+        };
+        let key_b = LaunchSlotKey {
+            environment_id: "demo".to_owned(),
+            slot_index: 2,
+        };
+        let mut registry = PendingLaunchRegistry::default();
+        registry.insert(key_a.clone(), 7, 1_000);
+        registry.insert(key_b.clone(), 8, 1_000);
+
+        let occupied = HashSet::from([8]);
+        let keys = registry.keys_for_workspaces(&occupied);
+
+        assert_eq!(keys, vec![key_b]);
+        assert!(registry.contains(&key_a));
     }
 }
