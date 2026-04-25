@@ -539,10 +539,29 @@ fn try_handle_request(runtime: &Arc<ServerRuntime>, request: Request) -> Result<
         Request::SlotCommandClear { env, slot } => {
             ensure_positive_slot(slot)?;
             let resolved_env = resolve_required_environment(env.as_deref(), &runtime.store)?;
-            runtime
+            let cleared = runtime
                 .store
                 .clear_slot_launch_command(&resolved_env, slot)?;
-            slot_configuration_response(&runtime.store, &resolved_env, slot)
+            match slot_configuration_response(&runtime.store, &resolved_env, slot) {
+                Ok(mut value) => {
+                    if let Some(object) = value.as_object_mut() {
+                        object.insert("cleared".to_owned(), serde_json::Value::Bool(cleared));
+                    }
+                    Ok(value)
+                }
+                Err(_) if !cleared => Ok(json!({
+                    "environment_id": resolved_env,
+                    "slot_index": slot,
+                    "binding_environment_id": serde_json::Value::Null,
+                    "command_environment_id": serde_json::Value::Null,
+                    "physical_workspace_id": serde_json::Value::Null,
+                    "binding_kind": serde_json::Value::Null,
+                    "launch_argv": serde_json::Value::Null,
+                    "resolved": false,
+                    "cleared": false,
+                })),
+                Err(error) => Err(error),
+            }
         }
         Request::SlotResolve { env, slot } => {
             ensure_positive_slot(slot)?;
@@ -992,7 +1011,7 @@ fn resolve_slot_binding_for_workspace_id(
 }
 
 fn build_grid_snapshot(runtime: &ServerRuntime, cwd: Option<&str>) -> Result<GridSnapshot> {
-    let workspace_cards = current_workspace_cards(runtime, true)?;
+    let workspace_cards = current_workspace_cards(runtime, false)?;
     let cards_by_workspace = workspace_cards
         .into_iter()
         .map(|card| (card.workspace_id, card))
@@ -1005,6 +1024,10 @@ fn build_grid_snapshot(runtime: &ServerRuntime, cwd: Option<&str>) -> Result<Gri
         .filter(|value| !value.is_empty());
     let environments = runtime.store.list_environments()?;
     let local_bindings = runtime.store.list_local_bindings()?;
+    let binding_index = local_bindings
+        .iter()
+        .map(|binding| ((binding.env_id.as_str(), binding.slot_index), binding))
+        .collect::<HashMap<_, _>>();
 
     let mut rows = environments;
     let row_count = rows.len() as i32;
@@ -1033,9 +1056,11 @@ fn build_grid_snapshot(runtime: &ServerRuntime, cwd: Option<&str>) -> Result<Gri
         max_column_count = max_column_count.max(slot_indexes.len() as i32);
 
         for (column_index, slot_index) in slot_indexes.into_iter().enumerate() {
-            let Some(record) = runtime
-                .store
-                .resolve_slot_effective(&environment.env_id, slot_index)?
+            let Some(record) = resolve_slot_effective_from_bindings(
+                &binding_index,
+                &environment.env_id,
+                slot_index,
+            )
             else {
                 continue;
             };
@@ -1052,9 +1077,6 @@ fn build_grid_snapshot(runtime: &ServerRuntime, cwd: Option<&str>) -> Result<Gri
             } else if preview.is_file() {
                 preview.to_string_lossy().into_owned()
             } else {
-                if workspace_id != current_workspace_id {
-                    enqueue_preview_refresh_ids(runtime, [workspace_id]);
-                }
                 String::new()
             };
             let generation = preview_generation(runtime, workspace_id, &preview_path);
@@ -1099,6 +1121,51 @@ fn build_grid_snapshot(runtime: &ServerRuntime, cwd: Option<&str>) -> Result<Gri
         row_count,
         max_column_count,
     })
+}
+
+fn resolve_slot_effective_from_bindings<'a>(
+    binding_index: &HashMap<(&'a str, i32), &'a SlotBindingRecord>,
+    env_id: &str,
+    slot_index: i32,
+) -> Option<crate::db::SlotResolutionRecord> {
+    let chain = environment_chain(env_id);
+    let mut binding_environment_id = None;
+    let mut binding_kind = None;
+    let mut workspace_id = None;
+    let mut command_environment_id = None;
+    let mut launch_argv = None;
+
+    for candidate_env in chain {
+        let Some(local) = binding_index.get(&(candidate_env.as_str(), slot_index)) else {
+            continue;
+        };
+
+        if command_environment_id.is_none() && local.launch_argv.is_some() {
+            command_environment_id = Some(local.env_id.clone());
+            launch_argv = local.launch_argv.clone();
+        }
+
+        if binding_environment_id.is_none() && local.binding_kind.is_concrete() {
+            binding_environment_id = Some(local.env_id.clone());
+            binding_kind = Some(local.binding_kind);
+            workspace_id = local.workspace_id;
+        }
+    }
+
+    match (binding_environment_id, binding_kind, workspace_id) {
+        (Some(binding_environment_id), Some(binding_kind), Some(workspace_id)) => {
+            Some(crate::db::SlotResolutionRecord {
+                environment_id: env_id.to_owned(),
+                binding_environment_id,
+                command_environment_id,
+                slot_index,
+                binding_kind,
+                workspace_id,
+                launch_argv,
+            })
+        }
+        _ => None,
+    }
 }
 
 fn slot_indexes_for_environment(env_id: &str, bindings: &[SlotBindingRecord]) -> Vec<i32> {
@@ -1638,6 +1705,34 @@ mod tests {
             slot_indexes_for_environment("/tmp/x.y.z", &bindings),
             Vec::<i32>::new()
         );
+    }
+
+    #[test]
+    fn resolve_slot_effective_from_bindings_prefers_nearest_command_and_binding_sources() {
+        let bindings = vec![
+            binding("x", 1, 5),
+            SlotBindingRecord {
+                env_id: "x.y".to_owned(),
+                display_id: "x.y".to_owned(),
+                slot_index: 1,
+                binding_kind: SlotBindingKind::Inherit,
+                workspace_id: None,
+                launch_argv: Some(vec!["kitty".to_owned()]),
+            },
+        ];
+        let binding_index = bindings
+            .iter()
+            .map(|binding| ((binding.env_id.as_str(), binding.slot_index), binding))
+            .collect::<HashMap<_, _>>();
+
+        let record =
+            resolve_slot_effective_from_bindings(&binding_index, "x.y.z", 1).expect("resolved");
+
+        assert_eq!(record.environment_id, "x.y.z");
+        assert_eq!(record.binding_environment_id, "x");
+        assert_eq!(record.command_environment_id, Some("x.y".to_owned()));
+        assert_eq!(record.workspace_id, 5);
+        assert_eq!(record.launch_argv, Some(vec!["kitty".to_owned()]));
     }
 
     #[test]

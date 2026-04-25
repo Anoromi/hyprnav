@@ -16,7 +16,7 @@ Window {
     Timer {
         interval: 1000
         repeat: true
-        running: root.visible
+        running: false
         onTriggered: Controller.refreshSnapshotIfVisible()
     }
 

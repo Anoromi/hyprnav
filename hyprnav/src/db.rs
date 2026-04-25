@@ -350,7 +350,7 @@ impl StateStore {
         Ok(())
     }
 
-    pub fn clear_slot_launch_command(&self, env_id: &str, slot_index: i32) -> Result<()> {
+    pub fn clear_slot_launch_command(&self, env_id: &str, slot_index: i32) -> Result<bool> {
         let connection = self.open()?;
         let updated = connection.execute(
             "UPDATE slot_bindings
@@ -358,12 +358,7 @@ impl StateStore {
              WHERE env_id = ?1 AND slot_index = ?2",
             params![env_id, slot_index, now_unix()],
         )?;
-        if updated == 0 {
-            return Err(anyhow!(
-                "slot {slot_index} is not assigned for environment {env_id}"
-            ));
-        }
-        Ok(())
+        Ok(updated > 0)
     }
 
     pub fn list_local_bindings(&self) -> Result<Vec<SlotBindingRecord>> {
@@ -1009,7 +1004,7 @@ mod tests {
             )
             .unwrap();
 
-        store.clear_slot_launch_command("x.y", 4).unwrap();
+        assert!(store.clear_slot_launch_command("x.y", 4).unwrap());
         let record = store.resolve_slot_effective("x.y", 4).unwrap().unwrap();
         assert_eq!(record.binding_environment_id, "x");
         assert_eq!(record.command_environment_id, Some("x".to_owned()));
@@ -1117,9 +1112,19 @@ mod tests {
             Some(vec!["ghostty".to_owned(), "--class".to_owned()])
         );
 
-        store.clear_slot_launch_command("demo", 1).unwrap();
+        assert!(store.clear_slot_launch_command("demo", 1).unwrap());
         let cleared = store.resolve_slot_effective("demo", 1).unwrap().unwrap();
         assert_eq!(cleared.launch_argv, None);
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn clearing_missing_slot_launch_command_is_a_noop() {
+        let path = test_db_path("clear-missing-command");
+        let store = StateStore::new(&path).unwrap();
+
+        assert!(!store.clear_slot_launch_command("demo", 2).unwrap());
 
         cleanup(&path);
     }
