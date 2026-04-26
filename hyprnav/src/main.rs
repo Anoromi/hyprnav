@@ -1,16 +1,16 @@
 use cxx_qt_lib::{QGuiApplication, QQmlApplicationEngine, QString, QUrl};
 use hyprnav::cli::{
-    parse_args, ClientCommand, Command, EnvCommand, LockArgs, ResolveArgs, RunArgs, SlotAssignArgs,
-    SlotClearArgs, SlotCommand, SlotCommandClearArgs, SlotCommandSetArgs, SlotLaunchCommand,
-    SpawnArgs, SpawnInternalArgs,
+    parse_args, BatchArgs, ClientCommand, Command, EnvCommand, EnvTitleCommand, LockArgs,
+    ResolveArgs, RunArgs, SlotAssignArgs, SlotClearArgs, SlotCommand, SlotCommandClearArgs,
+    SlotCommandSetArgs, SlotLaunchCommand, SlotNameCommand, SpawnArgs, SpawnInternalArgs,
 };
 use hyprnav::controller::qobject::{
     hyprexpo_configure_root_window, hyprexpo_load_qml_from_module,
     hyprexpo_set_quit_on_last_window_closed,
 };
 use hyprnav::protocol::{
-    send_request_with_fallbacks, Request, SlotAssignmentMode, SpawnPrepared, SpawnStarted,
-    StatusSnapshot,
+    send_request_with_fallbacks, BatchMutationPayload, Request, SlotAssignmentMode, SpawnPrepared,
+    SpawnStarted, StatusSnapshot,
 };
 use hyprnav::runtime_paths::resolve_runtime_paths;
 use hyprnav::server::run_server;
@@ -20,6 +20,8 @@ use hyprnav::ui_session::{
     start_grid_session_listener, start_switcher_session_listener,
 };
 use serde_json::Value;
+use std::fs;
+use std::io::Read;
 use std::io::{self, Write};
 use std::process::Command as ProcessCommand;
 use std::process::ExitStatus;
@@ -86,10 +88,20 @@ fn main() -> anyhow::Result<()> {
                     env: args.env,
                     cwd: args.cwd,
                     client: args.client,
+                    title: args.title,
                 })),
                 EnvCommand::Delete(args) => {
                     print_json(send::<Value>(Request::EnvDelete { env: args.env }))
                 }
+                EnvCommand::Title(command) => match command {
+                    EnvTitleCommand::Set(args) => print_json(send::<Value>(Request::EnvTitleSet {
+                        env: args.env,
+                        title: args.title,
+                    })),
+                    EnvTitleCommand::Clear(args) => {
+                        print_json(send::<Value>(Request::EnvTitleClear { env: args.env }))
+                    }
+                },
             }
         }
         Command::Client(command) => {
@@ -110,6 +122,19 @@ fn main() -> anyhow::Result<()> {
                     SlotLaunchCommand::Set(args) => handle_slot_command_set(args),
                     SlotLaunchCommand::Clear(args) => handle_slot_command_clear(args),
                 },
+                SlotCommand::Name(command) => match command {
+                    SlotNameCommand::Set(args) => print_json(send::<Value>(Request::SlotNameSet {
+                        env: args.env,
+                        slot: args.slot,
+                        name: args.name,
+                    })),
+                    SlotNameCommand::Clear(args) => {
+                        print_json(send::<Value>(Request::SlotNameClear {
+                            env: args.env,
+                            slot: args.slot,
+                        }))
+                    }
+                },
             }
         }
         Command::Goto(args) => {
@@ -126,6 +151,10 @@ fn main() -> anyhow::Result<()> {
         Command::Spawn(args) => {
             ensure_server_running()?;
             handle_spawn(args)
+        }
+        Command::Batch(args) => {
+            ensure_server_running()?;
+            handle_batch(args)
         }
         Command::SpawnInternal(args) => {
             ensure_server_running()?;
@@ -170,6 +199,7 @@ fn handle_slot_assign(args: SlotAssignArgs) -> anyhow::Result<()> {
         client: args.client,
         cwd: args.cwd,
         launch_argv: args.launch.then_some(args.command),
+        display_name: args.name,
     }))
 }
 
@@ -193,6 +223,7 @@ fn handle_slot_command_set(args: SlotCommandSetArgs) -> anyhow::Result<()> {
         env: args.env,
         slot: args.slot,
         argv: args.command,
+        display_name: args.name,
     }))
 }
 
@@ -247,6 +278,17 @@ fn handle_spawn(args: SpawnArgs) -> anyhow::Result<()> {
     std::process::exit(exit_status_code(status));
 }
 
+fn handle_batch(args: BatchArgs) -> anyhow::Result<()> {
+    let payload = read_batch_payload(args)?;
+    if payload.operations.is_empty() {
+        return Err(anyhow::anyhow!("batch requires at least one operation"));
+    }
+    print_json(send::<Value>(Request::BatchMutate {
+        atomic: payload.atomic,
+        operations: payload.operations,
+    }))
+}
+
 fn handle_spawn_internal(args: SpawnInternalArgs) -> anyhow::Result<()> {
     if args.command.is_empty() {
         return Err(anyhow::anyhow!("spawn-internal requires a command"));
@@ -258,6 +300,29 @@ fn handle_spawn_internal(args: SpawnInternalArgs) -> anyhow::Result<()> {
     })?;
     exec_command(&args.command)?;
     Ok(())
+}
+
+fn read_batch_payload(args: BatchArgs) -> anyhow::Result<BatchMutationPayload> {
+    match (args.file, args.stdin) {
+        (Some(_), true) => Err(anyhow::anyhow!(
+            "batch requires exactly one of --file or --stdin"
+        )),
+        (None, false) => Err(anyhow::anyhow!(
+            "batch requires exactly one of --file or --stdin"
+        )),
+        (Some(path), false) => {
+            let content = fs::read_to_string(&path)
+                .map_err(|error| anyhow::anyhow!("reading batch payload from {path}: {error}"))?;
+            serde_json::from_str(&content)
+                .map_err(|error| anyhow::anyhow!("decoding batch payload from {path}: {error}"))
+        }
+        (None, true) => {
+            let mut content = String::new();
+            io::stdin().read_to_string(&mut content)?;
+            serde_json::from_str(&content)
+                .map_err(|error| anyhow::anyhow!("decoding batch payload from stdin: {error}"))
+        }
+    }
 }
 
 fn print_json(result: anyhow::Result<Value>) -> anyhow::Result<()> {
@@ -387,5 +452,85 @@ fn exit_status_code(status: ExitStatus) -> i32 {
     #[cfg(not(unix))]
     {
         status.code().unwrap_or(1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hyprnav::protocol::BatchMutationRequest;
+    use std::env;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_file(label: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        env::temp_dir().join(format!("hyprnav-main-{label}-{unique}.json"))
+    }
+
+    #[test]
+    fn read_batch_payload_rejects_missing_source() {
+        let error = read_batch_payload(BatchArgs {
+            file: None,
+            stdin: false,
+        })
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("exactly one of --file or --stdin"));
+    }
+
+    #[test]
+    fn read_batch_payload_rejects_multiple_sources() {
+        let error = read_batch_payload(BatchArgs {
+            file: Some("/tmp/payload.json".to_owned()),
+            stdin: true,
+        })
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("exactly one of --file or --stdin"));
+    }
+
+    #[test]
+    fn read_batch_payload_reads_from_file() {
+        let path = unique_temp_file("batch-file");
+        fs::write(
+            &path,
+            r#"{"atomic":true,"operations":[{"op":"lock_clear"}]}"#,
+        )
+        .unwrap();
+
+        let payload = read_batch_payload(BatchArgs {
+            file: Some(path.to_string_lossy().into_owned()),
+            stdin: false,
+        })
+        .unwrap();
+
+        assert!(payload.atomic);
+        assert_eq!(payload.operations.len(), 1);
+        assert!(matches!(
+            payload.operations[0],
+            BatchMutationRequest::LockClear
+        ));
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn read_batch_payload_reports_malformed_json() {
+        let path = unique_temp_file("batch-bad-json");
+        fs::write(&path, "{not-json").unwrap();
+
+        let error = read_batch_payload(BatchArgs {
+            file: Some(path.to_string_lossy().into_owned()),
+            stdin: false,
+        })
+        .unwrap_err();
+
+        assert!(error.to_string().contains("decoding batch payload"));
+        fs::remove_file(path).unwrap();
     }
 }

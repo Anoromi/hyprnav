@@ -8,6 +8,7 @@ use std::path::Path;
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct WorkspaceCardSnapshot {
     pub workspace_id: i32,
+    pub slot_index: i32,
     pub workspace_name: String,
     pub subtitle: String,
     pub app_class: String,
@@ -27,9 +28,11 @@ pub struct SwitcherSnapshot {
 pub struct GridCellSnapshot {
     pub environment_id: String,
     pub environment_display_id: String,
+    pub environment_title: String,
     pub binding_environment_id: Option<String>,
     pub command_environment_id: Option<String>,
     pub slot_index: i32,
+    pub slot_display_name: String,
     pub physical_workspace_id: i32,
     pub binding_kind: String,
     pub inherited: bool,
@@ -66,6 +69,7 @@ pub struct SlotResolution {
     pub binding_environment_id: String,
     pub command_environment_id: Option<String>,
     pub slot_index: i32,
+    pub display_name: Option<String>,
     pub physical_workspace_id: i32,
     pub binding_kind: String,
     pub launch_argv: Option<Vec<String>>,
@@ -123,17 +127,21 @@ pub struct SpawnStarted {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
-pub enum Request {
-    Ping,
-    StatusGet {
-        cwd: Option<String>,
-    },
+pub enum BatchMutationRequest {
     EnvEnsure {
         env: Option<String>,
         cwd: Option<String>,
         client: Option<String>,
+        title: Option<String>,
     },
     EnvDelete {
+        env: String,
+    },
+    EnvTitleSet {
+        env: String,
+        title: String,
+    },
+    EnvTitleClear {
         env: String,
     },
     ClientEnsure {
@@ -146,6 +154,7 @@ pub enum Request {
         client: Option<String>,
         cwd: Option<String>,
         launch_argv: Option<Vec<String>>,
+        display_name: Option<String>,
     },
     SlotClear {
         env: Option<String>,
@@ -156,8 +165,120 @@ pub enum Request {
         env: Option<String>,
         slot: i32,
         argv: Vec<String>,
+        display_name: Option<String>,
     },
     SlotCommandClear {
+        env: Option<String>,
+        slot: i32,
+    },
+    SlotNameSet {
+        env: Option<String>,
+        slot: i32,
+        name: String,
+    },
+    SlotNameClear {
+        env: Option<String>,
+        slot: i32,
+    },
+    LockSet {
+        env: String,
+    },
+    LockClear,
+}
+
+impl BatchMutationRequest {
+    pub fn op_name(&self) -> &'static str {
+        match self {
+            Self::EnvEnsure { .. } => "env_ensure",
+            Self::EnvDelete { .. } => "env_delete",
+            Self::EnvTitleSet { .. } => "env_title_set",
+            Self::EnvTitleClear { .. } => "env_title_clear",
+            Self::ClientEnsure { .. } => "client_ensure",
+            Self::SlotAssign { .. } => "slot_assign",
+            Self::SlotClear { .. } => "slot_clear",
+            Self::SlotCommandSet { .. } => "slot_command_set",
+            Self::SlotCommandClear { .. } => "slot_command_clear",
+            Self::SlotNameSet { .. } => "slot_name_set",
+            Self::SlotNameClear { .. } => "slot_name_clear",
+            Self::LockSet { .. } => "lock_set",
+            Self::LockClear => "lock_clear",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct BatchMutationPayload {
+    pub atomic: bool,
+    pub operations: Vec<BatchMutationRequest>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(transparent)]
+pub struct BatchMutationOperationResult(pub serde_json::Value);
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct BatchMutationResponse {
+    pub atomic: bool,
+    pub operation_count: usize,
+    pub results: Vec<BatchMutationOperationResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum Request {
+    Ping,
+    StatusGet {
+        cwd: Option<String>,
+    },
+    EnvEnsure {
+        env: Option<String>,
+        cwd: Option<String>,
+        client: Option<String>,
+        title: Option<String>,
+    },
+    EnvDelete {
+        env: String,
+    },
+    EnvTitleSet {
+        env: String,
+        title: String,
+    },
+    EnvTitleClear {
+        env: String,
+    },
+    ClientEnsure {
+        client: String,
+    },
+    SlotAssign {
+        env: Option<String>,
+        slot: i32,
+        assignment_mode: SlotAssignmentMode,
+        client: Option<String>,
+        cwd: Option<String>,
+        launch_argv: Option<Vec<String>>,
+        display_name: Option<String>,
+    },
+    SlotClear {
+        env: Option<String>,
+        slot: i32,
+        client: Option<String>,
+    },
+    SlotCommandSet {
+        env: Option<String>,
+        slot: i32,
+        argv: Vec<String>,
+        display_name: Option<String>,
+    },
+    SlotCommandClear {
+        env: Option<String>,
+        slot: i32,
+    },
+    SlotNameSet {
+        env: Option<String>,
+        slot: i32,
+        name: String,
+    },
+    SlotNameClear {
         env: Option<String>,
         slot: i32,
     },
@@ -197,6 +318,10 @@ pub enum Request {
     },
     UiSnapshotGrid {
         cwd: Option<String>,
+    },
+    BatchMutate {
+        atomic: bool,
+        operations: Vec<BatchMutationRequest>,
     },
 }
 
@@ -276,6 +401,41 @@ pub fn send_request<R: DeserializeOwned>(path: &Path, request: &Request) -> Resu
             message: "request failed".to_owned(),
         });
         Err(anyhow!("{}: {}", error.code, error.message))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_batch_mutate_request() {
+        let request = read_request(
+            r#"{"op":"batch_mutate","atomic":true,"operations":[{"op":"env_ensure","env":"demo","cwd":"/repo"},{"op":"lock_clear"}]}"#,
+        )
+        .unwrap();
+
+        match request {
+            Request::BatchMutate { atomic, operations } => {
+                assert!(atomic);
+                assert_eq!(operations.len(), 2);
+                assert!(matches!(
+                    operations[0],
+                    BatchMutationRequest::EnvEnsure { .. }
+                ));
+                assert!(matches!(operations[1], BatchMutationRequest::LockClear));
+            }
+            other => panic!("expected batch mutate request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_unsupported_batch_operation_during_decode() {
+        let error = serde_json::from_str::<BatchMutationPayload>(
+            r#"{"atomic":true,"operations":[{"op":"ping"}]}"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("unknown variant"));
     }
 }
 

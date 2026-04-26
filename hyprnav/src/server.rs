@@ -1,19 +1,19 @@
-use crate::db::{
-    environment_chain, environment_has_parent, SlotBindingKind, SlotBindingRecord, StateStore,
-};
+use crate::db::{environment_chain, environment_has_parent, SlotBindingRecord, StateStore};
 use crate::protocol::{
-    read_request, write_response, GridCellSnapshot, GridSnapshot, NavigationLaunchResult,
+    read_request, write_response, BatchMutationOperationResult, BatchMutationRequest,
+    BatchMutationResponse, GridCellSnapshot, GridSnapshot, NavigationLaunchResult,
     NavigationLaunchSkippedReason, Request, Response, SlotAssignmentMode, SlotResolution,
     SpawnPrepared, SpawnStarted, StatusSnapshot, SwitcherSnapshot, WorkspaceCardSnapshot,
     WorkspaceNavigationResult,
 };
 use crate::runtime_paths::{ensure_parent_dir, preview_path, resolve_runtime_paths, RuntimePaths};
 use crate::spawn::{
-    now_ms, parse_spawn_focus_policy, parse_spawn_target, SpawnFocusPolicy, SpawnOperation,
-    SpawnOperationState, SpawnOriginSnapshot, SpawnRegistry,
+    now_ms, parse_spawn_focus_policy, parse_spawn_target, SpawnFocusPolicy, SpawnOperationState,
+    SpawnOriginSnapshot, SpawnRegistry,
 };
 use crate::workspace_utils::{build_workspace_descriptors, initial_selection_index};
 use anyhow::{anyhow, Context, Result};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
@@ -36,6 +36,8 @@ const LAUNCH_PENDING_TTL_MS: u64 = 30_000;
 #[derive(Clone, Debug)]
 struct WorkspaceCardData {
     workspace_id: i32,
+    slot_index: i32,
+    slot_display_name: String,
     workspace_name: String,
     subtitle: String,
     app_class: String,
@@ -105,6 +107,7 @@ struct PluginSpawnError {
 #[derive(Debug, Default)]
 struct PreviewRefreshState {
     pending_ids: HashSet<i32>,
+    urgent_ids: HashSet<i32>,
     last_requested_ms: HashMap<i32, u64>,
     known_generations: HashMap<i32, u64>,
 }
@@ -252,6 +255,28 @@ fn start_hypr_event_thread(runtime: Arc<ServerRuntime>) {
                                             &runtime,
                                             [previous_workspace_id],
                                         );
+                                    }
+                                    enqueue_urgent_preview_refresh_ids(
+                                        &runtime,
+                                        [next_workspace_id],
+                                    );
+                                    let locked_environment_id =
+                                        runtime.store.locked_environment().ok().flatten();
+                                    if let Ok(Some(environment_id)) =
+                                        resolve_environment_for_physical_workspace(
+                                            &runtime.store,
+                                            next_workspace_id,
+                                            locked_environment_id.as_deref(),
+                                        )
+                                    {
+                                        if let Err(error) =
+                                            runtime.store.record_environment_focus(&environment_id)
+                                        {
+                                            warn!(
+                                                "failed to record environment focus for {}: {error}",
+                                                environment_id
+                                            );
+                                        }
                                     }
                                     previous_workspace_id = next_workspace_id;
                                 }
@@ -464,28 +489,31 @@ fn try_handle_request(runtime: &Arc<ServerRuntime>, request: Request) -> Result<
                 .transpose()?
                 .filter(|value| !value.is_empty()),
         })?),
-        Request::EnvEnsure { env, cwd, client } => {
-            let resolved = resolve_or_default_environment(env.as_deref(), cwd.as_deref())?;
-            let display_id = default_display_id(env.as_deref(), &resolved);
-            let record = runtime.store.ensure_environment(
-                &resolved,
-                &display_id,
-                cwd.as_deref(),
-                client.as_deref(),
-            )?;
-            Ok(json!({
-                "env_id": record.env_id,
-                "display_id": record.display_id,
-                "source_path": record.source_path,
-            }))
-        }
+        Request::EnvEnsure {
+            env,
+            cwd,
+            client,
+            title,
+        } => apply_mutation_request(
+            runtime,
+            BatchMutationRequest::EnvEnsure {
+                env,
+                cwd,
+                client,
+                title,
+            },
+        ),
         Request::EnvDelete { env } => {
-            runtime.store.delete_environment(&env)?;
-            Ok(json!({"deleted": true, "env_id": env}))
+            apply_mutation_request(runtime, BatchMutationRequest::EnvDelete { env })
+        }
+        Request::EnvTitleSet { env, title } => {
+            apply_mutation_request(runtime, BatchMutationRequest::EnvTitleSet { env, title })
+        }
+        Request::EnvTitleClear { env } => {
+            apply_mutation_request(runtime, BatchMutationRequest::EnvTitleClear { env })
         }
         Request::ClientEnsure { client } => {
-            runtime.store.ensure_client(&client)?;
-            Ok(json!({"client_id": client}))
+            apply_mutation_request(runtime, BatchMutationRequest::ClientEnsure { client })
         }
         Request::SlotAssign {
             env,
@@ -494,74 +522,47 @@ fn try_handle_request(runtime: &Arc<ServerRuntime>, request: Request) -> Result<
             client,
             cwd,
             launch_argv,
-        } => {
-            ensure_positive_slot(slot)?;
-            let resolved_env =
-                resolve_explicit_or_default(env.as_deref(), cwd.as_deref(), &runtime.store)?;
-            if matches!(assignment_mode, SlotAssignmentMode::Inherit)
-                && !environment_has_parent(&resolved_env)
-            {
-                return Err(anyhow!(
-                    "slot assign --inherit requires a named dotted environment with a parent"
-                ));
-            }
-            let display_id = default_display_id(env.as_deref(), &resolved_env);
-            let live_workspace_ids = live_workspace_ids(&runtime.paths)?;
-            runtime.store.assign_slot(
-                &resolved_env,
+            display_name,
+        } => apply_mutation_request(
+            runtime,
+            BatchMutationRequest::SlotAssign {
+                env,
                 slot,
-                &assignment_mode,
-                &display_id,
-                cwd.as_deref(),
-                client.as_deref(),
-                &live_workspace_ids,
-                launch_argv.as_deref(),
-            )?;
-            slot_configuration_response(&runtime.store, &resolved_env, slot)
-        }
-        Request::SlotClear { env, slot, .. } => {
-            ensure_positive_slot(slot)?;
-            let resolved_env = resolve_required_environment(env.as_deref(), &runtime.store)?;
-            runtime.store.clear_slot(&resolved_env, slot)?;
-            Ok(json!({"cleared": true, "env_id": resolved_env, "slot": slot}))
-        }
-        Request::SlotCommandSet { env, slot, argv } => {
-            ensure_positive_slot(slot)?;
-            if argv.is_empty() {
-                return Err(anyhow!("slot command set requires a command"));
-            }
-            let resolved_env = resolve_required_environment(env.as_deref(), &runtime.store)?;
-            runtime
-                .store
-                .set_slot_launch_command(&resolved_env, slot, &argv)?;
-            slot_configuration_response(&runtime.store, &resolved_env, slot)
-        }
-        Request::SlotCommandClear { env, slot } => {
-            ensure_positive_slot(slot)?;
-            let resolved_env = resolve_required_environment(env.as_deref(), &runtime.store)?;
-            let cleared = runtime
-                .store
-                .clear_slot_launch_command(&resolved_env, slot)?;
-            match slot_configuration_response(&runtime.store, &resolved_env, slot) {
-                Ok(mut value) => {
-                    if let Some(object) = value.as_object_mut() {
-                        object.insert("cleared".to_owned(), serde_json::Value::Bool(cleared));
-                    }
-                    Ok(value)
-                }
-                Err(_) if !cleared => Ok(json!({
-                    "environment_id": resolved_env,
-                    "slot_index": slot,
-                    "binding_environment_id": serde_json::Value::Null,
-                    "command_environment_id": serde_json::Value::Null,
-                    "physical_workspace_id": serde_json::Value::Null,
-                    "binding_kind": serde_json::Value::Null,
-                    "launch_argv": serde_json::Value::Null,
-                    "resolved": false,
-                    "cleared": false,
-                })),
-                Err(error) => Err(error),
-            }
+                assignment_mode,
+                client,
+                cwd,
+                launch_argv,
+                display_name,
+            },
+        ),
+        Request::SlotClear { env, slot, client } => apply_mutation_request(
+            runtime,
+            BatchMutationRequest::SlotClear { env, slot, client },
+        ),
+        Request::SlotCommandSet {
+            env,
+            slot,
+            argv,
+            display_name,
+        } => apply_mutation_request(
+            runtime,
+            BatchMutationRequest::SlotCommandSet {
+                env,
+                slot,
+                argv,
+                display_name,
+            },
+        ),
+        Request::SlotCommandClear { env, slot } => apply_mutation_request(
+            runtime,
+            BatchMutationRequest::SlotCommandClear { env, slot },
+        ),
+        Request::SlotNameSet { env, slot, name } => apply_mutation_request(
+            runtime,
+            BatchMutationRequest::SlotNameSet { env, slot, name },
+        ),
+        Request::SlotNameClear { env, slot } => {
+            apply_mutation_request(runtime, BatchMutationRequest::SlotNameClear { env, slot })
         }
         Request::SlotResolve { env, slot } => {
             ensure_positive_slot(slot)?;
@@ -575,19 +576,9 @@ fn try_handle_request(runtime: &Arc<ServerRuntime>, request: Request) -> Result<
             Ok(serde_json::to_value(slot_resolution_from_record(record))?)
         }
         Request::LockSet { env } => {
-            runtime.store.ensure_environment(
-                &env,
-                &default_display_id(Some(&env), &env),
-                None,
-                None,
-            )?;
-            runtime.store.set_locked_environment(&env)?;
-            Ok(json!({"locked_environment_id": env}))
+            apply_mutation_request(runtime, BatchMutationRequest::LockSet { env })
         }
-        Request::LockClear => {
-            runtime.store.clear_locked_environment()?;
-            Ok(json!({"locked_environment_id": serde_json::Value::Null}))
-        }
+        Request::LockClear => apply_mutation_request(runtime, BatchMutationRequest::LockClear),
         Request::WorkspaceGoto { env, slot } => {
             ensure_positive_slot(slot)?;
             let resolved_env = resolve_required_environment(env.as_deref(), &runtime.store)?;
@@ -598,6 +589,7 @@ fn try_handle_request(runtime: &Arc<ServerRuntime>, request: Request) -> Result<
                     anyhow!("slot {slot} is not assigned for environment {resolved_env}")
                 })?;
             goto_workspace(&runtime.paths, record.workspace_id)?;
+            runtime.store.record_environment_focus(&resolved_env)?;
             let launch = attempt_slot_launch(runtime, &record)?;
             Ok(serde_json::to_value(WorkspaceNavigationResult {
                 workspace_id: record.workspace_id,
@@ -607,11 +599,19 @@ fn try_handle_request(runtime: &Arc<ServerRuntime>, request: Request) -> Result<
         }
         Request::WorkspaceGotoPhysical { workspace_id } => {
             goto_workspace(&runtime.paths, workspace_id)?;
+            let locked_environment_id = runtime.store.locked_environment()?;
             let (record, skipped_reason) = resolve_slot_for_physical_workspace(
                 runtime,
                 workspace_id,
-                runtime.store.locked_environment()?.as_deref(),
+                locked_environment_id.as_deref(),
             )?;
+            if let Some(environment_id) = resolve_environment_for_physical_workspace(
+                &runtime.store,
+                workspace_id,
+                locked_environment_id.as_deref(),
+            )? {
+                runtime.store.record_environment_focus(&environment_id)?;
+            }
             let launch = if let Some(record) = record.as_ref() {
                 attempt_slot_launch(runtime, record)?
             } else {
@@ -756,11 +756,391 @@ fn try_handle_request(runtime: &Arc<ServerRuntime>, request: Request) -> Result<
             let snapshot = build_grid_snapshot(runtime, cwd.as_deref())?;
             Ok(serde_json::to_value(snapshot)?)
         }
+        Request::BatchMutate { atomic, operations } => {
+            if !atomic {
+                return Err(anyhow!("best-effort batch mode is not implemented"));
+            }
+            if operations.is_empty() {
+                return Err(anyhow!("batch requires at least one operation"));
+            }
+            handle_batch_mutate(runtime, operations)
+        }
+    }
+}
+
+fn apply_mutation_request(
+    runtime: &Arc<ServerRuntime>,
+    request: BatchMutationRequest,
+) -> Result<serde_json::Value> {
+    apply_batch_mutation_request(runtime, None, request)
+}
+
+fn handle_batch_mutate(
+    runtime: &Arc<ServerRuntime>,
+    operations: Vec<BatchMutationRequest>,
+) -> Result<serde_json::Value> {
+    runtime.store.with_transaction(|connection| {
+        let mut results = Vec::with_capacity(operations.len());
+        for (index, operation) in operations.iter().cloned().enumerate() {
+            let op_name = operation.op_name();
+            let value = apply_batch_mutation_request(runtime, Some(connection), operation)
+                .map_err(|error| anyhow!("batch operation {index} ({op_name}) failed: {error}"))?;
+            results.push(BatchMutationOperationResult(value));
+        }
+
+        serde_json::to_value(BatchMutationResponse {
+            atomic: true,
+            operation_count: results.len(),
+            results,
+        })
+        .map_err(Into::into)
+    })
+}
+
+fn apply_batch_mutation_request(
+    runtime: &Arc<ServerRuntime>,
+    connection: Option<&Connection>,
+    request: BatchMutationRequest,
+) -> Result<serde_json::Value> {
+    match request {
+        BatchMutationRequest::EnvEnsure {
+            env,
+            cwd,
+            client,
+            title,
+        } => {
+            let resolved = resolve_or_default_environment(env.as_deref(), cwd.as_deref())?;
+            let display_id = default_display_id(env.as_deref(), &resolved);
+            let record = match connection {
+                Some(connection) => runtime.store.ensure_environment_with_connection(
+                    connection,
+                    &resolved,
+                    &display_id,
+                    cwd.as_deref(),
+                    client.as_deref(),
+                    title.as_deref(),
+                )?,
+                None => runtime.store.ensure_environment(
+                    &resolved,
+                    &display_id,
+                    cwd.as_deref(),
+                    client.as_deref(),
+                    title.as_deref(),
+                )?,
+            };
+            Ok(json!({
+                "env_id": record.env_id,
+                "display_id": record.display_id,
+                "title": record.title,
+                "source_path": record.source_path,
+            }))
+        }
+        BatchMutationRequest::EnvDelete { env } => {
+            match connection {
+                Some(connection) => runtime
+                    .store
+                    .delete_environment_with_connection(connection, &env)?,
+                None => runtime.store.delete_environment(&env)?,
+            }
+            Ok(json!({"deleted": true, "env_id": env}))
+        }
+        BatchMutationRequest::EnvTitleSet { env, title } => {
+            match connection {
+                Some(connection) => runtime
+                    .store
+                    .set_environment_title_with_connection(connection, &env, &title)?,
+                None => runtime.store.set_environment_title(&env, &title)?,
+            }
+            Ok(json!({"env_id": env, "title": title}))
+        }
+        BatchMutationRequest::EnvTitleClear { env } => {
+            match connection {
+                Some(connection) => runtime
+                    .store
+                    .clear_environment_title_with_connection(connection, &env)?,
+                None => runtime.store.clear_environment_title(&env)?,
+            }
+            Ok(json!({"env_id": env, "title": serde_json::Value::Null}))
+        }
+        BatchMutationRequest::ClientEnsure { client } => {
+            match connection {
+                Some(connection) => runtime
+                    .store
+                    .ensure_client_with_connection(connection, &client)?,
+                None => runtime.store.ensure_client(&client)?,
+            }
+            Ok(json!({"client_id": client}))
+        }
+        BatchMutationRequest::SlotAssign {
+            env,
+            slot,
+            assignment_mode,
+            client,
+            cwd,
+            launch_argv,
+            display_name,
+        } => {
+            ensure_positive_slot(slot)?;
+            let resolved_env = resolve_explicit_or_default_with_connection(
+                env.as_deref(),
+                cwd.as_deref(),
+                &runtime.store,
+                connection,
+            )?;
+            if matches!(assignment_mode, SlotAssignmentMode::Inherit)
+                && !environment_has_parent(&resolved_env)
+            {
+                return Err(anyhow!(
+                    "slot assign --inherit requires a named dotted environment with a parent"
+                ));
+            }
+            let display_id = default_display_id(env.as_deref(), &resolved_env);
+            let live_workspace_ids = live_workspace_ids(&runtime.paths)?;
+            match connection {
+                Some(connection) => runtime.store.assign_slot_with_connection(
+                    connection,
+                    &resolved_env,
+                    slot,
+                    &assignment_mode,
+                    &display_id,
+                    cwd.as_deref(),
+                    client.as_deref(),
+                    &live_workspace_ids,
+                    launch_argv.as_deref(),
+                    display_name.as_deref(),
+                )?,
+                None => runtime.store.assign_slot(
+                    &resolved_env,
+                    slot,
+                    &assignment_mode,
+                    &display_id,
+                    cwd.as_deref(),
+                    client.as_deref(),
+                    &live_workspace_ids,
+                    launch_argv.as_deref(),
+                    display_name.as_deref(),
+                )?,
+            }
+            slot_configuration_response_with_connection(
+                &runtime.store,
+                connection,
+                &resolved_env,
+                slot,
+            )
+        }
+        BatchMutationRequest::SlotClear { env, slot, .. } => {
+            ensure_positive_slot(slot)?;
+            let resolved_env = resolve_required_environment_with_connection(
+                env.as_deref(),
+                &runtime.store,
+                connection,
+            )?;
+            match connection {
+                Some(connection) => {
+                    runtime
+                        .store
+                        .clear_slot_with_connection(connection, &resolved_env, slot)?
+                }
+                None => runtime.store.clear_slot(&resolved_env, slot)?,
+            }
+            Ok(json!({"cleared": true, "env_id": resolved_env, "slot": slot}))
+        }
+        BatchMutationRequest::SlotCommandSet {
+            env,
+            slot,
+            argv,
+            display_name,
+        } => {
+            ensure_positive_slot(slot)?;
+            if argv.is_empty() {
+                return Err(anyhow!("slot command set requires a command"));
+            }
+            let resolved_env = resolve_required_environment_with_connection(
+                env.as_deref(),
+                &runtime.store,
+                connection,
+            )?;
+            match connection {
+                Some(connection) => runtime.store.set_slot_launch_command_with_connection(
+                    connection,
+                    &resolved_env,
+                    slot,
+                    &argv,
+                    display_name.as_deref(),
+                )?,
+                None => runtime.store.set_slot_launch_command(
+                    &resolved_env,
+                    slot,
+                    &argv,
+                    display_name.as_deref(),
+                )?,
+            }
+            slot_configuration_response_with_connection(
+                &runtime.store,
+                connection,
+                &resolved_env,
+                slot,
+            )
+        }
+        BatchMutationRequest::SlotCommandClear { env, slot } => {
+            ensure_positive_slot(slot)?;
+            let resolved_env = resolve_required_environment_with_connection(
+                env.as_deref(),
+                &runtime.store,
+                connection,
+            )?;
+            let cleared = match connection {
+                Some(connection) => runtime.store.clear_slot_launch_command_with_connection(
+                    connection,
+                    &resolved_env,
+                    slot,
+                )?,
+                None => runtime
+                    .store
+                    .clear_slot_launch_command(&resolved_env, slot)?,
+            };
+            match slot_configuration_response_with_connection(
+                &runtime.store,
+                connection,
+                &resolved_env,
+                slot,
+            ) {
+                Ok(mut value) => {
+                    if let Some(object) = value.as_object_mut() {
+                        object.insert("cleared".to_owned(), serde_json::Value::Bool(cleared));
+                    }
+                    Ok(value)
+                }
+                Err(_) if !cleared => Ok(json!({
+                    "environment_id": resolved_env,
+                    "slot_index": slot,
+                    "binding_environment_id": serde_json::Value::Null,
+                    "command_environment_id": serde_json::Value::Null,
+                    "physical_workspace_id": serde_json::Value::Null,
+                    "binding_kind": serde_json::Value::Null,
+                    "launch_argv": serde_json::Value::Null,
+                    "resolved": false,
+                    "cleared": false,
+                })),
+                Err(error) => Err(error),
+            }
+        }
+        BatchMutationRequest::SlotNameSet { env, slot, name } => {
+            ensure_positive_slot(slot)?;
+            let resolved_env = resolve_required_environment_with_connection(
+                env.as_deref(),
+                &runtime.store,
+                connection,
+            )?;
+            match connection {
+                Some(connection) => runtime.store.set_slot_display_name_with_connection(
+                    connection,
+                    &resolved_env,
+                    slot,
+                    &name,
+                )?,
+                None => runtime
+                    .store
+                    .set_slot_display_name(&resolved_env, slot, &name)?,
+            }
+            slot_configuration_response_with_connection(
+                &runtime.store,
+                connection,
+                &resolved_env,
+                slot,
+            )
+        }
+        BatchMutationRequest::SlotNameClear { env, slot } => {
+            ensure_positive_slot(slot)?;
+            let resolved_env = resolve_required_environment_with_connection(
+                env.as_deref(),
+                &runtime.store,
+                connection,
+            )?;
+            let cleared = match connection {
+                Some(connection) => runtime.store.clear_slot_display_name_with_connection(
+                    connection,
+                    &resolved_env,
+                    slot,
+                )?,
+                None => runtime.store.clear_slot_display_name(&resolved_env, slot)?,
+            };
+            let mut value = slot_configuration_response_with_connection(
+                &runtime.store,
+                connection,
+                &resolved_env,
+                slot,
+            )?;
+            if let Some(object) = value.as_object_mut() {
+                object.insert("cleared".to_owned(), serde_json::Value::Bool(cleared));
+            }
+            Ok(value)
+        }
+        BatchMutationRequest::LockSet { env } => {
+            match connection {
+                Some(connection) => {
+                    runtime.store.ensure_environment_with_connection(
+                        connection,
+                        &env,
+                        &default_display_id(Some(&env), &env),
+                        None,
+                        None,
+                        None,
+                    )?;
+                    runtime
+                        .store
+                        .set_locked_environment_with_connection(connection, &env)?;
+                }
+                None => {
+                    runtime.store.ensure_environment(
+                        &env,
+                        &default_display_id(Some(&env), &env),
+                        None,
+                        None,
+                        None,
+                    )?;
+                    runtime.store.set_locked_environment(&env)?;
+                }
+            }
+            Ok(json!({"locked_environment_id": env}))
+        }
+        BatchMutationRequest::LockClear => {
+            match connection {
+                Some(connection) => runtime
+                    .store
+                    .clear_locked_environment_with_connection(connection)?,
+                None => runtime.store.clear_locked_environment()?,
+            }
+            Ok(json!({"locked_environment_id": serde_json::Value::Null}))
+        }
     }
 }
 
 fn build_switcher_snapshot(runtime: &ServerRuntime, reverse: bool) -> Result<SwitcherSnapshot> {
-    let descriptors = current_workspace_cards(runtime, true)?;
+    let local_bindings = runtime.store.list_local_bindings()?;
+    let locked_environment_id = runtime.store.locked_environment()?;
+    let descriptors = current_workspace_cards(runtime, true)?
+        .into_iter()
+        .map(|mut item| {
+            let (resolution, _) = resolve_slot_for_physical_workspace_with_store(
+                &runtime.store,
+                &local_bindings,
+                item.workspace_id,
+                locked_environment_id.as_deref(),
+            )?;
+            if let Some(resolution) = resolution {
+                item.slot_index = resolution.slot_index;
+                item.slot_display_name = resolution.display_name.unwrap_or_default();
+            }
+            item.workspace_name = live_display_label(
+                &item.subtitle,
+                &item.app_class,
+                Some(item.slot_display_name.as_str()),
+                &item.workspace_name,
+            );
+            Ok(item)
+        })
+        .collect::<Result<Vec<_>>>()?;
     let initial_index = initial_selection_index(
         &descriptors
             .iter()
@@ -782,6 +1162,7 @@ fn build_switcher_snapshot(runtime: &ServerRuntime, reverse: bool) -> Result<Swi
             .into_iter()
             .map(|item| WorkspaceCardSnapshot {
                 workspace_id: item.workspace_id,
+                slot_index: item.slot_index,
                 workspace_name: item.workspace_name,
                 subtitle: item.subtitle,
                 app_class: item.app_class,
@@ -801,6 +1182,7 @@ fn slot_resolution_from_record(record: crate::db::SlotResolutionRecord) -> SlotR
         binding_environment_id: record.binding_environment_id,
         command_environment_id: record.command_environment_id,
         slot_index: record.slot_index,
+        display_name: record.display_name,
         physical_workspace_id: record.workspace_id,
         binding_kind: record.binding_kind.as_str().to_owned(),
         launch_argv: record.launch_argv,
@@ -812,7 +1194,22 @@ fn slot_configuration_response(
     env_id: &str,
     slot_index: i32,
 ) -> Result<serde_json::Value> {
-    if let Some(record) = store.resolve_slot_effective(env_id, slot_index)? {
+    slot_configuration_response_with_connection(store, None, env_id, slot_index)
+}
+
+fn slot_configuration_response_with_connection(
+    store: &StateStore,
+    connection: Option<&Connection>,
+    env_id: &str,
+    slot_index: i32,
+) -> Result<serde_json::Value> {
+    let resolved = match connection {
+        Some(connection) => {
+            store.resolve_slot_effective_with_connection(connection, env_id, slot_index)?
+        }
+        None => store.resolve_slot_effective(env_id, slot_index)?,
+    };
+    if let Some(record) = resolved {
         let mut value = serde_json::to_value(slot_resolution_from_record(record))?;
         if let Some(object) = value.as_object_mut() {
             object.insert("resolved".to_owned(), serde_json::Value::Bool(true));
@@ -820,19 +1217,59 @@ fn slot_configuration_response(
         return Ok(value);
     }
 
-    let local = store
-        .get_local_slot(env_id, slot_index)?
-        .ok_or_else(|| anyhow!("slot {slot_index} is not assigned for environment {env_id}"))?;
+    let local = match connection {
+        Some(connection) => store.get_local_slot_with_connection(connection, env_id, slot_index)?,
+        None => store.get_local_slot(env_id, slot_index)?,
+    }
+    .ok_or_else(|| anyhow!("slot {slot_index} is not assigned for environment {env_id}"))?;
     Ok(json!({
         "environment_id": env_id,
         "binding_environment_id": serde_json::Value::Null,
         "command_environment_id": local.launch_argv.as_ref().map(|_| env_id.to_owned()),
         "slot_index": slot_index,
+        "display_name": local.display_name,
         "physical_workspace_id": serde_json::Value::Null,
         "binding_kind": local.binding_kind.as_str(),
         "launch_argv": local.launch_argv,
         "resolved": false,
     }))
+}
+
+fn resolve_required_environment_with_connection(
+    env: Option<&str>,
+    store: &StateStore,
+    connection: Option<&Connection>,
+) -> Result<String> {
+    if let Some(env) = env.filter(|value| !value.is_empty()) {
+        return Ok(env.to_owned());
+    }
+
+    match connection {
+        Some(connection) => store
+            .locked_environment_with_connection(connection)?
+            .ok_or_else(|| anyhow!("no environment specified and no global lock is active")),
+        None => resolve_required_environment(env, store),
+    }
+}
+
+fn resolve_explicit_or_default_with_connection(
+    env: Option<&str>,
+    cwd: Option<&str>,
+    store: &StateStore,
+    connection: Option<&Connection>,
+) -> Result<String> {
+    if let Some(env) = env.filter(|value| !value.is_empty()) {
+        return Ok(env.to_owned());
+    }
+
+    resolve_or_default_environment(None, cwd).or_else(|_| match connection {
+        Some(connection) => store
+            .locked_environment_with_connection(connection)?
+            .ok_or_else(|| anyhow!("no environment specified and no global lock is active")),
+        None => store
+            .locked_environment()?
+            .ok_or_else(|| anyhow!("no environment specified and no global lock is active")),
+    })
 }
 
 fn attempt_slot_launch(
@@ -931,6 +1368,21 @@ fn resolve_slot_for_physical_workspace(
     )
 }
 
+fn resolve_environment_for_physical_workspace(
+    store: &StateStore,
+    workspace_id: i32,
+    locked_environment_id: Option<&str>,
+) -> Result<Option<String>> {
+    let bindings = store.list_local_bindings()?;
+    let (record, _) = resolve_slot_for_physical_workspace_with_store(
+        store,
+        &bindings,
+        workspace_id,
+        locked_environment_id,
+    )?;
+    Ok(record.map(|record| record.environment_id))
+}
+
 fn resolve_slot_for_physical_workspace_with_store(
     store: &StateStore,
     bindings: &[SlotBindingRecord],
@@ -996,6 +1448,7 @@ fn resolve_slot_binding_for_workspace_id(
                 binding_environment_id: environment_id,
                 command_environment_id,
                 slot_index: binding.slot_index,
+                display_name: binding.display_name,
                 binding_kind: binding.binding_kind,
                 workspace_id: binding.workspace_id.expect("concrete binding workspace"),
                 launch_argv: binding.launch_argv,
@@ -1018,36 +1471,15 @@ fn build_grid_snapshot(runtime: &ServerRuntime, cwd: Option<&str>) -> Result<Gri
         .collect::<HashMap<_, _>>();
     let current_workspace_id = current_active_workspace_id(&runtime.paths)?;
     let locked_env_id = runtime.store.locked_environment()?;
-    let current_env_id = cwd
-        .map(resolve_environment_from_cwd)
-        .transpose()?
-        .filter(|value| !value.is_empty());
-    let environments = runtime.store.list_environments()?;
+    let _ = cwd;
+    let rows = runtime.store.list_environments()?;
     let local_bindings = runtime.store.list_local_bindings()?;
     let binding_index = local_bindings
         .iter()
         .map(|binding| ((binding.env_id.as_str(), binding.slot_index), binding))
         .collect::<HashMap<_, _>>();
 
-    let mut rows = environments;
-
-    rows.sort_by(|left_env, right_env| {
-        row_sort_key(
-            &left_env.env_id,
-            &left_env.display_id,
-            locked_env_id.as_deref(),
-            current_env_id.as_deref(),
-        )
-        .cmp(&row_sort_key(
-            &right_env.env_id,
-            &right_env.display_id,
-            locked_env_id.as_deref(),
-            current_env_id.as_deref(),
-        ))
-    });
-
     let mut items = Vec::new();
-    let mut initial_index = -1;
     let mut max_column_count = 0;
     let mut row_count = 0;
 
@@ -1080,24 +1512,19 @@ fn build_grid_snapshot(runtime: &ServerRuntime, cwd: Option<&str>) -> Result<Gri
             };
             let generation = preview_generation(runtime, workspace_id, &preview_path);
             let active = workspace_id == current_workspace_id;
-            let item_index = items.len() as i32;
-            if active
-                && (initial_index < 0
-                    || locked_env_id.as_deref() == Some(environment.env_id.as_str()))
-            {
-                initial_index = item_index + row_items.len() as i32;
-            }
 
             row_items.push(GridCellSnapshot {
                 environment_id: environment.env_id.clone(),
                 environment_display_id: environment.display_id.clone(),
+                environment_title: environment.title.clone().unwrap_or_default(),
                 binding_environment_id: Some(record.binding_environment_id.clone()),
                 command_environment_id: record.command_environment_id.clone(),
                 slot_index: record.slot_index,
+                slot_display_name: record.display_name.clone().unwrap_or_default(),
                 physical_workspace_id: workspace_id,
                 binding_kind: record.binding_kind.as_str().to_owned(),
                 inherited: record.binding_environment_id != environment.env_id,
-                workspace_name: workspace_id.to_string(),
+                workspace_name: workspace_display_label(card, &record, workspace_id),
                 subtitle: card
                     .map(|item| item.subtitle.clone())
                     .unwrap_or_else(|| format!("Workspace {}", workspace_id)),
@@ -1122,6 +1549,19 @@ fn build_grid_snapshot(runtime: &ServerRuntime, cwd: Option<&str>) -> Result<Gri
         row_count += 1;
     }
 
+    let initial_index = if items.is_empty() {
+        -1
+    } else {
+        items
+            .iter()
+            .position(|item| {
+                item.row_index == 0 && item.physical_workspace_id == current_workspace_id
+            })
+            .or_else(|| items.iter().position(|item| item.row_index == 0))
+            .map(|index| index as i32)
+            .unwrap_or(0)
+    };
+
     Ok(GridSnapshot {
         items,
         initial_index,
@@ -1140,12 +1580,17 @@ fn resolve_slot_effective_from_bindings<'a>(
     let mut binding_kind = None;
     let mut workspace_id = None;
     let mut command_environment_id = None;
+    let mut display_name = None;
     let mut launch_argv = None;
 
     for candidate_env in chain {
         let Some(local) = binding_index.get(&(candidate_env.as_str(), slot_index)) else {
             continue;
         };
+
+        if display_name.is_none() && local.display_name.is_some() {
+            display_name = local.display_name.clone();
+        }
 
         if command_environment_id.is_none() && local.launch_argv.is_some() {
             command_environment_id = Some(local.env_id.clone());
@@ -1166,6 +1611,7 @@ fn resolve_slot_effective_from_bindings<'a>(
                 binding_environment_id,
                 command_environment_id,
                 slot_index,
+                display_name,
                 binding_kind,
                 workspace_id,
                 launch_argv,
@@ -1173,6 +1619,38 @@ fn resolve_slot_effective_from_bindings<'a>(
         }
         _ => None,
     }
+}
+
+fn workspace_display_label(
+    card: Option<&WorkspaceCardData>,
+    record: &crate::db::SlotResolutionRecord,
+    workspace_id: i32,
+) -> String {
+    let fallback = format!("Workspace {}", workspace_id);
+    live_display_label(
+        card.map(|item| item.subtitle.as_str()).unwrap_or_default(),
+        card.map(|item| item.app_class.as_str()).unwrap_or_default(),
+        record.display_name.as_deref(),
+        &fallback,
+    )
+}
+
+fn live_display_label(
+    subtitle: &str,
+    app_class: &str,
+    stored_name: Option<&str>,
+    fallback: &str,
+) -> String {
+    if !subtitle.is_empty() {
+        return subtitle.to_owned();
+    }
+    if !app_class.is_empty() {
+        return app_class.to_owned();
+    }
+    if let Some(name) = stored_name.filter(|value| !value.is_empty()) {
+        return name.to_owned();
+    }
+    fallback.to_owned()
 }
 
 fn slot_indexes_for_environment(env_id: &str, bindings: &[SlotBindingRecord]) -> Vec<i32> {
@@ -1240,6 +1718,8 @@ fn current_workspace_cards(
 
             WorkspaceCardData {
                 workspace_id: descriptor.id,
+                slot_index: 0,
+                slot_display_name: String::new(),
                 workspace_name: descriptor.name,
                 subtitle: descriptor.subtitle,
                 app_class: descriptor.app_class,
@@ -1277,6 +1757,22 @@ fn enqueue_preview_refresh_ids(
     }
 }
 
+fn enqueue_urgent_preview_refresh_ids(
+    runtime: &ServerRuntime,
+    workspace_ids: impl IntoIterator<Item = i32>,
+) {
+    let Ok(mut state) = runtime.preview_refresh.lock() else {
+        return;
+    };
+
+    for workspace_id in workspace_ids {
+        if workspace_id > 0 {
+            state.pending_ids.insert(workspace_id);
+            state.urgent_ids.insert(workspace_id);
+        }
+    }
+}
+
 fn due_preview_refresh_ids(runtime: &ServerRuntime, now_ms: u64) -> Vec<i32> {
     let Ok(state) = runtime.preview_refresh.lock() else {
         return Vec::new();
@@ -1287,6 +1783,9 @@ fn due_preview_refresh_ids(runtime: &ServerRuntime, now_ms: u64) -> Vec<i32> {
         .iter()
         .copied()
         .filter(|workspace_id| {
+            if state.urgent_ids.contains(workspace_id) {
+                return true;
+            }
             state
                 .last_requested_ms
                 .get(workspace_id)
@@ -1305,6 +1804,7 @@ fn mark_preview_refresh_ids_sent(runtime: &ServerRuntime, workspace_ids: &[i32],
 
     for workspace_id in workspace_ids {
         state.pending_ids.remove(workspace_id);
+        state.urgent_ids.remove(workspace_id);
         state.last_requested_ms.insert(*workspace_id, now_ms);
     }
 }
@@ -1595,13 +2095,18 @@ fn send_plugin_spawn_request(paths: &RuntimePaths, request: &PluginSpawnRequest<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{EnvironmentRecord, StateStore};
-    use crate::protocol::SlotAssignmentMode;
+    use crate::db::{EnvironmentRecord, SlotBindingKind, StateStore};
+    use crate::protocol::{
+        BatchMutationRequest, BatchMutationResponse, Request, SlotAssignmentMode,
+    };
+    use crate::runtime_paths::RuntimePaths;
+    use crate::spawn::SpawnRegistry;
     use std::collections::HashSet;
     use std::env;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process;
+    use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn binding(env_id: &str, slot_index: i32, workspace_id: i32) -> SlotBindingRecord {
@@ -1609,6 +2114,7 @@ mod tests {
             env_id: env_id.to_owned(),
             display_id: env_id.to_owned(),
             slot_index,
+            display_name: None,
             binding_kind: SlotBindingKind::Fixed,
             workspace_id: Some(workspace_id),
             launch_argv: Some(vec!["ghostty".to_owned()]),
@@ -1630,17 +2136,50 @@ mod tests {
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
+    fn test_runtime(label: &str) -> (Arc<ServerRuntime>, PathBuf) {
+        let db_path = test_db_path(label);
+        let root = db_path.parent().unwrap().to_path_buf();
+        let runtime_root = root.join("runtime");
+        let runtime_dir = runtime_root.join("hx/test");
+        fs::create_dir_all(&runtime_dir).unwrap();
+
+        let runtime = Arc::new(ServerRuntime {
+            paths: RuntimePaths {
+                runtime_root: runtime_root.clone(),
+                instance_signature: "test".to_owned(),
+                runtime_dir: runtime_dir.clone(),
+                preview_socket_path: runtime_dir.join("preview.sock"),
+                spawn_socket_path: runtime_dir.join("spawn.sock"),
+                switcher_socket_path: runtime_dir.join("switcher.sock"),
+                grid_socket_path: runtime_dir.join("grid.sock"),
+                server_socket_path: runtime_dir.join("hyprnav.sock"),
+                hypr_event_socket_path: runtime_dir.join("events.sock"),
+                state_root: root.clone(),
+                state_db_path: db_path.clone(),
+            },
+            store: StateStore::new(&db_path).unwrap(),
+            spawn_registry: Mutex::new(SpawnRegistry::new()),
+            preview_refresh: Mutex::new(PreviewRefreshState::default()),
+            pending_launches: Mutex::new(PendingLaunchRegistry::default()),
+        });
+
+        (runtime, db_path)
+    }
+
     fn environment(env_id: &str, display_id: &str) -> EnvironmentRecord {
         EnvironmentRecord {
             env_id: env_id.to_owned(),
             display_id: display_id.to_owned(),
+            title: None,
             source_path: None,
+            last_focused_at: 0,
         }
     }
 
     fn card(workspace_id: i32, subtitle: &str, active: bool) -> WorkspaceCardSnapshot {
         WorkspaceCardSnapshot {
             workspace_id,
+            slot_index: 0,
             workspace_name: workspace_id.to_string(),
             subtitle: subtitle.to_owned(),
             app_class: String::new(),
@@ -1657,7 +2196,7 @@ mod tests {
         workspace_cards: Vec<WorkspaceCardSnapshot>,
         current_workspace_id: i32,
         locked_env_id: Option<&str>,
-        current_env_id: Option<&str>,
+        _current_env_id: Option<&str>,
     ) -> GridSnapshot {
         let cards_by_workspace = workspace_cards
             .into_iter()
@@ -1668,28 +2207,11 @@ mod tests {
             .map(|binding| ((binding.env_id.as_str(), binding.slot_index), binding))
             .collect::<HashMap<_, _>>();
 
-        let mut rows = environments;
-        rows.sort_by(|left_env, right_env| {
-            row_sort_key(
-                &left_env.env_id,
-                &left_env.display_id,
-                locked_env_id,
-                current_env_id,
-            )
-            .cmp(&row_sort_key(
-                &right_env.env_id,
-                &right_env.display_id,
-                locked_env_id,
-                current_env_id,
-            ))
-        });
-
         let mut items = Vec::new();
-        let mut initial_index = -1;
         let mut max_column_count = 0;
         let mut row_count = 0;
 
-        for environment in rows {
+        for environment in environments {
             let slot_indexes = slot_indexes_for_environment(&environment.env_id, &local_bindings);
             let mut row_items = Vec::new();
 
@@ -1705,23 +2227,19 @@ mod tests {
                 let workspace_id = record.workspace_id;
                 let card = cards_by_workspace.get(&workspace_id);
                 let active = workspace_id == current_workspace_id;
-                let item_index = items.len() as i32;
-                if active
-                    && (initial_index < 0 || locked_env_id == Some(environment.env_id.as_str()))
-                {
-                    initial_index = item_index + row_items.len() as i32;
-                }
 
                 row_items.push(GridCellSnapshot {
                     environment_id: environment.env_id.clone(),
                     environment_display_id: environment.display_id.clone(),
+                    environment_title: environment.title.clone().unwrap_or_default(),
                     binding_environment_id: Some(record.binding_environment_id.clone()),
                     command_environment_id: record.command_environment_id.clone(),
                     slot_index: record.slot_index,
+                    slot_display_name: record.display_name.clone().unwrap_or_default(),
                     physical_workspace_id: workspace_id,
                     binding_kind: record.binding_kind.as_str().to_owned(),
                     inherited: record.binding_environment_id != environment.env_id,
-                    workspace_name: workspace_id.to_string(),
+                    workspace_name: workspace_display_label(card, &record, workspace_id),
                     subtitle: card
                         .map(|item| item.subtitle.clone())
                         .unwrap_or_else(|| format!("Workspace {}", workspace_id)),
@@ -1747,6 +2265,19 @@ mod tests {
             items.extend(row_items);
             row_count += 1;
         }
+
+        let initial_index = if items.is_empty() {
+            -1
+        } else {
+            items
+                .iter()
+                .position(|item| {
+                    item.row_index == 0 && item.physical_workspace_id == current_workspace_id
+                })
+                .or_else(|| items.iter().position(|item| item.row_index == 0))
+                .map(|index| index as i32)
+                .unwrap_or(0)
+        };
 
         GridSnapshot {
             items,
@@ -1796,6 +2327,7 @@ mod tests {
                 None,
                 &live_workspace_ids,
                 Some(&["ghostty".to_owned()]),
+                None,
             )
             .unwrap();
         store
@@ -1808,6 +2340,7 @@ mod tests {
                 None,
                 &live_workspace_ids,
                 Some(&["kitty".to_owned()]),
+                None,
             )
             .unwrap();
         let bindings = store.list_local_bindings().unwrap();
@@ -1848,6 +2381,7 @@ mod tests {
                 env_id: "x.y".to_owned(),
                 display_id: "x.y".to_owned(),
                 slot_index: 1,
+                display_name: None,
                 binding_kind: SlotBindingKind::Inherit,
                 workspace_id: None,
                 launch_argv: Some(vec!["kitty".to_owned()]),
@@ -1892,7 +2426,7 @@ mod tests {
 
         assert_eq!(snapshot.row_count, 2);
         assert_eq!(snapshot.max_column_count, 2);
-        assert_eq!(snapshot.initial_index, 2);
+        assert_eq!(snapshot.initial_index, 0);
         assert_eq!(snapshot.items.len(), 3);
 
         assert_eq!(snapshot.items[0].environment_id, "alpha");
@@ -1912,7 +2446,7 @@ mod tests {
     }
 
     #[test]
-    fn grid_snapshot_prefers_locked_environment_for_initial_selection_after_row_compaction() {
+    fn grid_snapshot_prefers_top_row_for_initial_selection_after_row_compaction() {
         let snapshot = build_grid_snapshot_from_data(
             vec![environment("alpha", "Alpha"), environment("beta", "Beta")],
             vec![binding("alpha", 1, 11), binding("beta", 1, 11)],
@@ -1923,7 +2457,7 @@ mod tests {
         );
 
         assert_eq!(snapshot.row_count, 2);
-        assert_eq!(snapshot.initial_index, 1);
+        assert_eq!(snapshot.initial_index, 0);
         assert_eq!(snapshot.items[0].environment_id, "alpha");
         assert_eq!(snapshot.items[1].environment_id, "beta");
         assert!(snapshot.items[1].environment_locked);
@@ -1965,5 +2499,136 @@ mod tests {
 
         assert_eq!(keys, vec![key_b]);
         assert!(registry.contains(&key_a));
+    }
+
+    #[test]
+    fn batch_mutate_commits_all_mutations() {
+        let (runtime, path) = test_runtime("batch-commit");
+
+        let request = Request::BatchMutate {
+            atomic: true,
+            operations: vec![
+                BatchMutationRequest::EnvEnsure {
+                    env: Some("demo".to_owned()),
+                    cwd: None,
+                    client: Some("t3code".to_owned()),
+                    title: Some("Thread A".to_owned()),
+                },
+                BatchMutationRequest::SlotAssign {
+                    env: Some("demo".to_owned()),
+                    slot: 1,
+                    assignment_mode: SlotAssignmentMode::Fixed { workspace_id: 5 },
+                    client: Some("t3code".to_owned()),
+                    cwd: None,
+                    launch_argv: None,
+                    display_name: Some("API".to_owned()),
+                },
+                BatchMutationRequest::SlotCommandSet {
+                    env: Some("demo".to_owned()),
+                    slot: 1,
+                    argv: vec!["ghostty".to_owned()],
+                    display_name: Some("API".to_owned()),
+                },
+                BatchMutationRequest::LockSet {
+                    env: "demo".to_owned(),
+                },
+            ],
+        };
+
+        let result = try_handle_request(&runtime, request).unwrap();
+        let response = serde_json::from_value::<BatchMutationResponse>(result).unwrap();
+        assert!(response.atomic);
+        assert_eq!(response.operation_count, 4);
+        assert_eq!(response.results.len(), 4);
+
+        let record = runtime
+            .store
+            .resolve_slot_effective("demo", 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.workspace_id, 5);
+        assert_eq!(record.display_name.as_deref(), Some("API"));
+        assert_eq!(record.launch_argv, Some(vec!["ghostty".to_owned()]));
+        assert_eq!(
+            runtime.store.locked_environment().unwrap().as_deref(),
+            Some("demo")
+        );
+        assert_eq!(
+            runtime.store.list_environments().unwrap()[0]
+                .title
+                .as_deref(),
+            Some("Thread A")
+        );
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn batch_mutate_rolls_back_on_failure() {
+        let (runtime, path) = test_runtime("batch-rollback");
+
+        let error = try_handle_request(
+            &runtime,
+            Request::BatchMutate {
+                atomic: true,
+                operations: vec![
+                    BatchMutationRequest::EnvEnsure {
+                        env: Some("demo".to_owned()),
+                        cwd: None,
+                        client: None,
+                        title: None,
+                    },
+                    BatchMutationRequest::SlotAssign {
+                        env: Some("demo".to_owned()),
+                        slot: 1,
+                        assignment_mode: SlotAssignmentMode::Fixed { workspace_id: 5 },
+                        client: None,
+                        cwd: None,
+                        launch_argv: None,
+                        display_name: Some("API".to_owned()),
+                    },
+                    BatchMutationRequest::SlotCommandSet {
+                        env: Some("missing".to_owned()),
+                        slot: 4,
+                        argv: vec!["ghostty".to_owned()],
+                        display_name: None,
+                    },
+                ],
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("batch operation 2 (slot_command_set) failed"),
+            "{error}"
+        );
+        assert!(runtime.store.list_environments().unwrap().is_empty());
+        assert!(runtime
+            .store
+            .resolve_slot_effective("demo", 1)
+            .unwrap()
+            .is_none());
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn batch_mutate_rejects_best_effort_mode() {
+        let (runtime, path) = test_runtime("batch-best-effort");
+        let error = try_handle_request(
+            &runtime,
+            Request::BatchMutate {
+                atomic: false,
+                operations: vec![BatchMutationRequest::LockClear],
+            },
+        )
+        .unwrap_err();
+
+        assert!(error
+            .to_string()
+            .contains("best-effort batch mode is not implemented"));
+        cleanup(&path);
     }
 }

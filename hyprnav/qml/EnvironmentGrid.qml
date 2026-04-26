@@ -12,6 +12,22 @@ Window {
     property bool hasBeenVisible: false
     color: "transparent"
     title: "Hyprnav Environment Grid"
+    property color overlayScrim: "#5807080a"
+    property color panelBackground: "#17191c"
+    property color panelBorder: "#2b3036"
+    property color cardBackground: "#1d2126"
+    property color cardSelectedBackground: "#262b31"
+    property color cardBorder: "#30363d"
+    property color cardSelectedBorder: "#8b949e"
+    property color cardActiveBorder: "#55606c"
+    property color previewBackground: "#111316"
+    property color previewFallback: "#1a1d21"
+    property color textPrimary: "#e6e9ed"
+    property color textSecondary: "#a7afb8"
+    property color textMuted: "#7d8791"
+    property color badgeBackground: "#2b3138"
+    property color badgeText: "#d9dfe5"
+    property color scrollbarColor: "#69737d"
 
     Timer {
         interval: 1000
@@ -114,7 +130,7 @@ Window {
 
         Rectangle {
             anchors.fill: parent
-            color: "#40070a0f"
+            color: root.overlayScrim
         }
 
         Rectangle {
@@ -122,10 +138,10 @@ Window {
             anchors.centerIn: parent
             property int cardWidth: 210
             property int cardHeight: 216
-            property int horizontalSpacing: 14
-            property int rowSpacing: 12
-            property int rowHeaderHeight: 20
-            property int rowHeaderGap: 6
+            property int horizontalSpacing: 1
+            property int rowSpacing: 1
+            property int rowHeaderHeight: 16
+            property int rowHeaderGap: 1
             property int cellWidth: cardWidth + horizontalSpacing
             property int rowBlockHeight: rowHeaderHeight + rowHeaderGap + cardHeight
             property int contentColumnsWidth: Controller.gridColumnCount > 0
@@ -137,17 +153,17 @@ Window {
             property real trackpadScrollMultiplier: 1.8
             property real wheelScrollStep: rowBlockHeight + rowSpacing
 
-            width: Math.min(root.width - 80, Math.max(192, contentColumnsWidth + 44))
-            height: Math.min(root.height - 80, Math.max(192, contentRowsHeight + 44))
-            radius: 14
-            color: "#e811171d"
+            width: Math.min(root.width - 8, Math.max(192, contentColumnsWidth + 2))
+            height: Math.min(root.height - 8, Math.max(192, contentRowsHeight + 2))
+            radius: 0
+            color: root.panelBackground
             border.width: 1
-            border.color: "#32404b"
+            border.color: root.panelBorder
 
             Flickable {
                 id: flick
                 anchors.fill: parent
-                anchors.margins: 22
+                anchors.margins: 0
                 contentWidth: Math.max(width, dialog.contentColumnsWidth)
                 contentHeight: Math.max(height, dialog.contentRowsHeight)
                 flickableDirection: Flickable.HorizontalAndVerticalFlick
@@ -163,8 +179,8 @@ Window {
                         implicitWidth: 6
                         implicitHeight: 48
                         radius: 3
-                        color: "#c7d2d8"
-                        opacity: verticalBar.active || verticalBar.hovered || flick.movingVertically ? 0.95 : 0.55
+                        color: root.scrollbarColor
+                        opacity: verticalBar.active || verticalBar.hovered || flick.movingVertically ? 0.85 : 0.35
                     }
 
                     background: Item {
@@ -267,27 +283,16 @@ Window {
                             required property int columnIndex
                             required property int slotIndex
                             required property int physicalWorkspaceId
-                            required property string workspaceSubtitle
-                            required property string workspaceAppClass
-                            required property int workspaceWindowCount
+                            required property string workspaceName
                             required property bool workspaceActive
                             required property url workspacePreview
                             required property string environmentDisplayId
+                            required property string environmentTitle
                             required property bool environmentLocked
                             required property bool showEnvironmentLabel
                             property bool workspaceDelegate: true
                             readonly property bool workspaceSelected: Controller.currentIndex === index
                             property int cardTop: dialog.rowHeaderHeight + dialog.rowHeaderGap
-
-                            property string cardSummary: {
-                                if (workspaceSubtitle.length > 0)
-                                    return workspaceSubtitle
-
-                                if (workspaceAppClass.length > 0)
-                                    return workspaceAppClass
-
-                                return "WS " + slotIndex
-                            }
 
                             x: columnIndex * dialog.cellWidth
                             y: rowIndex * (dialog.rowBlockHeight + dialog.rowSpacing)
@@ -299,9 +304,9 @@ Window {
                                 x: 0
                                 y: 0
                                 width: contentRoot.width
-                                text: environmentDisplayId
-                                color: environmentLocked ? "#efe6d4" : "#c7d2d8"
-                                font.pixelSize: 14
+                                text: environmentTitle.length > 0 ? environmentTitle : environmentDisplayId
+                                color: environmentLocked ? root.textPrimary : root.textSecondary
+                                font.pixelSize: 12
                                 font.family: "IBM Plex Sans"
                                 font.weight: Font.Medium
                                 elide: Text.ElideRight
@@ -311,25 +316,31 @@ Window {
                                 y: cardTop
                                 width: parent.width
                                 height: dialog.cardHeight
-                                radius: 12
+                                radius: 0
                                 clip: true
-                                color: workspaceSelected ? "#efe6d4" : "#111920"
-                                border.width: workspaceActive ? 2 : 1
-                                border.color: workspaceSelected ? "#111920" : (workspaceActive ? "#caa45d" : "#27323c")
-                                scale: workspaceSelected ? 1.0 : 0.96
-                                opacity: workspaceSelected ? 1.0 : 0.9
+                                color: workspaceSelected
+                                    ? root.cardSelectedBackground
+                                    : root.cardBackground
+                                border.width: 1
+                                border.color: workspaceSelected
+                                    ? root.cardSelectedBorder
+                                    : (workspaceActive ? root.cardActiveBorder : root.cardBorder)
+                                scale: 1.0
+                                opacity: 1.0
 
                                 ColumnLayout {
                                     anchors.fill: parent
-                                    anchors.margins: 12
-                                    spacing: 10
+                                    anchors.margins: 0
+                                    spacing: 1
 
                                     Rectangle {
                                         id: previewFrame
                                         Layout.fillWidth: true
-                                        Layout.preferredHeight: 132
-                                        radius: 10
-                                        color: workspaceSelected ? "#d9ded6" : "#0a1015"
+                                        Layout.fillHeight: true
+                                        Layout.minimumHeight: 0
+                                        Layout.preferredHeight: 0
+                                        radius: 0
+                                        color: root.previewBackground
                                         clip: true
                                         property url observedPreview: workspacePreview
                                         property url displaySource: ""
@@ -388,37 +399,47 @@ Window {
                                         Rectangle {
                                             anchors.fill: parent
                                             visible: previewFrame.displaySource.toString().length === 0
-                                            color: workspaceSelected ? "#d2d8d2" : "#141d24"
+                                            color: root.previewFallback
                                         }
 
                                         onObservedPreviewChanged: syncPreviewSource()
 
                                         Component.onCompleted: syncPreviewSource()
 
-                                        Label {
-                                            anchors.horizontalCenter: parent.horizontalCenter
-                                            anchors.bottom: parent.bottom
-                                            anchors.bottomMargin: 10
-                                            text: "WS " + slotIndex
-                                            color: workspaceSelected ? "#111920" : "#ecf2ef"
-                                            font.pixelSize: 22
-                                            font.family: "IBM Plex Sans"
-                                            font.weight: Font.DemiBold
+                                        Rectangle {
+                                            anchors.left: parent.left
+                                            anchors.leftMargin: 1
+                                            anchors.top: parent.top
+                                            anchors.topMargin: 1
+                                            radius: 0
+                                            color: root.badgeBackground
+                                            implicitHeight: 18
+                                            implicitWidth: slotBadgeLabel.implicitWidth + 6
+
+                                            Label {
+                                                id: slotBadgeLabel
+                                                anchors.centerIn: parent
+                                                text: slotIndex.toString()
+                                                color: root.badgeText
+                                                font.pixelSize: 10
+                                                font.family: "IBM Plex Sans"
+                                                font.weight: Font.Medium
+                                            }
                                         }
                                     }
 
                                     Label {
                                         Layout.fillWidth: true
-                                        Layout.preferredHeight: 38
-                                        Layout.maximumHeight: 38
-                                        text: cardSummary
-                                        color: workspaceSelected ? "#1d2a33" : "#c7d2d8"
-                                        font.pixelSize: 14
+                                        Layout.preferredHeight: 24
+                                        Layout.maximumHeight: 24
+                                        text: workspaceName
+                                        color: workspaceSelected ? root.textPrimary : root.textSecondary
+                                        font.pixelSize: 13
                                         font.family: "IBM Plex Sans"
                                         font.weight: Font.Medium
                                         elide: Text.ElideRight
-                                        maximumLineCount: 2
-                                        wrapMode: Text.Wrap
+                                        maximumLineCount: 1
+                                        wrapMode: Text.NoWrap
                                         clip: true
                                     }
                                 }
@@ -435,7 +456,7 @@ Window {
                         anchors.centerIn: parent
                         visible: !Controller.hasSnapshot && Controller.loading
                         text: "Loading environments"
-                        color: "#9fb0b8"
+                        color: root.textMuted
                         font.pixelSize: 15
                         font.family: "IBM Plex Sans"
                     }
@@ -444,7 +465,7 @@ Window {
                         anchors.centerIn: parent
                         visible: Controller.hasSnapshot && Controller.gridRowCount === 0
                         text: "No mapped environments"
-                        color: "#9fb0b8"
+                        color: root.textMuted
                         font.pixelSize: 15
                         font.family: "IBM Plex Sans"
                     }

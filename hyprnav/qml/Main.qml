@@ -14,6 +14,22 @@ Window {
     title: "Hyprnav"
 
     property int maxGridColumns: 6
+    property color overlayScrim: "#5807080a"
+    property color panelBackground: "#17191c"
+    property color panelBorder: "#2b3036"
+    property color cardBackground: "#1d2126"
+    property color cardSelectedBackground: "#262b31"
+    property color cardBorder: "#30363d"
+    property color cardSelectedBorder: "#8b949e"
+    property color cardActiveBorder: "#55606c"
+    property color previewBackground: "#111316"
+    property color previewFallback: "#1a1d21"
+    property color textPrimary: "#e6e9ed"
+    property color textSecondary: "#a7afb8"
+    property color textMuted: "#7d8791"
+    property color badgeBackground: "#2b3138"
+    property color badgeText: "#d9dfe5"
+    property color scrollbarColor: "#69737d"
 
     Timer {
         interval: 1000
@@ -84,7 +100,7 @@ Window {
 
         Rectangle {
             anchors.fill: parent
-            color: "#40070a0f"
+            color: root.overlayScrim
         }
 
         Rectangle {
@@ -92,8 +108,8 @@ Window {
             anchors.centerIn: parent
             property int cardWidth: 210
             property int cardHeight: 216
-            property int horizontalSpacing: 14
-            property int verticalSpacing: 16
+            property int horizontalSpacing: 1
+            property int verticalSpacing: 1
             property int cellWidth: cardWidth + horizontalSpacing
             property int cellHeight: cardHeight + verticalSpacing
             property int workspaceCount: Math.max(0, workspaceGrid.count)
@@ -101,28 +117,28 @@ Window {
             property int rowCount: workspaceCount > 0 ? Math.ceil(workspaceCount / columnCount) : 1
 
             width: Math.min(
-                root.width - 72,
-                columnCount * cellWidth + 44
+                root.width - 8,
+                columnCount * cellWidth + 2
             )
             height: Math.max(
                 184,
-                rowCount * cellHeight + 44
+                rowCount * cellHeight + 2
             )
-            radius: 16
-            color: "#e811171d"
+            radius: 0
+            color: root.panelBackground
             border.width: 1
-            border.color: "#32404b"
+            border.color: root.panelBorder
 
             ColumnLayout {
                 anchors.fill: parent
-                anchors.margins: 22
+                anchors.margins: 0
                 spacing: 0
 
                 GridView {
                     id: workspaceGrid
                     Layout.alignment: Qt.AlignHCenter | Qt.AlignVCenter
-                    Layout.preferredWidth: dialog.width - 44
-                    Layout.preferredHeight: dialog.height - 44
+                    Layout.preferredWidth: dialog.width - 2
+                    Layout.preferredHeight: dialog.height - 2
                     Layout.maximumWidth: Layout.preferredWidth
                     Layout.maximumHeight: Layout.preferredHeight
                     model: Controller
@@ -135,51 +151,45 @@ Window {
                     delegate: Item {
                         required property int index
                         required property int workspaceId
+                        required property int slotIndex
                         required property string workspaceName
-                        required property string workspaceSubtitle
-                        required property string workspaceAppClass
-                        required property int workspaceWindowCount
                         required property bool workspaceActive
                         required property url workspacePreview
                         readonly property bool workspaceSelected: Controller.currentIndex === index
-
-                        property string cardSummary: {
-                            if (workspaceSubtitle.length > 0)
-                                return workspaceSubtitle
-
-                            if (workspaceAppClass.length > 0)
-                                return workspaceAppClass
-
-                            return "WS " + workspaceName
-                        }
 
                         width: dialog.cardWidth + dialog.horizontalSpacing
                         height: dialog.cardHeight + dialog.verticalSpacing
 
                         Rectangle {
-                            anchors.horizontalCenter: parent.horizontalCenter
-                            anchors.verticalCenter: parent.verticalCenter
+                            x: 0
+                            y: 0
                             width: dialog.cardWidth
                             height: dialog.cardHeight
-                            radius: 12
+                            radius: 0
                             clip: true
-                            color: workspaceSelected ? "#efe6d4" : "#111920"
-                            border.width: workspaceActive ? 2 : 1
-                            border.color: workspaceSelected ? "#111920" : (workspaceActive ? "#caa45d" : "#27323c")
-                            scale: workspaceSelected ? 1.0 : 0.96
-                            opacity: workspaceSelected ? 1.0 : 0.9
+                            color: workspaceSelected
+                                ? root.cardSelectedBackground
+                                : root.cardBackground
+                            border.width: 1
+                            border.color: workspaceSelected
+                                ? root.cardSelectedBorder
+                                : (workspaceActive ? root.cardActiveBorder : root.cardBorder)
+                            scale: 1.0
+                            opacity: 1.0
 
                             ColumnLayout {
                                 anchors.fill: parent
-                                anchors.margins: 12
-                                spacing: 10
+                                anchors.margins: 0
+                                spacing: 1
 
                                 Rectangle {
                                     id: previewFrame
                                     Layout.fillWidth: true
-                                    Layout.preferredHeight: 132
-                                    radius: 10
-                                    color: workspaceSelected ? "#d9ded6" : "#0a1015"
+                                    Layout.fillHeight: true
+                                    Layout.minimumHeight: 0
+                                    Layout.preferredHeight: 0
+                                    radius: 0
+                                    color: root.previewBackground
                                     clip: true
                                     property url observedPreview: workspacePreview
                                     property url displaySource: ""
@@ -238,7 +248,7 @@ Window {
                                     Rectangle {
                                         anchors.fill: parent
                                         visible: previewFrame.displaySource.toString().length === 0
-                                        color: workspaceSelected ? "#d2d8d2" : "#141d24"
+                                        color: root.previewFallback
                                     }
 
                                     onObservedPreviewChanged: syncPreviewSource()
@@ -247,50 +257,61 @@ Window {
 
                                     Rectangle {
                                         anchors.left: parent.left
-                                        anchors.leftMargin: 10
+                                        anchors.leftMargin: 1
                                         anchors.top: parent.top
-                                        anchors.topMargin: 10
-                                        visible: workspaceActive
-                                        radius: 8
-                                        color: workspaceSelected ? "#111920" : "#caa45d"
-                                        implicitHeight: 24
-                                        implicitWidth: currentLabel.implicitWidth + 14
+                                        anchors.topMargin: 1
+                                        visible: slotIndex > 0
+                                        radius: 0
+                                        color: root.badgeBackground
+                                        implicitHeight: 18
+                                        implicitWidth: slotBadgeLabel.implicitWidth + 6
 
                                         Label {
-                                            id: currentLabel
+                                            id: slotBadgeLabel
                                             anchors.centerIn: parent
-                                            text: "Current"
-                                            color: workspaceSelected ? "#efe6d4" : "#111920"
-                                            font.pixelSize: 11
+                                            text: slotIndex.toString()
+                                            color: root.badgeText
+                                            font.pixelSize: 10
                                             font.family: "IBM Plex Sans"
                                             font.weight: Font.Medium
                                         }
                                     }
 
-                                    Label {
-                                        anchors.horizontalCenter: parent.horizontalCenter
-                                        anchors.bottom: parent.bottom
-                                        anchors.bottomMargin: 10
-                                        text: "WS " + workspaceName
-                                        color: workspaceSelected ? "#111920" : "#ecf2ef"
-                                        font.pixelSize: 22
-                                        font.family: "IBM Plex Sans"
-                                        font.weight: Font.DemiBold
+                                    Rectangle {
+                                        anchors.right: parent.right
+                                        anchors.rightMargin: 1
+                                        anchors.top: parent.top
+                                        anchors.topMargin: 1
+                                        visible: workspaceActive
+                                        radius: 0
+                                        color: root.badgeBackground
+                                        implicitHeight: 18
+                                        implicitWidth: currentLabel.implicitWidth + 6
+
+                                        Label {
+                                            id: currentLabel
+                                            anchors.centerIn: parent
+                                            text: "Current"
+                                            color: root.badgeText
+                                            font.pixelSize: 10
+                                            font.family: "IBM Plex Sans"
+                                            font.weight: Font.Medium
+                                        }
                                     }
                                 }
 
                                 Label {
                                     Layout.fillWidth: true
-                                    Layout.preferredHeight: 38
-                                    Layout.maximumHeight: 38
-                                    text: cardSummary
-                                    color: workspaceSelected ? "#1d2a33" : "#c7d2d8"
-                                    font.pixelSize: 14
+                                    Layout.preferredHeight: 24
+                                    Layout.maximumHeight: 24
+                                    text: workspaceName
+                                    color: workspaceSelected ? root.textPrimary : root.textSecondary
+                                    font.pixelSize: 13
                                     font.family: "IBM Plex Sans"
                                     font.weight: Font.Medium
                                     elide: Text.ElideRight
-                                    maximumLineCount: 2
-                                    wrapMode: Text.Wrap
+                                    maximumLineCount: 1
+                                    wrapMode: Text.NoWrap
                                     clip: true
                                 }
                             }
@@ -308,7 +329,7 @@ Window {
                     Layout.alignment: Qt.AlignHCenter
                     visible: workspaceGrid.count === 0
                     text: "No populated workspaces"
-                    color: "#9fb0b8"
+                    color: root.textMuted
                     font.pixelSize: 15
                     font.family: "IBM Plex Sans"
                 }

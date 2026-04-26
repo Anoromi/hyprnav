@@ -131,6 +131,11 @@ pub enum Command {
         long_about = "Spawn a process tree onto a raw physical workspace.\n\nThis command is separate from environment slots. It accepts either an explicit physical workspace ID or `rand`, which allocates a temporary high-ID workspace. Window placement is handled through the plugin using PID-tree matching."
     )]
     Spawn(SpawnArgs),
+    #[command(
+        about = "Apply many environment/slot/lock mutations in one daemon request.",
+        long_about = "Apply many environment/slot/lock mutations in one daemon request.\n\nThe payload is read from JSON via --file or --stdin. Only state mutation operations are supported in this first version."
+    )]
+    Batch(BatchArgs),
     #[command(name = "spawn-internal", hide = true)]
     SpawnInternal(SpawnInternalArgs),
 }
@@ -167,6 +172,12 @@ pub enum EnvCommand {
         long_about = "Delete an environment and its slot bindings.\n\nIf the deleted environment is currently locked, the lock is cleared."
     )]
     Delete(EnvDeleteArgs),
+    #[command(
+        about = "Set or clear the stored title for an environment.",
+        long_about = "Set or clear the stored title for an environment.\n\nTitles are fallback metadata used when live context is missing or weak."
+    )]
+    #[command(subcommand)]
+    Title(EnvTitleCommand),
 }
 
 #[derive(Debug, Subcommand)]
@@ -201,6 +212,12 @@ pub enum SlotCommand {
     )]
     #[command(subcommand)]
     Command(SlotLaunchCommand),
+    #[command(
+        about = "Set or clear the stored fallback display name for a slot.",
+        long_about = "Set or clear the stored fallback display name for a slot.\n\nSlot names are used as fallback labels when live app/window metadata is not useful."
+    )]
+    #[command(subcommand)]
+    Name(SlotNameCommand),
 }
 
 #[derive(Debug, Subcommand)]
@@ -217,6 +234,34 @@ pub enum SlotLaunchCommand {
     Clear(SlotCommandClearArgs),
 }
 
+#[derive(Debug, Subcommand)]
+pub enum EnvTitleCommand {
+    #[command(
+        about = "Set the stored title for an environment.",
+        long_about = "Set the stored title for an environment."
+    )]
+    Set(EnvTitleSetArgs),
+    #[command(
+        about = "Clear the stored title for an environment.",
+        long_about = "Clear the stored title for an environment."
+    )]
+    Clear(EnvTitleClearArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SlotNameCommand {
+    #[command(
+        about = "Set the stored fallback display name for a slot.",
+        long_about = "Set the stored fallback display name for a slot."
+    )]
+    Set(SlotNameSetArgs),
+    #[command(
+        about = "Clear the stored fallback display name for a slot.",
+        long_about = "Clear the stored fallback display name for a slot."
+    )]
+    Clear(SlotNameClearArgs),
+}
+
 #[derive(Debug, Args)]
 pub struct EnvEnsureArgs {
     /// Explicit environment ID. If omitted, the environment is derived from a path.
@@ -228,11 +273,30 @@ pub struct EnvEnsureArgs {
     /// Optional client ID to ensure/update alongside the environment.
     #[arg(long)]
     pub client: Option<String>,
+    /// Optional stored title for the environment.
+    #[arg(long)]
+    pub title: Option<String>,
 }
 
 #[derive(Debug, Args)]
 pub struct EnvDeleteArgs {
     /// Environment ID to delete.
+    #[arg(long)]
+    pub env: String,
+}
+
+#[derive(Debug, Args)]
+pub struct EnvTitleSetArgs {
+    /// Environment ID to update.
+    #[arg(long)]
+    pub env: String,
+    /// Stored fallback title.
+    pub title: String,
+}
+
+#[derive(Debug, Args)]
+pub struct EnvTitleClearArgs {
+    /// Environment ID to update.
     #[arg(long)]
     pub env: String,
 }
@@ -268,6 +332,9 @@ pub struct SlotAssignArgs {
     /// Path used for environment derivation when --env is omitted.
     #[arg(long)]
     pub cwd: Option<String>,
+    /// Optional stored fallback display name for this slot.
+    #[arg(long)]
+    pub name: Option<String>,
     /// Store the trailing argv as the slot launch command.
     #[arg(long)]
     pub launch: bool,
@@ -298,6 +365,9 @@ pub struct SlotCommandSetArgs {
     /// Explicit environment ID. Otherwise the locked environment is used.
     #[arg(long)]
     pub env: Option<String>,
+    /// Optional stored fallback display name for this slot.
+    #[arg(long)]
+    pub name: Option<String>,
     /// Command and arguments to store after `--`.
     #[arg(last = true, required = true)]
     pub command: Vec<String>,
@@ -305,6 +375,28 @@ pub struct SlotCommandSetArgs {
 
 #[derive(Debug, Args)]
 pub struct SlotCommandClearArgs {
+    /// Virtual slot number to update. Must be positive.
+    #[arg(long)]
+    pub slot: i32,
+    /// Explicit environment ID. Otherwise the locked environment is used.
+    #[arg(long)]
+    pub env: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct SlotNameSetArgs {
+    /// Virtual slot number to update. Must be positive.
+    #[arg(long)]
+    pub slot: i32,
+    /// Explicit environment ID. Otherwise the locked environment is used.
+    #[arg(long)]
+    pub env: Option<String>,
+    /// Stored fallback display name.
+    pub name: String,
+}
+
+#[derive(Debug, Args)]
+pub struct SlotNameClearArgs {
     /// Virtual slot number to update. Must be positive.
     #[arg(long)]
     pub slot: i32,
@@ -363,6 +455,16 @@ pub struct SpawnInternalArgs {
     pub operation_id: String,
     #[arg(last = true, required = true)]
     pub command: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct BatchArgs {
+    /// Read the batch JSON payload from a file.
+    #[arg(long)]
+    pub file: Option<String>,
+    /// Read the batch JSON payload from stdin.
+    #[arg(long)]
+    pub stdin: bool,
 }
 
 pub fn parse_args() -> Cli {

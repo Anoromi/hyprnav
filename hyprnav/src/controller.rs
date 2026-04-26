@@ -26,7 +26,9 @@ const ROLE_PREVIEW: i32 = 0x0108;
 const ROLE_GENERATION: i32 = 0x0109;
 const ROLE_ENVIRONMENT_ID: i32 = 0x010a;
 const ROLE_ENVIRONMENT_DISPLAY_ID: i32 = 0x010b;
+const ROLE_ENVIRONMENT_TITLE: i32 = 0x0112;
 const ROLE_SLOT_INDEX: i32 = 0x010c;
+const ROLE_SLOT_DISPLAY_NAME: i32 = 0x0113;
 const ROLE_PHYSICAL_WORKSPACE_ID: i32 = 0x010d;
 const ROLE_ENVIRONMENT_LOCKED: i32 = 0x010e;
 const ROLE_SHOW_ENVIRONMENT_LABEL: i32 = 0x010f;
@@ -47,7 +49,9 @@ struct UiItem {
     generation: u64,
     environment_id: String,
     environment_display_id: String,
+    environment_title: String,
     slot_index: i32,
+    slot_display_name: String,
     physical_workspace_id: i32,
     environment_locked: bool,
     show_environment_label: bool,
@@ -340,7 +344,11 @@ impl qobject::Controller {
             ROLE_ENVIRONMENT_DISPLAY_ID => {
                 QVariant::from(&QString::from(item.environment_display_id.as_str()))
             }
+            ROLE_ENVIRONMENT_TITLE => QVariant::from(&QString::from(item.environment_title.as_str())),
             ROLE_SLOT_INDEX => QVariant::from(&item.slot_index),
+            ROLE_SLOT_DISPLAY_NAME => {
+                QVariant::from(&QString::from(item.slot_display_name.as_str()))
+            }
             ROLE_PHYSICAL_WORKSPACE_ID => QVariant::from(&item.physical_workspace_id),
             ROLE_ENVIRONMENT_LOCKED => QVariant::from(&item.environment_locked),
             ROLE_SHOW_ENVIRONMENT_LABEL => QVariant::from(&item.show_environment_label),
@@ -383,7 +391,15 @@ impl qobject::Controller {
             ROLE_ENVIRONMENT_DISPLAY_ID,
             QByteArray::from("environmentDisplayId".as_bytes()),
         );
+        roles.insert(
+            ROLE_ENVIRONMENT_TITLE,
+            QByteArray::from("environmentTitle".as_bytes()),
+        );
         roles.insert(ROLE_SLOT_INDEX, QByteArray::from("slotIndex".as_bytes()));
+        roles.insert(
+            ROLE_SLOT_DISPLAY_NAME,
+            QByteArray::from("slotDisplayName".as_bytes()),
+        );
         roles.insert(
             ROLE_PHYSICAL_WORKSPACE_ID,
             QByteArray::from("physicalWorkspaceId".as_bytes()),
@@ -996,6 +1012,7 @@ impl ControllerRust {
 fn item_from_switcher_snapshot(item: WorkspaceCardSnapshot) -> UiItem {
     UiItem {
         workspace_id: item.workspace_id,
+        slot_index: item.slot_index,
         workspace_name: item.workspace_name,
         subtitle: item.subtitle,
         app_class: item.app_class,
@@ -1019,7 +1036,9 @@ fn item_from_grid_snapshot(item: GridCellSnapshot) -> UiItem {
         generation: item.generation,
         environment_id: item.environment_id,
         environment_display_id: item.environment_display_id,
+        environment_title: item.environment_title,
         slot_index: item.slot_index,
+        slot_display_name: item.slot_display_name,
         physical_workspace_id: item.physical_workspace_id,
         environment_locked: item.environment_locked,
         show_environment_label: item.show_environment_label,
@@ -1070,8 +1089,11 @@ fn volatile_item_eq(left: &UiItem, right: &UiItem) -> bool {
         && left.app_class == right.app_class
         && left.window_count == right.window_count
         && left.active == right.active
+        && left.slot_index == right.slot_index
         && left.preview_path == right.preview_path
         && left.generation == right.generation
+        && left.environment_title == right.environment_title
+        && left.slot_display_name == right.slot_display_name
 }
 
 fn snapshot_matches_switcher_layout(current: &[UiItem], next: &[UiItem]) -> bool {
@@ -1132,8 +1154,11 @@ fn volatile_roles() -> QList<i32> {
         ROLE_APP_CLASS,
         ROLE_WINDOW_COUNT,
         ROLE_ACTIVE,
+        ROLE_SLOT_INDEX,
         ROLE_PREVIEW,
         ROLE_GENERATION,
+        ROLE_ENVIRONMENT_TITLE,
+        ROLE_SLOT_DISPLAY_NAME,
     ]
     .into_iter()
     .collect()
@@ -1214,7 +1239,9 @@ mod tests {
             generation: 1,
             environment_id: "env".into(),
             environment_display_id: "Env".into(),
+            environment_title: String::new(),
             slot_index: 1,
+            slot_display_name: String::new(),
             physical_workspace_id: 1,
             environment_locked: false,
             show_environment_label: true,

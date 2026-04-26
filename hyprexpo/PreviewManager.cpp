@@ -18,6 +18,7 @@
 #include <format>
 #include <jpeglib.h>
 #include <setjmp.h>
+#include <string_view>
 #include <span>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -29,6 +30,32 @@ namespace {
 struct SJpegErrorManager {
     jpeg_error_mgr pub;
     jmp_buf        setjmpBuffer;
+};
+
+class CScopedLayerSurfaceSuppressor {
+  public:
+    explicit CScopedLayerSurfaceSuppressor(std::string_view targetNamespace) {
+        if (!g_pCompositor)
+            return;
+
+        for (const auto& layer : g_pCompositor->m_layers) {
+            if (!layer || layer->m_namespace != targetNamespace)
+                continue;
+
+            m_previousStates.emplace_back(layer, layer->m_mapped);
+            layer->m_mapped = false;
+        }
+    }
+
+    ~CScopedLayerSurfaceSuppressor() {
+        for (auto& [layer, mapped] : m_previousStates) {
+            if (layer)
+                layer->m_mapped = mapped;
+        }
+    }
+
+  private:
+    std::vector<std::pair<PHLLS, bool>> m_previousStates;
 };
 
 extern "C" void onJPEGError(j_common_ptr cinfo) {
@@ -352,6 +379,7 @@ bool CPreviewManager::renderWorkspacePreview(PHLMONITOR monitor, int workspaceID
     PHLWORKSPACE  previousWorkspace = monitor->m_activeWorkspace;
     PHLWORKSPACE  previousSpecial   = monitor->m_activeSpecialWorkspace;
     const auto    targetWorkspace   = g_pCompositor->getWorkspaceByID(workspaceID);
+    CScopedLayerSurfaceSuppressor suppressedHyprnavLayers{"hyprnav"};
 
     g_pHyprRenderer->makeEGLCurrent();
 
