@@ -102,10 +102,12 @@ pub mod qobject {
             uri: &QString,
             type_name: &QString,
         ) -> bool;
+        fn hyprexpo_map_root_window_resident();
         fn hyprexpo_set_quit_on_last_window_closed(
             app: Pin<&mut QGuiApplication>,
             quit_on_last_window_closed: bool,
         );
+        fn hyprexpo_set_root_window_interactive(interactive: bool);
         fn hyprexpo_set_root_window_visible(visible: bool);
     }
 
@@ -263,7 +265,10 @@ impl qobject::Controller {
         let resident_mode = self.as_ref().rust().resident_mode;
         self.as_mut().set_resident_mode(resident_mode);
 
-        if !(self.as_ref().rust().mode == UiMode::Grid && resident_mode) {
+        if uses_resident_grid_window(self.as_ref().rust().mode, resident_mode) {
+            qobject::hyprexpo_map_root_window_resident();
+            qobject::hyprexpo_set_root_window_interactive(false);
+        } else {
             if let Err(error) = self.as_mut().load_snapshot_and_show() {
                 warn!("failed to load UI snapshot: {error}");
                 self.as_mut().hide_overlay();
@@ -648,12 +653,26 @@ impl qobject::Controller {
 
     fn show_overlay(mut self: Pin<&mut Self>) {
         self.as_mut().set_visible(true);
-        qobject::hyprexpo_set_root_window_visible(true);
+        if uses_resident_grid_window(
+            self.as_ref().rust().mode,
+            self.as_ref().rust().resident_mode,
+        ) {
+            qobject::hyprexpo_set_root_window_interactive(true);
+        } else {
+            qobject::hyprexpo_set_root_window_visible(true);
+        }
     }
 
     fn hide_overlay(mut self: Pin<&mut Self>) {
         self.as_mut().set_visible(false);
-        qobject::hyprexpo_set_root_window_visible(false);
+        if uses_resident_grid_window(
+            self.as_ref().rust().mode,
+            self.as_ref().rust().resident_mode,
+        ) {
+            qobject::hyprexpo_set_root_window_interactive(false);
+        } else {
+            qobject::hyprexpo_set_root_window_visible(false);
+        }
     }
 
     fn apply_switcher_snapshot(
@@ -916,6 +935,10 @@ fn build_row_indices(items: &[UiItem]) -> Vec<Vec<usize>> {
     rows.into_values().collect()
 }
 
+fn uses_resident_grid_window(mode: UiMode, resident_mode: bool) -> bool {
+    mode == UiMode::Grid && resident_mode
+}
+
 fn normalize_index(index: i32, item_count: usize) -> i32 {
     if item_count == 0 {
         -1
@@ -937,4 +960,17 @@ fn now_ms_qt() -> u64 {
 
 impl cxx_qt::Initialize for qobject::Controller {
     fn initialize(self: Pin<&mut Self>) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{uses_resident_grid_window, UiMode};
+
+    #[test]
+    fn uses_resident_window_only_for_resident_grid() {
+        assert!(uses_resident_grid_window(UiMode::Grid, true));
+        assert!(!uses_resident_grid_window(UiMode::Grid, false));
+        assert!(!uses_resident_grid_window(UiMode::Switcher, true));
+        assert!(!uses_resident_grid_window(UiMode::Switcher, false));
+    }
 }

@@ -12,6 +12,7 @@
 
 namespace {
 QPointer<QQuickWindow> g_rootWindow;
+QPointer<LayerShellQt::Window> g_layerWindow;
 }
 
 bool hyprexpo_configure_root_window(QQmlApplicationEngine& engine) {
@@ -31,6 +32,7 @@ bool hyprexpo_configure_root_window(QQmlApplicationEngine& engine) {
 
     if (QGuiApplication::platformName() == QStringLiteral("wayland")) {
         if (auto* layerWindow = LayerShellQt::Window::get(window)) {
+            g_layerWindow = layerWindow;
             layerWindow->setAnchors(LayerShellQt::Window::AnchorNone);
             layerWindow->setLayer(LayerShellQt::Window::LayerTop);
             layerWindow->setKeyboardInteractivity(LayerShellQt::Window::KeyboardInteractivityExclusive);
@@ -59,11 +61,41 @@ void hyprexpo_set_quit_on_last_window_closed(QGuiApplication& app, bool quitOnLa
     app.setQuitOnLastWindowClosed(quitOnLastWindowClosed);
 }
 
+void hyprexpo_map_root_window_resident() {
+    if (!g_rootWindow)
+        return;
+
+    if (g_layerWindow)
+        g_layerWindow->setKeyboardInteractivity(LayerShellQt::Window::KeyboardInteractivityNone);
+    g_rootWindow->setFlag(Qt::WindowTransparentForInput, true);
+    g_rootWindow->show();
+}
+
+void hyprexpo_set_root_window_interactive(bool interactive) {
+    if (!g_rootWindow)
+        return;
+
+    if (g_layerWindow) {
+        g_layerWindow->setKeyboardInteractivity(
+            interactive ? LayerShellQt::Window::KeyboardInteractivityExclusive
+                        : LayerShellQt::Window::KeyboardInteractivityNone
+        );
+    }
+
+    g_rootWindow->setFlag(Qt::WindowTransparentForInput, !interactive);
+    if (interactive)
+        g_rootWindow->requestActivate();
+}
+
 void hyprexpo_set_root_window_visible(bool visible) {
     if (!g_rootWindow)
         return;
 
     if (visible) {
+        if (g_layerWindow) {
+            g_layerWindow->setKeyboardInteractivity(LayerShellQt::Window::KeyboardInteractivityExclusive);
+        }
+        g_rootWindow->setFlag(Qt::WindowTransparentForInput, false);
         g_rootWindow->show();
         g_rootWindow->requestActivate();
     } else {

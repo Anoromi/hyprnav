@@ -16,7 +16,7 @@ Window {
     Timer {
         interval: 1000
         repeat: true
-        running: false
+        running: Controller.visible
         onTriggered: Controller.refreshSnapshotIfVisible()
     }
 
@@ -44,7 +44,9 @@ Window {
     FocusScope {
         id: keyHandler
         anchors.fill: parent
-        focus: true
+        visible: Controller.visible
+        enabled: Controller.visible
+        focus: Controller.visible
 
         Keys.onPressed: event => {
             if (event.key === Qt.Key_Right || event.key === Qt.Key_Tab) {
@@ -389,20 +391,15 @@ Window {
         target: Controller
 
         function onVisibleChanged() {
-            if (Controller.visible)
-                root.show()
-            else
-                root.hide()
-        }
-    }
-
-    onVisibleChanged: {
-        if (visible) {
-            hasBeenVisible = true
-            keyHandler.forceActiveFocus()
-            Qt.callLater(() => flick.ensureSelectedVisible())
-        } else if (hasBeenVisible && !Controller.residentMode) {
-            Qt.quit()
+            if (Controller.visible) {
+                hasBeenVisible = true
+                Qt.callLater(() => {
+                    keyHandler.forceActiveFocus()
+                    flick.ensureSelectedVisible()
+                })
+            } else if (hasBeenVisible && !Controller.residentMode) {
+                Qt.quit()
+            }
         }
     }
 
