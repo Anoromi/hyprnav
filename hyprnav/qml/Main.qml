@@ -23,6 +23,13 @@ Window {
     }
 
     Timer {
+        id: navigationRefreshTimer
+        interval: 220
+        repeat: false
+        onTriggered: Controller.refreshSnapshotIfVisible()
+    }
+
+    Timer {
         interval: 40
         repeat: true
         running: root.visible
@@ -133,8 +140,8 @@ Window {
                         required property string workspaceAppClass
                         required property int workspaceWindowCount
                         required property bool workspaceActive
-                        required property bool workspaceSelected
                         required property url workspacePreview
+                        readonly property bool workspaceSelected: Controller.currentIndex === index
 
                         property string cardSummary: {
                             if (workspaceSubtitle.length > 0)
@@ -168,26 +175,75 @@ Window {
                                 spacing: 10
 
                                 Rectangle {
+                                    id: previewFrame
                                     Layout.fillWidth: true
                                     Layout.preferredHeight: 132
                                     radius: 10
                                     color: workspaceSelected ? "#d9ded6" : "#0a1015"
                                     clip: true
+                                    property url observedPreview: workspacePreview
+                                    property url displaySource: ""
+                                    property url pendingSource: ""
+
+                                    function clearPreviewState() {
+                                        displaySource = ""
+                                        pendingSource = ""
+                                        loadingImage.source = ""
+                                    }
+
+                                    function syncPreviewSource() {
+                                        const nextSource = workspacePreview.toString()
+                                        const currentDisplay = displaySource.toString()
+                                        const currentPending = pendingSource.toString()
+
+                                        if (nextSource.length === 0) {
+                                            clearPreviewState()
+                                            return
+                                        }
+
+                                        if (nextSource === currentDisplay || nextSource === currentPending)
+                                            return
+
+                                        pendingSource = workspacePreview
+                                        loadingImage.source = pendingSource
+                                    }
 
                                     Image {
-                                        id: previewImage
+                                        id: displayImage
                                         anchors.fill: parent
-                                        source: workspacePreview
+                                        source: previewFrame.displaySource
                                         fillMode: Image.PreserveAspectCrop
+                                        visible: previewFrame.displaySource.toString().length > 0
+                                    }
+
+                                    Image {
+                                        id: loadingImage
+                                        anchors.fill: parent
+                                        visible: false
                                         asynchronous: true
-                                        visible: source.toString().length > 0
+                                        fillMode: Image.PreserveAspectCrop
+
+                                        onStatusChanged: {
+                                            if (status === Image.Ready && source.toString() === previewFrame.pendingSource.toString()) {
+                                                previewFrame.displaySource = previewFrame.pendingSource
+                                                previewFrame.pendingSource = ""
+                                                source = ""
+                                            } else if (status === Image.Error && source.toString() === previewFrame.pendingSource.toString()) {
+                                                previewFrame.pendingSource = ""
+                                                source = ""
+                                            }
+                                        }
                                     }
 
                                     Rectangle {
                                         anchors.fill: parent
-                                        visible: !previewImage.visible
+                                        visible: previewFrame.displaySource.toString().length === 0
                                         color: workspaceSelected ? "#d2d8d2" : "#141d24"
                                     }
+
+                                    onObservedPreviewChanged: syncPreviewSource()
+
+                                    Component.onCompleted: syncPreviewSource()
 
                                     Rectangle {
                                         anchors.left: parent.left
@@ -263,6 +319,10 @@ Window {
 
     Connections {
         target: Controller
+
+        function onCurrentIndexChanged() {
+            navigationRefreshTimer.restart()
+        }
 
         function onVisibleChanged() {
             if (Controller.visible)

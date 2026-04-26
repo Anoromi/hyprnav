@@ -35,6 +35,23 @@ Window {
     }
 
     Timer {
+        id: navigationRefreshTimer
+        interval: 220
+        repeat: false
+        onTriggered: Controller.refreshSnapshotIfVisible()
+    }
+
+    Timer {
+        id: selectionRevealTimer
+        interval: 1
+        repeat: false
+        onTriggered: {
+            if (Controller.visible)
+                flick.ensureSelectedVisible()
+        }
+    }
+
+    Timer {
         id: warmStartTimer
         interval: 50
         repeat: false
@@ -254,12 +271,12 @@ Window {
                             required property string workspaceAppClass
                             required property int workspaceWindowCount
                             required property bool workspaceActive
-                            required property bool workspaceSelected
                             required property url workspacePreview
                             required property string environmentDisplayId
                             required property bool environmentLocked
                             required property bool showEnvironmentLabel
                             property bool workspaceDelegate: true
+                            readonly property bool workspaceSelected: Controller.currentIndex === index
                             property int cardTop: dialog.rowHeaderHeight + dialog.rowHeaderGap
 
                             property string cardSummary: {
@@ -308,26 +325,75 @@ Window {
                                     spacing: 10
 
                                     Rectangle {
+                                        id: previewFrame
                                         Layout.fillWidth: true
                                         Layout.preferredHeight: 132
                                         radius: 10
                                         color: workspaceSelected ? "#d9ded6" : "#0a1015"
                                         clip: true
+                                        property url observedPreview: workspacePreview
+                                        property url displaySource: ""
+                                        property url pendingSource: ""
+
+                                        function clearPreviewState() {
+                                            displaySource = ""
+                                            pendingSource = ""
+                                            loadingImage.source = ""
+                                        }
+
+                                        function syncPreviewSource() {
+                                            const nextSource = workspacePreview.toString()
+                                            const currentDisplay = displaySource.toString()
+                                            const currentPending = pendingSource.toString()
+
+                                            if (nextSource.length === 0) {
+                                                clearPreviewState()
+                                                return
+                                            }
+
+                                            if (nextSource === currentDisplay || nextSource === currentPending)
+                                                return
+
+                                            pendingSource = workspacePreview
+                                            loadingImage.source = pendingSource
+                                        }
 
                                         Image {
-                                            id: previewImage
+                                            id: displayImage
                                             anchors.fill: parent
-                                            source: workspacePreview
+                                            source: previewFrame.displaySource
                                             fillMode: Image.PreserveAspectCrop
+                                            visible: previewFrame.displaySource.toString().length > 0
+                                        }
+
+                                        Image {
+                                            id: loadingImage
+                                            anchors.fill: parent
+                                            visible: false
                                             asynchronous: true
-                                            visible: source.toString().length > 0
+                                            fillMode: Image.PreserveAspectCrop
+
+                                            onStatusChanged: {
+                                                if (status === Image.Ready && source.toString() === previewFrame.pendingSource.toString()) {
+                                                    previewFrame.displaySource = previewFrame.pendingSource
+                                                    previewFrame.pendingSource = ""
+                                                    source = ""
+                                                } else if (status === Image.Error && source.toString() === previewFrame.pendingSource.toString()) {
+                                                    previewFrame.pendingSource = ""
+                                                    source = ""
+                                                }
+                                            }
                                         }
 
                                         Rectangle {
                                             anchors.fill: parent
-                                            visible: !previewImage.visible
+                                            visible: previewFrame.displaySource.toString().length === 0
                                             color: workspaceSelected ? "#d2d8d2" : "#141d24"
                                         }
+
+                                        onObservedPreviewChanged: syncPreviewSource()
+
+                                        Component.onCompleted: syncPreviewSource()
 
                                         Label {
                                             anchors.horizontalCenter: parent.horizontalCenter
@@ -393,10 +459,8 @@ Window {
         function onVisibleChanged() {
             if (Controller.visible) {
                 hasBeenVisible = true
-                Qt.callLater(() => {
-                    keyHandler.forceActiveFocus()
-                    flick.ensureSelectedVisible()
-                })
+                keyHandler.forceActiveFocus()
+                selectionRevealTimer.restart()
             } else if (hasBeenVisible && !Controller.residentMode) {
                 Qt.quit()
             }
@@ -407,21 +471,22 @@ Window {
         target: Controller
 
         function onCurrentIndexChanged() {
-            Qt.callLater(() => flick.ensureSelectedVisible())
+            navigationRefreshTimer.restart()
+            selectionRevealTimer.restart()
         }
 
         function onGridRowCountChanged() {
-            Qt.callLater(() => flick.ensureSelectedVisible())
+            selectionRevealTimer.restart()
         }
 
         function onGridColumnCountChanged() {
-            Qt.callLater(() => flick.ensureSelectedVisible())
+            selectionRevealTimer.restart()
         }
 
         function onOpenGenerationChanged() {
             openRefreshTimer.interval = Controller.hasSnapshot ? 120 : 24
             openRefreshTimer.restart()
-            Qt.callLater(() => flick.ensureSelectedVisible())
+            selectionRevealTimer.restart()
         }
     }
 

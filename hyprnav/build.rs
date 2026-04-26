@@ -13,6 +13,7 @@ fn main() {
     .qt_module("Network")
     .file("src/controller.rs")
     .cpp_file("cpp/layer_shell_bridge.cpp")
+    .cpp_file("cpp/model_bridge.cpp")
     .build();
 
     println!("cargo:rustc-link-lib=LayerShellQtInterface");

@@ -6,9 +6,10 @@ use crate::runtime_paths::resolve_runtime_paths;
 use crate::ui_session::{
     drain_grid_session_commands, drain_switcher_session_commands, GridUiCommand, UiSessionCommand,
 };
+use cxx_qt::casting::Upcast;
 use cxx_qt::CxxQtType;
 use cxx_qt_lib::{
-    QByteArray, QHash, QHashPair_i32_QByteArray, QModelIndex, QString, QUrl, QVariant,
+    QByteArray, QHash, QHashPair_i32_QByteArray, QList, QModelIndex, QString, QUrl, QVariant,
 };
 use std::collections::BTreeMap;
 use std::pin::Pin;
@@ -21,7 +22,6 @@ const ROLE_SUBTITLE: i32 = 0x0103;
 const ROLE_APP_CLASS: i32 = 0x0104;
 const ROLE_WINDOW_COUNT: i32 = 0x0105;
 const ROLE_ACTIVE: i32 = 0x0106;
-const ROLE_SELECTED: i32 = 0x0107;
 const ROLE_PREVIEW: i32 = 0x0108;
 const ROLE_GENERATION: i32 = 0x0109;
 const ROLE_ENVIRONMENT_ID: i32 = 0x010a;
@@ -33,8 +33,9 @@ const ROLE_SHOW_ENVIRONMENT_LABEL: i32 = 0x010f;
 const ROLE_ROW_INDEX: i32 = 0x0110;
 const ROLE_COLUMN_INDEX: i32 = 0x0111;
 const OPEN_REFRESH_STALE_THRESHOLD_MS: u64 = 1_500;
+const NAVIGATION_REFRESH_GRACE_MS: u64 = 250;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct UiItem {
     workspace_id: i32,
     workspace_name: String,
@@ -80,6 +81,9 @@ pub mod qobject {
         include!("cxx-qt-lib/qmodelindex.h");
         type QModelIndex = cxx_qt_lib::QModelIndex;
 
+        include!("cxx-qt-lib/core/qlist/qlist_i32.h");
+        type QList_i32 = cxx_qt_lib::QList<i32>;
+
         include!("cxx-qt-lib/qstring.h");
         type QString = cxx_qt_lib::QString;
 
@@ -115,6 +119,16 @@ pub mod qobject {
         include!(<QtCore/QAbstractListModel>);
         #[qobject]
         type QAbstractListModel;
+    }
+
+    unsafe extern "C++" {
+        include!("hyprnav/cpp/model_bridge.hpp");
+        fn hyprexpo_emit_rows_changed(
+            model: Pin<&mut QAbstractListModel>,
+            first_row: i32,
+            last_row: i32,
+            roles: &QList_i32,
+        );
     }
 
     extern "RustQt" {
@@ -231,6 +245,7 @@ pub struct ControllerRust {
     open_generation: i32,
     initialized: bool,
     last_snapshot_ms: u64,
+    last_navigation_ms: u64,
     items: Vec<UiItem>,
     mode: UiMode,
     reverse: bool,
@@ -311,7 +326,6 @@ impl qobject::Controller {
             ROLE_APP_CLASS => QVariant::from(&QString::from(item.app_class.as_str())),
             ROLE_WINDOW_COUNT => QVariant::from(&item.window_count),
             ROLE_ACTIVE => QVariant::from(&item.active),
-            ROLE_SELECTED => QVariant::from(&(index.row() == self.rust().current_index)),
             ROLE_PREVIEW => {
                 if item.preview_path.is_empty() {
                     QVariant::default()
@@ -353,10 +367,6 @@ impl qobject::Controller {
             QByteArray::from("workspaceWindowCount".as_bytes()),
         );
         roles.insert(ROLE_ACTIVE, QByteArray::from("workspaceActive".as_bytes()));
-        roles.insert(
-            ROLE_SELECTED,
-            QByteArray::from("workspaceSelected".as_bytes()),
-        );
         roles.insert(
             ROLE_PREVIEW,
             QByteArray::from("workspacePreview".as_bytes()),
@@ -527,7 +537,7 @@ impl qobject::Controller {
     }
 
     pub fn refresh_snapshot_if_visible(mut self: Pin<&mut Self>) {
-        if !*self.visible() {
+        if !*self.visible() || self.as_ref().rust().navigation_grace_active() {
             return;
         }
 
@@ -537,7 +547,7 @@ impl qobject::Controller {
     }
 
     pub fn refresh_snapshot_if_stale(mut self: Pin<&mut Self>) {
-        if !*self.visible() {
+        if !*self.visible() || self.as_ref().rust().navigation_grace_active() {
             return;
         }
 
@@ -694,6 +704,33 @@ impl qobject::Controller {
             })
             .unwrap_or_else(|| normalize_index(snapshot.initial_index, items.len()));
 
+        let unchanged_snapshot = {
+            let binding = self.as_ref();
+            let rust = binding.rust();
+            snapshot_matches_switcher_layout(&rust.items, &items)
+                && !*binding.grid_mode()
+                && *binding.grid_row_count() == 0
+                && *binding.grid_column_count() == 0
+        };
+
+        if unchanged_snapshot {
+            self.as_mut().set_current_index(current_index);
+            self.as_mut().set_grid_mode(false);
+            self.as_mut().set_grid_row_count(0);
+            self.as_mut().set_grid_column_count(0);
+            return;
+        }
+
+        let changed_ranges = {
+            let binding = self.as_ref();
+            let rust = binding.rust();
+            if switcher_snapshot_is_structural_match(&rust.items, &items) {
+                Some(changed_row_ranges(&rust.items, &items))
+            } else {
+                None
+            }
+        };
+
         {
             let mut rust = self.as_mut().rust_mut();
             rust.items = items;
@@ -704,7 +741,11 @@ impl qobject::Controller {
         self.as_mut().set_grid_mode(false);
         self.as_mut().set_grid_row_count(0);
         self.as_mut().set_grid_column_count(0);
-        self.as_mut().reset_model();
+        if let Some(changed_ranges) = changed_ranges {
+            self.as_mut().emit_rows_changed(changed_ranges);
+        } else {
+            self.as_mut().reset_model();
+        }
     }
 
     fn apply_grid_snapshot(
@@ -731,6 +772,43 @@ impl qobject::Controller {
             })
             .unwrap_or_else(|| normalize_index(snapshot.initial_index, items.len()));
         let row_to_indices = build_row_indices(&items);
+
+        let unchanged_snapshot = {
+            let binding = self.as_ref();
+            let rust = binding.rust();
+            snapshot_matches_grid_layout(&rust.items, &items)
+                && rust.row_to_indices == row_to_indices
+                && *binding.grid_mode()
+                && *binding.grid_row_count() == snapshot.row_count
+                && *binding.grid_column_count() == snapshot.max_column_count
+        };
+
+        if unchanged_snapshot {
+            // Avoid rebuilding delegates on periodic refreshes when the snapshot payload
+            // is unchanged. Selection is derived from currentIndex in QML now.
+            self.as_mut().set_current_index(current_index);
+            self.as_mut().set_grid_mode(true);
+            self.as_mut().set_grid_row_count(snapshot.row_count);
+            self.as_mut()
+                .set_grid_column_count(snapshot.max_column_count);
+            return;
+        }
+
+        let changed_ranges = {
+            let binding = self.as_ref();
+            let rust = binding.rust();
+            if grid_snapshot_is_structural_match(&rust.items, &items)
+                && rust.row_to_indices == row_to_indices
+                && *binding.grid_mode()
+                && *binding.grid_row_count() == snapshot.row_count
+                && *binding.grid_column_count() == snapshot.max_column_count
+            {
+                Some(changed_row_ranges(&rust.items, &items))
+            } else {
+                None
+            }
+        };
+
         {
             let mut rust = self.as_mut().rust_mut();
             rust.items = items;
@@ -742,7 +820,11 @@ impl qobject::Controller {
         self.as_mut().set_grid_row_count(snapshot.row_count);
         self.as_mut()
             .set_grid_column_count(snapshot.max_column_count);
-        self.as_mut().reset_model();
+        if let Some(changed_ranges) = changed_ranges {
+            self.as_mut().emit_rows_changed(changed_ranges);
+        } else {
+            self.as_mut().reset_model();
+        }
     }
 
     fn move_linear(mut self: Pin<&mut Self>, delta: i32) {
@@ -875,8 +957,8 @@ impl qobject::Controller {
             return;
         }
 
+        self.as_mut().rust_mut().last_navigation_ms = now_ms_qt();
         self.as_mut().set_current_index(normalized);
-        self.as_mut().reset_model();
     }
 
     fn send_request<T: serde::de::DeserializeOwned>(&self, request: Request) -> anyhow::Result<T> {
@@ -889,6 +971,25 @@ impl qobject::Controller {
             self.as_mut().begin_reset_model();
             self.as_mut().end_reset_model();
         }
+    }
+
+    fn emit_rows_changed(mut self: Pin<&mut Self>, changed_ranges: Vec<(i32, i32)>) {
+        if changed_ranges.is_empty() {
+            return;
+        }
+
+        let roles = volatile_roles();
+        let mut model: Pin<&mut qobject::QAbstractListModel> = self.as_mut().upcast_pin();
+        for (first_row, last_row) in changed_ranges {
+            qobject::hyprexpo_emit_rows_changed(model.as_mut(), first_row, last_row, &roles);
+        }
+    }
+}
+
+impl ControllerRust {
+    fn navigation_grace_active(&self) -> bool {
+        self.last_navigation_ms != 0
+            && now_ms_qt().saturating_sub(self.last_navigation_ms) < NAVIGATION_REFRESH_GRACE_MS
     }
 }
 
@@ -935,6 +1036,109 @@ fn build_row_indices(items: &[UiItem]) -> Vec<Vec<usize>> {
     rows.into_values().collect()
 }
 
+fn switcher_snapshot_is_structural_match(current: &[UiItem], next: &[UiItem]) -> bool {
+    current.len() == next.len()
+        && current
+            .iter()
+            .zip(next.iter())
+            .all(|(left, right)| left.workspace_id == right.workspace_id)
+}
+
+fn grid_snapshot_is_structural_match(current: &[UiItem], next: &[UiItem]) -> bool {
+    current.len() == next.len()
+        && current
+            .iter()
+            .zip(next.iter())
+            .all(|(left, right)| grid_item_structural_eq(left, right))
+}
+
+fn grid_item_structural_eq(left: &UiItem, right: &UiItem) -> bool {
+    left.workspace_id == right.workspace_id
+        && left.environment_id == right.environment_id
+        && left.environment_display_id == right.environment_display_id
+        && left.slot_index == right.slot_index
+        && left.physical_workspace_id == right.physical_workspace_id
+        && left.environment_locked == right.environment_locked
+        && left.show_environment_label == right.show_environment_label
+        && left.row_index == right.row_index
+        && left.column_index == right.column_index
+}
+
+fn volatile_item_eq(left: &UiItem, right: &UiItem) -> bool {
+    left.workspace_name == right.workspace_name
+        && left.subtitle == right.subtitle
+        && left.app_class == right.app_class
+        && left.window_count == right.window_count
+        && left.active == right.active
+        && left.preview_path == right.preview_path
+        && left.generation == right.generation
+}
+
+fn snapshot_matches_switcher_layout(current: &[UiItem], next: &[UiItem]) -> bool {
+    switcher_snapshot_is_structural_match(current, next)
+        && current
+            .iter()
+            .zip(next.iter())
+            .all(|(left, right)| volatile_item_eq(left, right))
+}
+
+fn snapshot_matches_grid_layout(current: &[UiItem], next: &[UiItem]) -> bool {
+    grid_snapshot_is_structural_match(current, next)
+        && current
+            .iter()
+            .zip(next.iter())
+            .all(|(left, right)| volatile_item_eq(left, right))
+}
+
+fn changed_row_ranges(current: &[UiItem], next: &[UiItem]) -> Vec<(i32, i32)> {
+    let changed_rows = current
+        .iter()
+        .zip(next.iter())
+        .enumerate()
+        .filter_map(|(index, (left, right))| (!volatile_item_eq(left, right)).then_some(index))
+        .collect::<Vec<_>>();
+    coalesce_row_ranges(&changed_rows)
+}
+
+fn coalesce_row_ranges(changed_rows: &[usize]) -> Vec<(i32, i32)> {
+    let Some(&first_row) = changed_rows.first() else {
+        return Vec::new();
+    };
+
+    let mut ranges = Vec::new();
+    let mut range_start = first_row as i32;
+    let mut range_end = range_start;
+
+    for &row in &changed_rows[1..] {
+        let row = row as i32;
+        if row == range_end + 1 {
+            range_end = row;
+            continue;
+        }
+
+        ranges.push((range_start, range_end));
+        range_start = row;
+        range_end = row;
+    }
+
+    ranges.push((range_start, range_end));
+    ranges
+}
+
+fn volatile_roles() -> QList<i32> {
+    [
+        ROLE_NAME,
+        ROLE_SUBTITLE,
+        ROLE_APP_CLASS,
+        ROLE_WINDOW_COUNT,
+        ROLE_ACTIVE,
+        ROLE_PREVIEW,
+        ROLE_GENERATION,
+    ]
+    .into_iter()
+    .collect()
+}
+
 fn uses_resident_grid_window(mode: UiMode, resident_mode: bool) -> bool {
     mode == UiMode::Grid && resident_mode
 }
@@ -964,7 +1168,11 @@ impl cxx_qt::Initialize for qobject::Controller {
 
 #[cfg(test)]
 mod tests {
-    use super::{uses_resident_grid_window, UiMode};
+    use super::{
+        changed_row_ranges, coalesce_row_ranges, grid_item_structural_eq, item_from_grid_snapshot,
+        switcher_snapshot_is_structural_match, uses_resident_grid_window, volatile_item_eq,
+        GridCellSnapshot, UiItem, UiMode,
+    };
 
     #[test]
     fn uses_resident_window_only_for_resident_grid() {
@@ -972,5 +1180,98 @@ mod tests {
         assert!(!uses_resident_grid_window(UiMode::Grid, false));
         assert!(!uses_resident_grid_window(UiMode::Switcher, true));
         assert!(!uses_resident_grid_window(UiMode::Switcher, false));
+    }
+
+    #[test]
+    fn switcher_structure_ignores_volatile_changes() {
+        let current = vec![UiItem {
+            workspace_id: 4,
+            workspace_name: "one".into(),
+            generation: 1,
+            ..UiItem::default()
+        }];
+        let next = vec![UiItem {
+            workspace_id: 4,
+            workspace_name: "two".into(),
+            generation: 2,
+            active: true,
+            ..UiItem::default()
+        }];
+
+        assert!(switcher_snapshot_is_structural_match(&current, &next));
+        assert!(!volatile_item_eq(&current[0], &next[0]));
+    }
+
+    #[test]
+    fn grid_structure_rejects_layout_changes() {
+        let left = item_from_grid_snapshot(GridCellSnapshot {
+            workspace_name: "1".into(),
+            subtitle: String::new(),
+            app_class: String::new(),
+            window_count: 1,
+            active: false,
+            preview_path: String::new(),
+            generation: 1,
+            environment_id: "env".into(),
+            environment_display_id: "Env".into(),
+            slot_index: 1,
+            physical_workspace_id: 1,
+            environment_locked: false,
+            show_environment_label: true,
+            row_index: 0,
+            column_index: 0,
+        });
+        let right = UiItem {
+            row_index: 1,
+            ..left.clone()
+        };
+
+        assert!(!grid_item_structural_eq(&left, &right));
+    }
+
+    #[test]
+    fn changed_rows_only_track_volatile_differences() {
+        let current = vec![
+            UiItem {
+                workspace_id: 1,
+                workspace_name: "one".into(),
+                generation: 1,
+                ..UiItem::default()
+            },
+            UiItem {
+                workspace_id: 2,
+                workspace_name: "two".into(),
+                generation: 1,
+                ..UiItem::default()
+            },
+            UiItem {
+                workspace_id: 3,
+                workspace_name: "three".into(),
+                generation: 1,
+                ..UiItem::default()
+            },
+        ];
+        let next = vec![
+            current[0].clone(),
+            UiItem {
+                workspace_name: "second".into(),
+                generation: 2,
+                ..current[1].clone()
+            },
+            UiItem {
+                preview_path: "/tmp/preview.png".into(),
+                ..current[2].clone()
+            },
+        ];
+
+        assert_eq!(changed_row_ranges(&current, &next), vec![(1, 2)]);
+    }
+
+    #[test]
+    fn coalesces_adjacent_changed_rows() {
+        assert_eq!(
+            coalesce_row_ranges(&[0, 1, 3, 4, 7]),
+            vec![(0, 1), (3, 4), (7, 7)]
+        );
     }
 }
