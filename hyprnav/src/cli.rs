@@ -78,9 +78,11 @@ pub enum Command {
     Trigger(TriggerArgs),
     #[command(
         about = "Open the environment/slot grid overlay.",
-        long_about = "Open the environment/slot grid overlay.\n\nThis UI shows environment rows and their mapped virtual slots. It talks to the daemon for data and activation."
+        long_about = "Open the environment/slot grid overlay.\n\nThis command talks to a resident grid UI process when one is already running. If needed it starts that process first, then asks it to show the existing window."
     )]
     Grid,
+    #[command(name = "grid-server", hide = true)]
+    GridServer,
     #[command(
         about = "Show lock state and current environment derived from a path.",
         long_about = "Show lock state and, optionally, the environment that would be derived from a given working directory."

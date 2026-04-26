@@ -3,13 +3,16 @@ use crate::protocol::{
     WorkspaceCardSnapshot,
 };
 use crate::runtime_paths::resolve_runtime_paths;
-use crate::ui_session::{drain_switcher_session_commands, UiSessionCommand};
+use crate::ui_session::{
+    drain_grid_session_commands, drain_switcher_session_commands, GridUiCommand, UiSessionCommand,
+};
 use cxx_qt::CxxQtType;
 use cxx_qt_lib::{
     QByteArray, QHash, QHashPair_i32_QByteArray, QModelIndex, QString, QUrl, QVariant,
 };
 use std::collections::BTreeMap;
 use std::pin::Pin;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::warn;
 
 const ROLE_ID: i32 = 0x0101;
@@ -29,6 +32,7 @@ const ROLE_ENVIRONMENT_LOCKED: i32 = 0x010e;
 const ROLE_SHOW_ENVIRONMENT_LABEL: i32 = 0x010f;
 const ROLE_ROW_INDEX: i32 = 0x0110;
 const ROLE_COLUMN_INDEX: i32 = 0x0111;
+const OPEN_REFRESH_STALE_THRESHOLD_MS: u64 = 1_500;
 
 #[derive(Clone, Debug, Default)]
 struct UiItem {
@@ -121,6 +125,10 @@ pub mod qobject {
         #[qproperty(bool, grid_mode, cxx_name = "gridMode")]
         #[qproperty(i32, grid_row_count, cxx_name = "gridRowCount")]
         #[qproperty(i32, grid_column_count, cxx_name = "gridColumnCount")]
+        #[qproperty(bool, loading)]
+        #[qproperty(bool, has_snapshot, cxx_name = "hasSnapshot")]
+        #[qproperty(bool, resident_mode, cxx_name = "residentMode")]
+        #[qproperty(i32, open_generation, cxx_name = "openGeneration")]
         type Controller = super::ControllerRust;
 
         #[qinvokable]
@@ -171,8 +179,16 @@ pub mod qobject {
         fn refresh_snapshot_if_visible(self: Pin<&mut Controller>);
 
         #[qinvokable]
+        #[cxx_name = "refreshSnapshotIfStale"]
+        fn refresh_snapshot_if_stale(self: Pin<&mut Controller>);
+
+        #[qinvokable]
         #[cxx_name = "pumpSessionCommands"]
         fn pump_session_commands(self: Pin<&mut Controller>);
+
+        #[qinvokable]
+        #[cxx_name = "warmSnapshot"]
+        fn warm_snapshot(self: Pin<&mut Controller>);
 
         #[qinvokable]
         #[cxx_override]
@@ -207,7 +223,12 @@ pub struct ControllerRust {
     grid_mode: bool,
     grid_row_count: i32,
     grid_column_count: i32,
+    loading: bool,
+    has_snapshot: bool,
+    resident_mode: bool,
+    open_generation: i32,
     initialized: bool,
+    last_snapshot_ms: u64,
     items: Vec<UiItem>,
     mode: UiMode,
     reverse: bool,
@@ -234,12 +255,34 @@ impl qobject::Controller {
                 .as_deref()
                 == Some("1");
             rust.grid_mode = rust.mode == UiMode::Grid;
+            rust.resident_mode = std::env::var("HYPREXPO_SWITCHER_UI_RESIDENT")
+                .ok()
+                .as_deref()
+                == Some("1");
+        }
+        let resident_mode = self.as_ref().rust().resident_mode;
+        self.as_mut().set_resident_mode(resident_mode);
+
+        if !(self.as_ref().rust().mode == UiMode::Grid && resident_mode) {
+            if let Err(error) = self.as_mut().load_snapshot_and_show() {
+                warn!("failed to load UI snapshot: {error}");
+                self.as_mut().hide_overlay();
+            }
+        }
+    }
+
+    pub fn warm_snapshot(mut self: Pin<&mut Self>) {
+        if self.as_ref().rust().mode != UiMode::Grid
+            || !self.as_ref().rust().resident_mode
+            || *self.visible()
+            || *self.has_snapshot()
+        {
+            return;
         }
 
-        if let Err(error) = self.as_mut().load_snapshot() {
-            warn!("failed to load UI snapshot: {error}");
-            self.as_mut().set_visible(false);
-            qobject::hyprexpo_set_root_window_visible(false);
+        if let Err(error) = self.as_mut().refresh_snapshot(false) {
+            warn!("failed to warm grid snapshot: {error}");
+            self.as_mut().set_loading(false);
         }
     }
 
@@ -460,8 +503,7 @@ impl qobject::Controller {
             }
         }
 
-        self.as_mut().set_visible(false);
-        qobject::hyprexpo_set_root_window_visible(false);
+        self.as_mut().hide_overlay();
     }
 
     pub fn activate_workspace_at(mut self: Pin<&mut Self>, index: i32) {
@@ -470,12 +512,11 @@ impl qobject::Controller {
     }
 
     pub fn cancel(mut self: Pin<&mut Self>) {
-        self.as_mut().set_visible(false);
-        qobject::hyprexpo_set_root_window_visible(false);
+        self.as_mut().hide_overlay();
     }
 
     pub fn handle_modifier_released(mut self: Pin<&mut Self>) {
-        if *self.visible() {
+        if self.as_ref().rust().mode == UiMode::Switcher && *self.visible() {
             self.as_mut().activate_current();
         }
     }
@@ -485,83 +526,134 @@ impl qobject::Controller {
             return;
         }
 
-        if let Err(error) = self.as_mut().reload_snapshot_preserving_selection() {
+        if let Err(error) = self.as_mut().refresh_snapshot(true) {
             warn!("failed to refresh UI snapshot: {error}");
         }
     }
 
-    pub fn pump_session_commands(mut self: Pin<&mut Self>) {
-        if self.as_ref().rust().mode != UiMode::Switcher || !*self.visible() {
+    pub fn refresh_snapshot_if_stale(mut self: Pin<&mut Self>) {
+        if !*self.visible() {
             return;
         }
 
-        for command in drain_switcher_session_commands() {
-            match command {
-                UiSessionCommand::StepForward => self.as_mut().select_next(),
-                UiSessionCommand::StepReverse => self.as_mut().select_previous(),
-                UiSessionCommand::Activate => {
-                    self.as_mut().activate_current();
-                    break;
+        let should_refresh = {
+            let binding = self.as_ref();
+            let rust = binding.rust();
+            !rust.has_snapshot
+                || now_ms_qt().saturating_sub(rust.last_snapshot_ms)
+                    >= OPEN_REFRESH_STALE_THRESHOLD_MS
+        };
+
+        if !should_refresh {
+            return;
+        }
+
+        if let Err(error) = self.as_mut().refresh_snapshot(true) {
+            warn!("failed to refresh stale UI snapshot: {error}");
+        }
+    }
+
+    pub fn pump_session_commands(mut self: Pin<&mut Self>) {
+        match self.as_ref().rust().mode {
+            UiMode::Switcher => {
+                if !*self.visible() {
+                    return;
                 }
-                UiSessionCommand::Cancel => {
-                    self.as_mut().cancel();
-                    break;
+
+                for command in drain_switcher_session_commands() {
+                    match command {
+                        UiSessionCommand::StepForward => self.as_mut().select_next(),
+                        UiSessionCommand::StepReverse => self.as_mut().select_previous(),
+                        UiSessionCommand::Activate => {
+                            self.as_mut().activate_current();
+                            break;
+                        }
+                        UiSessionCommand::Cancel => {
+                            self.as_mut().cancel();
+                            break;
+                        }
+                    }
+                }
+            }
+            UiMode::Grid => {
+                if !self.as_ref().rust().resident_mode {
+                    return;
+                }
+
+                for command in drain_grid_session_commands() {
+                    match command {
+                        GridUiCommand::Open => {
+                            self.as_mut().show_overlay();
+                            let next_generation = self.as_ref().rust().open_generation + 1;
+                            self.as_mut().set_open_generation(next_generation);
+                        }
+                        GridUiCommand::Close => self.as_mut().hide_overlay(),
+                        GridUiCommand::Refresh => {
+                            if let Err(error) = self.as_mut().refresh_snapshot(true) {
+                                warn!("failed to refresh grid snapshot: {error}");
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 
-    fn load_snapshot(mut self: Pin<&mut Self>) -> anyhow::Result<()> {
-        match self.as_ref().rust().mode {
-            UiMode::Switcher => {
-                let snapshot = self.as_ref().send_request::<SwitcherSnapshot>(
-                    Request::UiSnapshotSwitcher {
-                        reverse: self.as_ref().rust().reverse,
-                    },
-                )?;
-                self.as_mut().apply_switcher_snapshot(snapshot, None);
-            }
-            UiMode::Grid => {
-                let cwd = std::env::current_dir()
-                    .ok()
-                    .map(|path| path.to_string_lossy().into_owned());
-                let snapshot = self
-                    .as_ref()
-                    .send_request::<GridSnapshot>(Request::UiSnapshotGrid { cwd })?;
-                self.as_mut().apply_grid_snapshot(snapshot, None);
-            }
-        }
-
-        self.as_mut().set_visible(true);
-        qobject::hyprexpo_set_root_window_visible(true);
+    fn load_snapshot_and_show(mut self: Pin<&mut Self>) -> anyhow::Result<()> {
+        self.as_mut().refresh_snapshot(false)?;
+        self.as_mut().show_overlay();
         Ok(())
     }
 
-    fn reload_snapshot_preserving_selection(mut self: Pin<&mut Self>) -> anyhow::Result<()> {
-        match self.as_ref().rust().mode {
+    fn refresh_snapshot(mut self: Pin<&mut Self>, preserve_selection: bool) -> anyhow::Result<()> {
+        self.as_mut().set_loading(true);
+        let result = match self.as_ref().rust().mode {
             UiMode::Switcher => {
-                let selected_workspace_id = self.as_ref().current_switcher_selection_workspace_id();
+                let preferred_workspace_id = preserve_selection
+                    .then(|| self.as_ref().current_switcher_selection_workspace_id())
+                    .flatten();
                 let snapshot = self.as_ref().send_request::<SwitcherSnapshot>(
                     Request::UiSnapshotSwitcher {
                         reverse: self.as_ref().rust().reverse,
                     },
                 )?;
                 self.as_mut()
-                    .apply_switcher_snapshot(snapshot, selected_workspace_id);
+                    .apply_switcher_snapshot(snapshot, preferred_workspace_id);
+                Ok(())
             }
             UiMode::Grid => {
-                let selected_key = self.as_ref().current_grid_selection_key();
+                let preferred_selection = preserve_selection
+                    .then(|| self.as_ref().current_grid_selection_key())
+                    .flatten();
                 let cwd = std::env::current_dir()
                     .ok()
                     .map(|path| path.to_string_lossy().into_owned());
                 let snapshot = self
                     .as_ref()
                     .send_request::<GridSnapshot>(Request::UiSnapshotGrid { cwd })?;
-                self.as_mut().apply_grid_snapshot(snapshot, selected_key);
+                self.as_mut()
+                    .apply_grid_snapshot(snapshot, preferred_selection);
+                Ok(())
             }
+        };
+
+        self.as_mut().set_loading(false);
+        if result.is_ok() {
+            self.as_mut().rust_mut().last_snapshot_ms = now_ms_qt();
+            self.as_mut().set_has_snapshot(true);
         }
 
-        Ok(())
+        result
+    }
+
+    fn show_overlay(mut self: Pin<&mut Self>) {
+        self.as_mut().set_visible(true);
+        qobject::hyprexpo_set_root_window_visible(true);
+    }
+
+    fn hide_overlay(mut self: Pin<&mut Self>) {
+        self.as_mut().set_visible(false);
+        qobject::hyprexpo_set_root_window_visible(false);
     }
 
     fn apply_switcher_snapshot(
@@ -836,8 +928,13 @@ fn normalize_index(index: i32, item_count: usize) -> i32 {
     }
 }
 
+fn now_ms_qt() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 impl cxx_qt::Initialize for qobject::Controller {
-    fn initialize(self: Pin<&mut Self>) {
-        self.initialize_if_needed();
-    }
+    fn initialize(self: Pin<&mut Self>) {}
 }

@@ -1030,7 +1030,6 @@ fn build_grid_snapshot(runtime: &ServerRuntime, cwd: Option<&str>) -> Result<Gri
         .collect::<HashMap<_, _>>();
 
     let mut rows = environments;
-    let row_count = rows.len() as i32;
 
     rows.sort_by(|left_env, right_env| {
         row_sort_key(
@@ -1050,18 +1049,18 @@ fn build_grid_snapshot(runtime: &ServerRuntime, cwd: Option<&str>) -> Result<Gri
     let mut items = Vec::new();
     let mut initial_index = -1;
     let mut max_column_count = 0;
+    let mut row_count = 0;
 
-    for (row_index, environment) in rows.into_iter().enumerate() {
+    for environment in rows {
         let slot_indexes = slot_indexes_for_environment(&environment.env_id, &local_bindings);
-        max_column_count = max_column_count.max(slot_indexes.len() as i32);
+        let mut row_items = Vec::new();
 
         for (column_index, slot_index) in slot_indexes.into_iter().enumerate() {
             let Some(record) = resolve_slot_effective_from_bindings(
                 &binding_index,
                 &environment.env_id,
                 slot_index,
-            )
-            else {
+            ) else {
                 continue;
             };
 
@@ -1086,10 +1085,10 @@ fn build_grid_snapshot(runtime: &ServerRuntime, cwd: Option<&str>) -> Result<Gri
                 && (initial_index < 0
                     || locked_env_id.as_deref() == Some(environment.env_id.as_str()))
             {
-                initial_index = item_index;
+                initial_index = item_index + row_items.len() as i32;
             }
 
-            items.push(GridCellSnapshot {
+            row_items.push(GridCellSnapshot {
                 environment_id: environment.env_id.clone(),
                 environment_display_id: environment.display_id.clone(),
                 binding_environment_id: Some(record.binding_environment_id.clone()),
@@ -1109,10 +1108,18 @@ fn build_grid_snapshot(runtime: &ServerRuntime, cwd: Option<&str>) -> Result<Gri
                 generation,
                 environment_locked: locked_env_id.as_deref() == Some(environment.env_id.as_str()),
                 show_environment_label: column_index == 0,
-                row_index: row_index as i32,
+                row_index: row_count,
                 column_index: column_index as i32,
             });
         }
+
+        if row_items.is_empty() {
+            continue;
+        }
+
+        max_column_count = max_column_count.max(row_items.len() as i32);
+        items.extend(row_items);
+        row_count += 1;
     }
 
     Ok(GridSnapshot {
@@ -1588,7 +1595,7 @@ fn send_plugin_spawn_request(paths: &RuntimePaths, request: &PluginSpawnRequest<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::StateStore;
+    use crate::db::{EnvironmentRecord, StateStore};
     use crate::protocol::SlotAssignmentMode;
     use std::collections::HashSet;
     use std::env;
@@ -1621,6 +1628,132 @@ mod tests {
 
     fn cleanup(path: &Path) {
         fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    fn environment(env_id: &str, display_id: &str) -> EnvironmentRecord {
+        EnvironmentRecord {
+            env_id: env_id.to_owned(),
+            display_id: display_id.to_owned(),
+            source_path: None,
+        }
+    }
+
+    fn card(workspace_id: i32, subtitle: &str, active: bool) -> WorkspaceCardSnapshot {
+        WorkspaceCardSnapshot {
+            workspace_id,
+            workspace_name: workspace_id.to_string(),
+            subtitle: subtitle.to_owned(),
+            app_class: String::new(),
+            window_count: 1,
+            active,
+            preview_path: String::new(),
+            generation: 0,
+        }
+    }
+
+    fn build_grid_snapshot_from_data(
+        environments: Vec<EnvironmentRecord>,
+        local_bindings: Vec<SlotBindingRecord>,
+        workspace_cards: Vec<WorkspaceCardSnapshot>,
+        current_workspace_id: i32,
+        locked_env_id: Option<&str>,
+        current_env_id: Option<&str>,
+    ) -> GridSnapshot {
+        let cards_by_workspace = workspace_cards
+            .into_iter()
+            .map(|card| (card.workspace_id, card))
+            .collect::<HashMap<_, _>>();
+        let binding_index = local_bindings
+            .iter()
+            .map(|binding| ((binding.env_id.as_str(), binding.slot_index), binding))
+            .collect::<HashMap<_, _>>();
+
+        let mut rows = environments;
+        rows.sort_by(|left_env, right_env| {
+            row_sort_key(
+                &left_env.env_id,
+                &left_env.display_id,
+                locked_env_id,
+                current_env_id,
+            )
+            .cmp(&row_sort_key(
+                &right_env.env_id,
+                &right_env.display_id,
+                locked_env_id,
+                current_env_id,
+            ))
+        });
+
+        let mut items = Vec::new();
+        let mut initial_index = -1;
+        let mut max_column_count = 0;
+        let mut row_count = 0;
+
+        for environment in rows {
+            let slot_indexes = slot_indexes_for_environment(&environment.env_id, &local_bindings);
+            let mut row_items = Vec::new();
+
+            for (column_index, slot_index) in slot_indexes.into_iter().enumerate() {
+                let Some(record) = resolve_slot_effective_from_bindings(
+                    &binding_index,
+                    &environment.env_id,
+                    slot_index,
+                ) else {
+                    continue;
+                };
+
+                let workspace_id = record.workspace_id;
+                let card = cards_by_workspace.get(&workspace_id);
+                let active = workspace_id == current_workspace_id;
+                let item_index = items.len() as i32;
+                if active
+                    && (initial_index < 0 || locked_env_id == Some(environment.env_id.as_str()))
+                {
+                    initial_index = item_index + row_items.len() as i32;
+                }
+
+                row_items.push(GridCellSnapshot {
+                    environment_id: environment.env_id.clone(),
+                    environment_display_id: environment.display_id.clone(),
+                    binding_environment_id: Some(record.binding_environment_id.clone()),
+                    command_environment_id: record.command_environment_id.clone(),
+                    slot_index: record.slot_index,
+                    physical_workspace_id: workspace_id,
+                    binding_kind: record.binding_kind.as_str().to_owned(),
+                    inherited: record.binding_environment_id != environment.env_id,
+                    workspace_name: workspace_id.to_string(),
+                    subtitle: card
+                        .map(|item| item.subtitle.clone())
+                        .unwrap_or_else(|| format!("Workspace {}", workspace_id)),
+                    app_class: card.map(|item| item.app_class.clone()).unwrap_or_default(),
+                    window_count: card.map(|item| item.window_count).unwrap_or(0),
+                    active,
+                    preview_path: card
+                        .map(|item| item.preview_path.clone())
+                        .unwrap_or_default(),
+                    generation: card.map(|item| item.generation).unwrap_or(0),
+                    environment_locked: locked_env_id == Some(environment.env_id.as_str()),
+                    show_environment_label: column_index == 0,
+                    row_index: row_count,
+                    column_index: column_index as i32,
+                });
+            }
+
+            if row_items.is_empty() {
+                continue;
+            }
+
+            max_column_count = max_column_count.max(row_items.len() as i32);
+            items.extend(row_items);
+            row_count += 1;
+        }
+
+        GridSnapshot {
+            items,
+            initial_index,
+            row_count,
+            max_column_count,
+        }
     }
 
     #[test]
@@ -1733,6 +1866,67 @@ mod tests {
         assert_eq!(record.command_environment_id, Some("x.y".to_owned()));
         assert_eq!(record.workspace_id, 5);
         assert_eq!(record.launch_argv, Some(vec!["kitty".to_owned()]));
+    }
+
+    fn grid_snapshot_omits_empty_rows_and_uses_dense_row_indexes() {
+        let snapshot = build_grid_snapshot_from_data(
+            vec![
+                environment("empty", "Empty"),
+                environment("alpha", "Alpha"),
+                environment("beta", "Beta"),
+            ],
+            vec![
+                binding("alpha", 1, 11),
+                binding("alpha", 3, 13),
+                binding("beta", 2, 22),
+            ],
+            vec![
+                card(11, "alpha-1", false),
+                card(13, "alpha-3", false),
+                card(22, "beta-2", true),
+            ],
+            22,
+            None,
+            Some("alpha"),
+        );
+
+        assert_eq!(snapshot.row_count, 2);
+        assert_eq!(snapshot.max_column_count, 2);
+        assert_eq!(snapshot.initial_index, 2);
+        assert_eq!(snapshot.items.len(), 3);
+
+        assert_eq!(snapshot.items[0].environment_id, "alpha");
+        assert_eq!(snapshot.items[0].row_index, 0);
+        assert_eq!(snapshot.items[0].column_index, 0);
+        assert!(snapshot.items[0].show_environment_label);
+
+        assert_eq!(snapshot.items[1].environment_id, "alpha");
+        assert_eq!(snapshot.items[1].row_index, 0);
+        assert_eq!(snapshot.items[1].column_index, 1);
+        assert!(!snapshot.items[1].show_environment_label);
+
+        assert_eq!(snapshot.items[2].environment_id, "beta");
+        assert_eq!(snapshot.items[2].row_index, 1);
+        assert_eq!(snapshot.items[2].column_index, 0);
+        assert!(snapshot.items[2].show_environment_label);
+    }
+
+    #[test]
+    fn grid_snapshot_prefers_locked_environment_for_initial_selection_after_row_compaction() {
+        let snapshot = build_grid_snapshot_from_data(
+            vec![environment("alpha", "Alpha"), environment("beta", "Beta")],
+            vec![binding("alpha", 1, 11), binding("beta", 1, 11)],
+            vec![card(11, "shared", true)],
+            11,
+            Some("beta"),
+            Some("alpha"),
+        );
+
+        assert_eq!(snapshot.row_count, 2);
+        assert_eq!(snapshot.initial_index, 1);
+        assert_eq!(snapshot.items[0].environment_id, "alpha");
+        assert_eq!(snapshot.items[1].environment_id, "beta");
+        assert!(snapshot.items[1].environment_locked);
     }
 
     #[test]

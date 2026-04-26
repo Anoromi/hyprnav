@@ -20,6 +20,27 @@ Window {
         onTriggered: Controller.refreshSnapshotIfVisible()
     }
 
+    Timer {
+        interval: 10
+        repeat: true
+        running: true
+        onTriggered: Controller.pumpSessionCommands()
+    }
+
+    Timer {
+        id: openRefreshTimer
+        interval: 120
+        repeat: false
+        onTriggered: Controller.refreshSnapshotIfStale()
+    }
+
+    Timer {
+        id: warmStartTimer
+        interval: 50
+        repeat: false
+        onTriggered: Controller.warmSnapshot()
+    }
+
     FocusScope {
         id: keyHandler
         anchors.fill: parent
@@ -80,29 +101,141 @@ Window {
         Rectangle {
             id: dialog
             anchors.centerIn: parent
-            property int rowLabelWidth: 184
             property int cardWidth: 210
             property int cardHeight: 216
             property int horizontalSpacing: 14
-            property int verticalSpacing: 18
+            property int rowSpacing: 12
+            property int rowHeaderHeight: 20
+            property int rowHeaderGap: 6
             property int cellWidth: cardWidth + horizontalSpacing
-            property int rowHeight: cardHeight + verticalSpacing
+            property int rowBlockHeight: rowHeaderHeight + rowHeaderGap + cardHeight
+            property int contentColumnsWidth: Controller.gridColumnCount > 0
+                ? cardWidth + Math.max(0, Controller.gridColumnCount - 1) * cellWidth
+                : 0
+            property int contentRowsHeight: Controller.gridRowCount > 0
+                ? Controller.gridRowCount * rowBlockHeight + Math.max(0, Controller.gridRowCount - 1) * rowSpacing
+                : 0
+            property real trackpadScrollMultiplier: 1.8
+            property real wheelScrollStep: rowBlockHeight + rowSpacing
 
-            width: Math.min(root.width - 80, rowLabelWidth + Controller.gridColumnCount * cellWidth + 44)
-            height: Math.min(root.height - 80, Math.max(192, Controller.gridRowCount * rowHeight + 44))
+            width: Math.min(root.width - 80, Math.max(192, contentColumnsWidth + 44))
+            height: Math.min(root.height - 80, Math.max(192, contentRowsHeight + 44))
             radius: 14
             color: "#e811171d"
             border.width: 1
             border.color: "#32404b"
 
             Flickable {
+                id: flick
                 anchors.fill: parent
                 anchors.margins: 22
-                contentWidth: Math.max(width, dialog.rowLabelWidth + Controller.gridColumnCount * dialog.cellWidth)
-                contentHeight: Math.max(height, Controller.gridRowCount * dialog.rowHeight)
+                contentWidth: Math.max(width, dialog.contentColumnsWidth)
+                contentHeight: Math.max(height, dialog.contentRowsHeight)
+                flickableDirection: Flickable.HorizontalAndVerticalFlick
+                interactive: false
+                boundsBehavior: Flickable.StopAtBounds
                 clip: true
 
+                ScrollBar.vertical: ScrollBar {
+                    id: verticalBar
+                    policy: flick.contentHeight > flick.height ? ScrollBar.AsNeeded : ScrollBar.AlwaysOff
+
+                    contentItem: Rectangle {
+                        implicitWidth: 6
+                        implicitHeight: 48
+                        radius: 3
+                        color: "#c7d2d8"
+                        opacity: verticalBar.active || verticalBar.hovered || flick.movingVertically ? 0.95 : 0.55
+                    }
+
+                    background: Item {
+                        implicitWidth: 6
+                    }
+                }
+
+                function clamp(value, minValue, maxValue) {
+                    return Math.max(minValue, Math.min(maxValue, value))
+                }
+
+                function axisDelta(pixelDelta, angleDelta, fallbackStep) {
+                    if (pixelDelta !== 0)
+                        return pixelDelta * dialog.trackpadScrollMultiplier
+
+                    if (angleDelta === 0)
+                        return 0
+
+                    return Math.sign(angleDelta) * fallbackStep
+                }
+
+                function scrollBy(rawDx, rawDy, shiftPressed) {
+                    const dx = shiftPressed && rawDx === 0 ? rawDy : rawDx
+                    const dy = shiftPressed && rawDx === 0 ? 0 : rawDy
+
+                    contentX = clamp(
+                        contentX - dx,
+                        0,
+                        Math.max(0, contentWidth - width)
+                    )
+                    contentY = clamp(
+                        contentY - dy,
+                        0,
+                        Math.max(0, contentHeight - height)
+                    )
+                }
+
+                function selectedDelegate() {
+                    for (let i = 0; i < contentRoot.children.length; ++i) {
+                        const child = contentRoot.children[i]
+                        if (child && child.workspaceDelegate && child.workspaceSelected)
+                            return child
+                    }
+
+                    return null
+                }
+
+                function ensureSelectedVisible() {
+                    const selected = selectedDelegate()
+                    if (!selected)
+                        return
+
+                    const left = selected.x
+                    const right = left + selected.width
+                    const top = selected.y + selected.cardTop
+                    const bottom = top + dialog.cardHeight
+                    const maxX = Math.max(0, contentWidth - width)
+                    const maxY = Math.max(0, contentHeight - height)
+                    let nextX = contentX
+                    let nextY = contentY
+
+                    if (left < nextX)
+                        nextX = left
+                    else if (right > nextX + width)
+                        nextX = right - width
+
+                    if (top < nextY)
+                        nextY = top
+                    else if (bottom > nextY + height)
+                        nextY = bottom - height
+
+                    contentX = clamp(nextX, 0, maxX)
+                    contentY = clamp(nextY, 0, maxY)
+                }
+
+                MouseArea {
+                    anchors.fill: parent
+                    acceptedButtons: Qt.NoButton
+                    propagateComposedEvents: true
+
+                    onWheel: event => {
+                        const rawDx = flick.axisDelta(event.pixelDelta.x, event.angleDelta.x, dialog.wheelScrollStep)
+                        const rawDy = flick.axisDelta(event.pixelDelta.y, event.angleDelta.y, dialog.wheelScrollStep)
+                        flick.scrollBy(rawDx, rawDy, (event.modifiers & Qt.ShiftModifier) !== 0)
+                        event.accepted = true
+                    }
+                }
+
                 Item {
+                    id: contentRoot
                     width: parent.contentWidth
                     height: parent.contentHeight
 
@@ -124,6 +257,8 @@ Window {
                             required property string environmentDisplayId
                             required property bool environmentLocked
                             required property bool showEnvironmentLabel
+                            property bool workspaceDelegate: true
+                            property int cardTop: dialog.rowHeaderHeight + dialog.rowHeaderGap
 
                             property string cardSummary: {
                                 if (workspaceSubtitle.length > 0)
@@ -135,26 +270,28 @@ Window {
                                 return "WS " + slotIndex
                             }
 
-                            x: dialog.rowLabelWidth + columnIndex * dialog.cellWidth
-                            y: rowIndex * dialog.rowHeight
+                            x: columnIndex * dialog.cellWidth
+                            y: rowIndex * (dialog.rowBlockHeight + dialog.rowSpacing)
                             width: dialog.cardWidth
-                            height: dialog.cardHeight
+                            height: dialog.rowBlockHeight
 
                             Label {
                                 visible: showEnvironmentLabel
-                                x: -dialog.rowLabelWidth + 8
-                                y: 58
-                                width: dialog.rowLabelWidth - 22
+                                x: 0
+                                y: 0
+                                width: contentRoot.width
                                 text: environmentDisplayId
                                 color: environmentLocked ? "#efe6d4" : "#c7d2d8"
-                                font.pixelSize: 17
+                                font.pixelSize: 14
                                 font.family: "IBM Plex Sans"
-                                font.weight: Font.DemiBold
+                                font.weight: Font.Medium
                                 elide: Text.ElideRight
                             }
 
                             Rectangle {
-                                anchors.fill: parent
+                                y: cardTop
+                                width: parent.width
+                                height: dialog.cardHeight
                                 radius: 12
                                 clip: true
                                 color: workspaceSelected ? "#efe6d4" : "#111920"
@@ -228,7 +365,16 @@ Window {
 
                     Label {
                         anchors.centerIn: parent
-                        visible: Controller.gridRowCount === 0
+                        visible: !Controller.hasSnapshot && Controller.loading
+                        text: "Loading environments"
+                        color: "#9fb0b8"
+                        font.pixelSize: 15
+                        font.family: "IBM Plex Sans"
+                    }
+
+                    Label {
+                        anchors.centerIn: parent
+                        visible: Controller.hasSnapshot && Controller.gridRowCount === 0
                         text: "No mapped environments"
                         color: "#9fb0b8"
                         font.pixelSize: 15
@@ -254,12 +400,39 @@ Window {
         if (visible) {
             hasBeenVisible = true
             keyHandler.forceActiveFocus()
-        } else if (hasBeenVisible) {
+            Qt.callLater(() => flick.ensureSelectedVisible())
+        } else if (hasBeenVisible && !Controller.residentMode) {
             Qt.quit()
         }
     }
 
+    Connections {
+        target: Controller
+
+        function onCurrentIndexChanged() {
+            Qt.callLater(() => flick.ensureSelectedVisible())
+        }
+
+        function onGridRowCountChanged() {
+            Qt.callLater(() => flick.ensureSelectedVisible())
+        }
+
+        function onGridColumnCountChanged() {
+            Qt.callLater(() => flick.ensureSelectedVisible())
+        }
+
+        function onOpenGenerationChanged() {
+            openRefreshTimer.interval = Controller.hasSnapshot ? 120 : 24
+            openRefreshTimer.restart()
+            Qt.callLater(() => flick.ensureSelectedVisible())
+        }
+    }
+
     Component.onCompleted: {
-        Qt.callLater(() => Controller.initializeIfNeeded())
+        Qt.callLater(() => {
+            Controller.initializeIfNeeded()
+            if (Controller.residentMode)
+                warmStartTimer.start()
+        })
     }
 }

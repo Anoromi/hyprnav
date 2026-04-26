@@ -15,7 +15,10 @@ use hyprnav::protocol::{
 use hyprnav::runtime_paths::resolve_runtime_paths;
 use hyprnav::server::run_server;
 use hyprnav::spawn::{current_pid, exec_command};
-use hyprnav::ui_session::{send_switcher_step_command, start_switcher_session_listener};
+use hyprnav::ui_session::{
+    send_grid_open_command, send_grid_ping_command, send_switcher_step_command,
+    start_grid_session_listener, start_switcher_session_listener,
+};
 use serde_json::Value;
 use std::io::{self, Write};
 use std::process::Command as ProcessCommand;
@@ -49,11 +52,18 @@ fn main() -> anyhow::Result<()> {
             if send_switcher_step_command(args.reverse)? {
                 return Ok(());
             }
-            run_ui("switcher", args.reverse)
+            run_ui("switcher", args.reverse, false)
         }
         Command::Grid => {
             ensure_server_running()?;
-            run_ui("grid", false)
+            ensure_grid_server_open()
+        }
+        Command::GridServer => {
+            ensure_server_running()?;
+            if send_grid_ping_command()? {
+                return Ok(());
+            }
+            run_ui("grid", false, true)
         }
         Command::Status(args) => {
             ensure_server_running()?;
@@ -283,12 +293,35 @@ fn ensure_server_running() -> anyhow::Result<()> {
     Err(anyhow::anyhow!("timed out waiting for hyprnav daemon"))
 }
 
-fn run_ui(mode: &str, reverse: bool) -> anyhow::Result<()> {
-    std::env::set_var("QML_DISABLE_DISK_CACHE", "1");
+fn ensure_grid_server_open() -> anyhow::Result<()> {
+    if send_grid_open_command()? {
+        return Ok(());
+    }
+
+    let current_exe = std::env::current_exe()?;
+    ProcessCommand::new(current_exe)
+        .arg("grid-server")
+        .spawn()?;
+
+    for _ in 0..40 {
+        thread::sleep(Duration::from_millis(100));
+        if send_grid_open_command()? {
+            return Ok(());
+        }
+    }
+
+    Err(anyhow::anyhow!("timed out waiting for hyprnav grid-server"))
+}
+
+fn run_ui(mode: &str, reverse: bool, resident: bool) -> anyhow::Result<()> {
     std::env::set_var("HYPREXPO_SWITCHER_UI_MODE", mode);
     std::env::set_var(
         "HYPREXPO_SWITCHER_UI_REVERSE",
         if reverse { "1" } else { "0" },
+    );
+    std::env::set_var(
+        "HYPREXPO_SWITCHER_UI_RESIDENT",
+        if resident { "1" } else { "0" },
     );
 
     let qml_type = if mode == "grid" {
@@ -298,6 +331,11 @@ fn run_ui(mode: &str, reverse: bool) -> anyhow::Result<()> {
     };
     let _switcher_session = if mode == "switcher" {
         Some(start_switcher_session_listener()?)
+    } else {
+        None
+    };
+    let _grid_session = if mode == "grid" && resident {
+        Some(start_grid_session_listener()?)
     } else {
         None
     };

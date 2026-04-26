@@ -15,6 +15,7 @@ pub struct RuntimePaths {
     pub preview_socket_path: PathBuf,
     pub spawn_socket_path: PathBuf,
     pub switcher_socket_path: PathBuf,
+    pub grid_socket_path: PathBuf,
     pub server_socket_path: PathBuf,
     pub hypr_event_socket_path: PathBuf,
     pub state_root: PathBuf,
@@ -48,6 +49,10 @@ pub fn preview_socket_path(runtime_dir: &Path, instance_signature: &str) -> Path
 
 pub fn switcher_socket_path(runtime_dir: &Path, instance_signature: &str) -> PathBuf {
     runtime_directory(runtime_dir, instance_signature).join("ui-hyprnav.sock")
+}
+
+pub fn grid_socket_path(runtime_dir: &Path, instance_signature: &str) -> PathBuf {
+    runtime_directory(runtime_dir, instance_signature).join("ui-hyprnav-grid.sock")
 }
 
 pub fn spawn_socket_path(runtime_dir: &Path, instance_signature: &str) -> PathBuf {
@@ -128,6 +133,7 @@ pub fn resolve_runtime_paths() -> RuntimePaths {
         preview_socket_path: preview_socket_path(&runtime_root, &instance_signature),
         spawn_socket_path: spawn_socket_path(&runtime_root, &instance_signature),
         switcher_socket_path: switcher_socket_path(&runtime_root, &instance_signature),
+        grid_socket_path: grid_socket_path(&runtime_root, &instance_signature),
         server_socket_path: server_socket_path(&runtime_root, &instance_signature),
         hypr_event_socket_path: hyprland_event_socket_path(&runtime_root, &instance_signature),
         runtime_dir: runtime_directory(&runtime_root, &instance_signature),
@@ -140,6 +146,10 @@ pub fn resolve_runtime_paths() -> RuntimePaths {
 
 pub fn fallback_switcher_socket_paths(runtime_dir: &Path) -> Vec<PathBuf> {
     fallback_named_socket_paths(runtime_dir, "ui-hyprnav.sock")
+}
+
+pub fn fallback_grid_socket_paths(runtime_dir: &Path) -> Vec<PathBuf> {
+    fallback_named_socket_paths(runtime_dir, "ui-hyprnav-grid.sock")
 }
 
 pub fn fallback_server_socket_paths(runtime_dir: &Path) -> Vec<PathBuf> {
