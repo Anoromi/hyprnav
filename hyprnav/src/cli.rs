@@ -36,6 +36,7 @@ Examples:
   hyprnav daemon
   hyprnav trigger
   hyprnav trigger --reverse
+  hyprnav switcher activate
   hyprnav grid
   hyprnav env ensure --env demo
   hyprnav slot assign --env demo --slot 1 --workspace 5
@@ -77,10 +78,18 @@ pub enum Command {
     )]
     Trigger(TriggerArgs),
     #[command(
+        about = "Control the active MRU workspace switcher overlay.",
+        long_about = "Control the active MRU workspace switcher overlay.\n\nThese commands are intended for compositor bindings that should activate or cancel an already-open switcher session."
+    )]
+    #[command(subcommand)]
+    Switcher(SwitcherCommand),
+    #[command(
         about = "Open the environment/slot grid overlay.",
         long_about = "Open the environment/slot grid overlay.\n\nThis command talks to a resident grid UI process when one is already running. If needed it starts that process first, then asks it to show the existing window."
     )]
     Grid,
+    #[command(name = "switcher-server", hide = true)]
+    SwitcherServer,
     #[command(name = "grid-server", hide = true)]
     GridServer,
     #[command(
@@ -145,6 +154,20 @@ pub struct TriggerArgs {
     /// Step backward instead of forward.
     #[arg(long)]
     pub reverse: bool,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SwitcherCommand {
+    #[command(
+        about = "Activate the current switcher selection.",
+        long_about = "Activate the current switcher selection if a switcher session is open."
+    )]
+    Activate,
+    #[command(
+        about = "Cancel the active switcher.",
+        long_about = "Cancel the active switcher if a switcher session is open."
+    )]
+    Cancel,
 }
 
 #[derive(Debug, Args)]

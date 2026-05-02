@@ -61,6 +61,11 @@ void hyprexpo_set_quit_on_last_window_closed(QGuiApplication& app, bool quitOnLa
     app.setQuitOnLastWindowClosed(quitOnLastWindowClosed);
 }
 
+bool hyprexpo_activation_modifier_held() {
+    const auto modifiers = QGuiApplication::queryKeyboardModifiers();
+    return modifiers.testFlag(Qt::MetaModifier) || modifiers.testFlag(Qt::AltModifier);
+}
+
 void hyprexpo_map_root_window_resident() {
     if (!g_rootWindow)
         return;

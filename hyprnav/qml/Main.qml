@@ -46,10 +46,17 @@ Window {
     }
 
     Timer {
-        interval: 40
+        interval: 10
         repeat: true
-        running: root.visible
+        running: true
         onTriggered: Controller.pumpSessionCommands()
+    }
+
+    Timer {
+        id: releaseRecoveryTimer
+        interval: 35
+        repeat: false
+        onTriggered: Controller.recoverMissedModifierRelease()
     }
 
     FocusScope {
@@ -357,7 +364,9 @@ Window {
         if (visible) {
             hasBeenVisible = true
             keyHandler.forceActiveFocus()
-        } else if (hasBeenVisible) {
+            if (Controller.residentMode)
+                releaseRecoveryTimer.restart()
+        } else if (hasBeenVisible && !Controller.residentMode) {
             Qt.quit()
         }
     }

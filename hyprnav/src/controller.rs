@@ -104,6 +104,7 @@ pub mod qobject {
         type QQmlApplicationEngine = cxx_qt_lib::QQmlApplicationEngine;
 
         include!("hyprnav/cpp/layer_shell_bridge.hpp");
+        fn hyprexpo_activation_modifier_held() -> bool;
         fn hyprexpo_configure_root_window(engine: Pin<&mut QQmlApplicationEngine>) -> bool;
         fn hyprexpo_load_qml_from_module(
             engine: Pin<&mut QQmlApplicationEngine>,
@@ -195,6 +196,10 @@ pub mod qobject {
         fn handle_modifier_released(self: Pin<&mut Controller>);
 
         #[qinvokable]
+        #[cxx_name = "recoverMissedModifierRelease"]
+        fn recover_missed_modifier_release(self: Pin<&mut Controller>);
+
+        #[qinvokable]
         #[cxx_name = "refreshSnapshotIfVisible"]
         fn refresh_snapshot_if_visible(self: Pin<&mut Controller>);
 
@@ -284,7 +289,9 @@ impl qobject::Controller {
         let resident_mode = self.as_ref().rust().resident_mode;
         self.as_mut().set_resident_mode(resident_mode);
 
-        if uses_resident_grid_window(self.as_ref().rust().mode, resident_mode) {
+        if self.as_ref().rust().mode == UiMode::Switcher && resident_mode {
+            qobject::hyprexpo_set_root_window_visible(false);
+        } else if uses_resident_grid_window(self.as_ref().rust().mode, resident_mode) {
             qobject::hyprexpo_map_root_window_resident();
             qobject::hyprexpo_set_root_window_interactive(false);
         } else {
@@ -344,7 +351,9 @@ impl qobject::Controller {
             ROLE_ENVIRONMENT_DISPLAY_ID => {
                 QVariant::from(&QString::from(item.environment_display_id.as_str()))
             }
-            ROLE_ENVIRONMENT_TITLE => QVariant::from(&QString::from(item.environment_title.as_str())),
+            ROLE_ENVIRONMENT_TITLE => {
+                QVariant::from(&QString::from(item.environment_title.as_str()))
+            }
             ROLE_SLOT_INDEX => QVariant::from(&item.slot_index),
             ROLE_SLOT_DISPLAY_NAME => {
                 QVariant::from(&QString::from(item.slot_display_name.as_str()))
@@ -552,6 +561,16 @@ impl qobject::Controller {
         }
     }
 
+    pub fn recover_missed_modifier_release(mut self: Pin<&mut Self>) {
+        if self.as_ref().rust().mode != UiMode::Switcher || !*self.visible() {
+            return;
+        }
+
+        if !qobject::hyprexpo_activation_modifier_held() {
+            self.as_mut().activate_current();
+        }
+    }
+
     pub fn refresh_snapshot_if_visible(mut self: Pin<&mut Self>) {
         if !*self.visible() || self.as_ref().rust().navigation_grace_active() {
             return;
@@ -587,16 +606,34 @@ impl qobject::Controller {
     pub fn pump_session_commands(mut self: Pin<&mut Self>) {
         match self.as_ref().rust().mode {
             UiMode::Switcher => {
-                if !*self.visible() {
-                    return;
-                }
-
                 for command in drain_switcher_session_commands() {
                     match command {
-                        UiSessionCommand::StepForward => self.as_mut().select_next(),
-                        UiSessionCommand::StepReverse => self.as_mut().select_previous(),
+                        UiSessionCommand::StepForward => {
+                            if !*self.visible() {
+                                self.as_mut().rust_mut().reverse = false;
+                                if let Err(error) = self.as_mut().load_snapshot_and_show() {
+                                    warn!("failed to open switcher: {error}");
+                                    self.as_mut().hide_overlay();
+                                }
+                            } else {
+                                self.as_mut().select_next();
+                            }
+                        }
+                        UiSessionCommand::StepReverse => {
+                            if !*self.visible() {
+                                self.as_mut().rust_mut().reverse = true;
+                                if let Err(error) = self.as_mut().load_snapshot_and_show() {
+                                    warn!("failed to open switcher: {error}");
+                                    self.as_mut().hide_overlay();
+                                }
+                            } else {
+                                self.as_mut().select_previous();
+                            }
+                        }
                         UiSessionCommand::Activate => {
-                            self.as_mut().activate_current();
+                            if *self.visible() {
+                                self.as_mut().activate_current();
+                            }
                             break;
                         }
                         UiSessionCommand::Cancel => {

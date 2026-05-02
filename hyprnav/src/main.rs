@@ -16,7 +16,8 @@ use hyprnav::runtime_paths::resolve_runtime_paths;
 use hyprnav::server::run_server;
 use hyprnav::spawn::{current_pid, exec_command};
 use hyprnav::ui_session::{
-    send_grid_open_command, send_grid_ping_command, send_switcher_step_command,
+    send_grid_open_command, send_grid_ping_command, send_switcher_activate_command,
+    send_switcher_cancel_command, send_switcher_ping_command, send_switcher_step_command,
     start_grid_session_listener, start_switcher_session_listener,
 };
 use serde_json::Value;
@@ -51,14 +52,31 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Trigger(args) => {
             ensure_server_running()?;
-            if send_switcher_step_command(args.reverse)? {
-                return Ok(());
+            ensure_switcher_server_open(args.reverse)
+        }
+        Command::Switcher(command) => {
+            ensure_server_running()?;
+            match command {
+                hyprnav::cli::SwitcherCommand::Activate => {
+                    let _ =
+                        send_switcher_command_with_startup_grace(send_switcher_activate_command)?;
+                }
+                hyprnav::cli::SwitcherCommand::Cancel => {
+                    let _ = send_switcher_command_with_startup_grace(send_switcher_cancel_command)?;
+                }
             }
-            run_ui("switcher", args.reverse, false)
+            Ok(())
         }
         Command::Grid => {
             ensure_server_running()?;
             ensure_grid_server_open()
+        }
+        Command::SwitcherServer => {
+            ensure_server_running()?;
+            if send_switcher_ping_command()? {
+                return Ok(());
+            }
+            run_ui("switcher", false, true)
         }
         Command::GridServer => {
             ensure_server_running()?;
@@ -376,6 +394,44 @@ fn ensure_grid_server_open() -> anyhow::Result<()> {
     }
 
     Err(anyhow::anyhow!("timed out waiting for hyprnav grid-server"))
+}
+
+fn ensure_switcher_server_open(reverse: bool) -> anyhow::Result<()> {
+    if send_switcher_step_command(reverse)? {
+        return Ok(());
+    }
+
+    let current_exe = std::env::current_exe()?;
+    ProcessCommand::new(current_exe)
+        .arg("switcher-server")
+        .spawn()?;
+
+    for _ in 0..40 {
+        thread::sleep(Duration::from_millis(25));
+        if send_switcher_step_command(reverse)? {
+            return Ok(());
+        }
+    }
+
+    Err(anyhow::anyhow!(
+        "timed out waiting for hyprnav switcher-server"
+    ))
+}
+
+fn send_switcher_command_with_startup_grace(
+    send_command: fn() -> anyhow::Result<bool>,
+) -> anyhow::Result<bool> {
+    for attempt in 0..10 {
+        if send_command()? {
+            return Ok(true);
+        }
+
+        if attempt < 9 {
+            thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    Ok(false)
 }
 
 fn run_ui(mode: &str, reverse: bool, resident: bool) -> anyhow::Result<()> {

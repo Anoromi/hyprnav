@@ -94,6 +94,36 @@ pub fn drain_grid_session_commands() -> Vec<GridUiCommand> {
 }
 
 pub fn send_switcher_step_command(reverse: bool) -> Result<bool> {
+    send_switcher_command(if reverse {
+        UiSessionCommand::StepReverse
+    } else {
+        UiSessionCommand::StepForward
+    })
+}
+
+pub fn send_switcher_activate_command() -> Result<bool> {
+    send_switcher_command(UiSessionCommand::Activate)
+}
+
+pub fn send_switcher_cancel_command() -> Result<bool> {
+    send_switcher_command(UiSessionCommand::Cancel)
+}
+
+pub fn send_switcher_ping_command() -> Result<bool> {
+    send_switcher_command_line("PING\n")
+}
+
+fn send_switcher_command(command: UiSessionCommand) -> Result<bool> {
+    let line = match command {
+        UiSessionCommand::StepForward => "STEP FORWARD\n",
+        UiSessionCommand::StepReverse => "STEP REVERSE\n",
+        UiSessionCommand::Activate => "ACTIVATE\n",
+        UiSessionCommand::Cancel => "CANCEL\n",
+    };
+    send_switcher_command_line(line)
+}
+
+fn send_switcher_command_line(line: &str) -> Result<bool> {
     let paths = resolve_runtime_paths();
     let mut candidates = vec![paths.switcher_socket_path];
     for candidate in fallback_switcher_socket_paths(&paths.runtime_root) {
@@ -103,14 +133,7 @@ pub fn send_switcher_step_command(reverse: bool) -> Result<bool> {
     }
 
     for candidate in candidates {
-        match send_command_to_socket(
-            &candidate,
-            if reverse {
-                UiSessionCommand::StepReverse
-            } else {
-                UiSessionCommand::StepForward
-            },
-        ) {
+        match send_command_line_to_socket(&candidate, line) {
             Ok(()) => return Ok(true),
             Err(_) => continue,
         }
@@ -346,6 +369,33 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn switcher_session_listener_accepts_step_activate_cancel_and_ping_commands() {
+        let path = test_socket_path("switcher");
+        let listener = start_switcher_session_listener_at(&path).expect("listener");
+
+        send_command_line_to_socket(&path, "STEP FORWARD\n").expect("step forward");
+        send_command_line_to_socket(&path, "STEP REVERSE\n").expect("step reverse");
+        send_command_line_to_socket(&path, "ACTIVATE\n").expect("activate");
+        send_command_line_to_socket(&path, "CANCEL\n").expect("cancel");
+        send_command_line_to_socket(&path, "PING\n").expect("ping");
+
+        thread::sleep(Duration::from_millis(75));
+
+        assert_eq!(
+            drain_switcher_session_commands(),
+            vec![
+                UiSessionCommand::StepForward,
+                UiSessionCommand::StepReverse,
+                UiSessionCommand::Activate,
+                UiSessionCommand::Cancel
+            ]
+        );
+
+        drop(listener);
+        let _ = fs::remove_file(path);
     }
 
     #[test]
