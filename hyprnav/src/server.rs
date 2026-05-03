@@ -29,7 +29,7 @@ use std::time::Duration;
 use tracing::warn;
 
 const PREVIEW_POLL_INTERVAL_MS: u64 = 15_000;
-const PREVIEW_WORKER_SLEEP_MS: u64 = 1_000;
+const PREVIEW_WORKER_SLEEP_MS: u64 = 100;
 const PREVIEW_SOCKET_READ_TIMEOUT_MS: u64 = 200;
 const LAUNCH_PENDING_TTL_MS: u64 = 30_000;
 
@@ -250,15 +250,10 @@ fn start_hypr_event_thread(runtime: Arc<ServerRuntime>) {
                                 if next_workspace_id > 0
                                     && next_workspace_id != previous_workspace_id
                                 {
-                                    if previous_workspace_id > 0 {
-                                        enqueue_preview_refresh_ids(
-                                            &runtime,
-                                            [previous_workspace_id],
-                                        );
-                                    }
-                                    enqueue_urgent_preview_refresh_ids(
-                                        &runtime,
-                                        [next_workspace_id],
+                                    previous_workspace_id = record_workspace_transition(
+                                        &runtime.preview_refresh,
+                                        previous_workspace_id,
+                                        next_workspace_id,
                                     );
                                     let locked_environment_id =
                                         runtime.store.locked_environment().ok().flatten();
@@ -278,7 +273,6 @@ fn start_hypr_event_thread(runtime: Arc<ServerRuntime>) {
                                             );
                                         }
                                     }
-                                    previous_workspace_id = next_workspace_id;
                                 }
                             }
                             Err(error) => {
@@ -1119,7 +1113,7 @@ fn apply_batch_mutation_request(
 fn build_switcher_snapshot(runtime: &ServerRuntime, reverse: bool) -> Result<SwitcherSnapshot> {
     let local_bindings = runtime.store.list_local_bindings()?;
     let locked_environment_id = runtime.store.locked_environment()?;
-    let descriptors = current_workspace_cards(runtime, true)?
+    let descriptors = current_workspace_cards(runtime)?
         .into_iter()
         .map(|mut item| {
             let (resolution, _) = resolve_slot_for_physical_workspace_with_store(
@@ -1464,7 +1458,7 @@ fn resolve_slot_binding_for_workspace_id(
 }
 
 fn build_grid_snapshot(runtime: &ServerRuntime, cwd: Option<&str>) -> Result<GridSnapshot> {
-    let workspace_cards = current_workspace_cards(runtime, false)?;
+    let workspace_cards = current_workspace_cards(runtime)?;
     let cards_by_workspace = workspace_cards
         .into_iter()
         .map(|card| (card.workspace_id, card))
@@ -1690,14 +1684,20 @@ fn row_sort_key(
     (rank, display_id.to_owned(), env_id.to_owned())
 }
 
-fn current_workspace_cards(
-    runtime: &ServerRuntime,
-    enqueue_missing: bool,
-) -> Result<Vec<WorkspaceCardData>> {
+fn current_workspace_cards(runtime: &ServerRuntime) -> Result<Vec<WorkspaceCardData>> {
     let monitors = run_hyprctl_json(&runtime.paths, &["-j", "monitors"])?;
     let workspaces = run_hyprctl_json(&runtime.paths, &["-j", "workspaces"])?;
     let clients = run_hyprctl_json(&runtime.paths, &["-j", "clients"])?;
-    let descriptors = build_workspace_descriptors(&monitors, &workspaces, &clients);
+    current_workspace_cards_from_json(runtime, &monitors, &workspaces, &clients)
+}
+
+fn current_workspace_cards_from_json(
+    runtime: &ServerRuntime,
+    monitors: &[u8],
+    workspaces: &[u8],
+    clients: &[u8],
+) -> Result<Vec<WorkspaceCardData>> {
+    let descriptors = build_workspace_descriptors(monitors, workspaces, clients);
 
     Ok(descriptors
         .into_iter()
@@ -1710,9 +1710,6 @@ fn current_workspace_cards(
             let preview_path = if preview.is_file() {
                 preview.to_string_lossy().into_owned()
             } else {
-                if enqueue_missing && !descriptor.active {
-                    enqueue_preview_refresh_ids(runtime, [descriptor.id]);
-                }
                 String::new()
             };
 
@@ -1742,11 +1739,11 @@ fn preview_generation(runtime: &ServerRuntime, workspace_id: i32, path: &str) ->
         .unwrap_or_else(|| preview_generation_from_file(path))
 }
 
-fn enqueue_preview_refresh_ids(
-    runtime: &ServerRuntime,
+fn enqueue_transition_preview_refresh_ids(
+    preview_refresh: &Mutex<PreviewRefreshState>,
     workspace_ids: impl IntoIterator<Item = i32>,
 ) {
-    let Ok(mut state) = runtime.preview_refresh.lock() else {
+    let Ok(mut state) = preview_refresh.lock() else {
         return;
     };
 
@@ -1757,11 +1754,11 @@ fn enqueue_preview_refresh_ids(
     }
 }
 
-fn enqueue_urgent_preview_refresh_ids(
-    runtime: &ServerRuntime,
+fn enqueue_opened_workspace_preview_refresh_ids(
+    preview_refresh: &Mutex<PreviewRefreshState>,
     workspace_ids: impl IntoIterator<Item = i32>,
 ) {
-    let Ok(mut state) = runtime.preview_refresh.lock() else {
+    let Ok(mut state) = preview_refresh.lock() else {
         return;
     };
 
@@ -1771,6 +1768,23 @@ fn enqueue_urgent_preview_refresh_ids(
             state.urgent_ids.insert(workspace_id);
         }
     }
+}
+
+fn record_workspace_transition(
+    preview_refresh: &Mutex<PreviewRefreshState>,
+    previous_workspace_id: i32,
+    next_workspace_id: i32,
+) -> i32 {
+    if next_workspace_id <= 0 || next_workspace_id == previous_workspace_id {
+        return previous_workspace_id;
+    }
+
+    if previous_workspace_id > 0 {
+        enqueue_transition_preview_refresh_ids(preview_refresh, [previous_workspace_id]);
+    }
+    enqueue_opened_workspace_preview_refresh_ids(preview_refresh, [next_workspace_id]);
+
+    next_workspace_id
 }
 
 fn due_preview_refresh_ids(runtime: &ServerRuntime, now_ms: u64) -> Vec<i32> {
@@ -2190,6 +2204,20 @@ mod tests {
         }
     }
 
+    fn workspace_fixture_json() -> (&'static [u8], &'static [u8], &'static [u8]) {
+        (
+            br#"[{"focused":true,"activeWorkspace":{"id":1}}]"#,
+            br#"[
+                {"id":1,"name":"1","windows":1,"lastwindowtitle":"Active"},
+                {"id":2,"name":"2","windows":1,"lastwindowtitle":"Other"}
+            ]"#,
+            br#"[
+                {"mapped":true,"workspace":{"id":1},"title":"Active","class":"term","focusHistoryID":0},
+                {"mapped":true,"workspace":{"id":2},"title":"Other","class":"browser","focusHistoryID":1}
+            ]"#,
+        )
+    }
+
     fn build_grid_snapshot_from_data(
         environments: Vec<EnvironmentRecord>,
         local_bindings: Vec<SlotBindingRecord>,
@@ -2285,6 +2313,85 @@ mod tests {
             row_count,
             max_column_count,
         }
+    }
+
+    #[test]
+    fn current_workspace_cards_does_not_queue_missing_previews() {
+        let (runtime, path) = test_runtime("missing-preview-no-queue");
+        let (monitors, workspaces, clients) = workspace_fixture_json();
+
+        let cards =
+            current_workspace_cards_from_json(&runtime, monitors, workspaces, clients).unwrap();
+
+        assert_eq!(cards.len(), 2);
+        assert!(cards.iter().all(|card| card.preview_path.is_empty()));
+        let state = runtime.preview_refresh.lock().unwrap();
+        assert!(state.pending_ids.is_empty());
+        assert!(state.urgent_ids.is_empty());
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn current_workspace_cards_exposes_existing_preview_without_queueing() {
+        let (runtime, path) = test_runtime("existing-preview-no-queue");
+        let (monitors, workspaces, clients) = workspace_fixture_json();
+        let preview = preview_path(
+            &runtime.paths.runtime_root,
+            &runtime.paths.instance_signature,
+            2,
+        );
+        fs::write(&preview, b"preview").unwrap();
+
+        let cards =
+            current_workspace_cards_from_json(&runtime, monitors, workspaces, clients).unwrap();
+        let card = cards
+            .iter()
+            .find(|card| card.workspace_id == 2)
+            .expect("workspace 2 card");
+
+        assert_eq!(card.preview_path, preview.to_string_lossy().as_ref());
+        let state = runtime.preview_refresh.lock().unwrap();
+        assert!(state.pending_ids.is_empty());
+        assert!(state.urgent_ids.is_empty());
+
+        cleanup(&path);
+    }
+
+    #[test]
+    fn record_workspace_transition_queues_previous_and_opened_workspaces() {
+        let preview_refresh = Mutex::new(PreviewRefreshState::default());
+
+        let next_previous = record_workspace_transition(&preview_refresh, 3, 4);
+
+        assert_eq!(next_previous, 4);
+        let state = preview_refresh.lock().unwrap();
+        assert_eq!(state.pending_ids, HashSet::from([3, 4]));
+        assert_eq!(state.urgent_ids, HashSet::from([4]));
+    }
+
+    #[test]
+    fn record_workspace_transition_ignores_invalid_or_unchanged_workspace() {
+        let preview_refresh = Mutex::new(PreviewRefreshState::default());
+
+        assert_eq!(record_workspace_transition(&preview_refresh, 3, 3), 3);
+        assert_eq!(record_workspace_transition(&preview_refresh, 3, -1), 3);
+
+        let state = preview_refresh.lock().unwrap();
+        assert!(state.pending_ids.is_empty());
+        assert!(state.urgent_ids.is_empty());
+    }
+
+    #[test]
+    fn record_workspace_transition_does_not_queue_invalid_previous_workspace() {
+        let preview_refresh = Mutex::new(PreviewRefreshState::default());
+
+        let next_previous = record_workspace_transition(&preview_refresh, -1, 4);
+
+        assert_eq!(next_previous, 4);
+        let state = preview_refresh.lock().unwrap();
+        assert_eq!(state.pending_ids, HashSet::from([4]));
+        assert_eq!(state.urgent_ids, HashSet::from([4]));
     }
 
     #[test]
