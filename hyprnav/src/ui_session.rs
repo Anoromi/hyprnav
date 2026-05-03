@@ -1,7 +1,4 @@
-use crate::runtime_paths::{
-    ensure_parent_dir, fallback_grid_socket_paths, fallback_switcher_socket_paths,
-    resolve_runtime_paths,
-};
+use crate::runtime_paths::{ensure_parent_dir, resolve_runtime_paths};
 use anyhow::{Context, Result};
 use crossbeam_channel::{unbounded, Receiver};
 use std::fs;
@@ -125,21 +122,7 @@ fn send_switcher_command(command: UiSessionCommand) -> Result<bool> {
 
 fn send_switcher_command_line(line: &str) -> Result<bool> {
     let paths = resolve_runtime_paths();
-    let mut candidates = vec![paths.switcher_socket_path];
-    for candidate in fallback_switcher_socket_paths(&paths.runtime_root) {
-        if !candidates.contains(&candidate) {
-            candidates.push(candidate);
-        }
-    }
-
-    for candidate in candidates {
-        match send_command_line_to_socket(&candidate, line) {
-            Ok(()) => return Ok(true),
-            Err(_) => continue,
-        }
-    }
-
-    Ok(false)
+    Ok(send_command_line_to_socket(&paths.switcher_socket_path, line).is_ok())
 }
 
 pub fn send_grid_open_command() -> Result<bool> {
@@ -156,21 +139,7 @@ pub fn send_grid_refresh_command() -> Result<bool> {
 
 pub fn send_grid_ping_command() -> Result<bool> {
     let paths = resolve_runtime_paths();
-    let mut candidates = vec![paths.grid_socket_path];
-    for candidate in fallback_grid_socket_paths(&paths.runtime_root) {
-        if !candidates.contains(&candidate) {
-            candidates.push(candidate);
-        }
-    }
-
-    for candidate in candidates {
-        match send_command_line_to_socket(&candidate, "PING\n") {
-            Ok(()) => return Ok(true),
-            Err(_) => continue,
-        }
-    }
-
-    Ok(false)
+    Ok(send_command_line_to_socket(&paths.grid_socket_path, "PING\n").is_ok())
 }
 
 fn start_switcher_session_listener_at(socket_path: &Path) -> Result<UiSessionHandle> {
@@ -316,27 +285,13 @@ fn send_command_to_socket(path: &Path, command: UiSessionCommand) -> Result<()> 
 
 fn send_grid_command(command: GridUiCommand) -> Result<bool> {
     let paths = resolve_runtime_paths();
-    let mut candidates = vec![paths.grid_socket_path];
-    for candidate in fallback_grid_socket_paths(&paths.runtime_root) {
-        if !candidates.contains(&candidate) {
-            candidates.push(candidate);
-        }
-    }
-
     let line = match command {
         GridUiCommand::Open => "OPEN\n",
         GridUiCommand::Close => "CLOSE\n",
         GridUiCommand::Refresh => "REFRESH\n",
     };
 
-    for candidate in candidates {
-        match send_command_line_to_socket(&candidate, line) {
-            Ok(()) => return Ok(true),
-            Err(_) => continue,
-        }
-    }
-
-    Ok(false)
+    Ok(send_command_line_to_socket(&paths.grid_socket_path, line).is_ok())
 }
 
 fn send_command_line_to_socket(path: &Path, line: &str) -> Result<()> {

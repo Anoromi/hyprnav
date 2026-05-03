@@ -9,8 +9,8 @@ use hyprnav::controller::qobject::{
     hyprnav_set_quit_on_last_window_closed,
 };
 use hyprnav::protocol::{
-    send_request_with_fallbacks, BatchMutationPayload, Request, SlotAssignmentMode, SpawnPrepared,
-    SpawnStarted, StatusSnapshot,
+    send_request, BatchMutationPayload, Request, SlotAssignmentMode, SpawnPrepared, SpawnStarted,
+    StatusSnapshot,
 };
 use hyprnav::runtime_paths::resolve_runtime_paths;
 use hyprnav::server::run_server;
@@ -351,7 +351,7 @@ fn print_json(result: anyhow::Result<Value>) -> anyhow::Result<()> {
 
 fn send<R: serde::de::DeserializeOwned>(request: Request) -> anyhow::Result<R> {
     let paths = resolve_runtime_paths();
-    send_request_with_fallbacks(&paths.server_socket_path, &request)
+    send_request(&paths.server_socket_path, &request)
 }
 
 fn server_running() -> bool {
