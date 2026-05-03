@@ -5,10 +5,10 @@
 class QGuiApplication;
 class QQmlApplicationEngine;
 
-bool hyprexpo_configure_root_window(QQmlApplicationEngine& engine);
-bool hyprexpo_load_qml_from_module(QQmlApplicationEngine& engine, const QString& uri, const QString& typeName);
-bool hyprexpo_activation_modifier_held();
-void hyprexpo_set_quit_on_last_window_closed(QGuiApplication& app, bool quitOnLastWindowClosed);
-void hyprexpo_map_root_window_resident();
-void hyprexpo_set_root_window_interactive(bool interactive);
-void hyprexpo_set_root_window_visible(bool visible);
+bool hyprnav_configure_root_window(QQmlApplicationEngine& engine);
+bool hyprnav_load_qml_from_module(QQmlApplicationEngine& engine, const QString& uri, const QString& typeName);
+bool hyprnav_activation_modifier_held();
+void hyprnav_set_quit_on_last_window_closed(QGuiApplication& app, bool quitOnLastWindowClosed);
+void hyprnav_map_root_window_resident();
+void hyprnav_set_root_window_interactive(bool interactive);
+void hyprnav_set_root_window_visible(bool visible);

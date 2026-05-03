@@ -1,5 +1,5 @@
 {
-  description = "Official Hyprland Plugins";
+  description = "Local hyprnav workspace navigation tooling";
 
   inputs = {
     hyprland.url = "github:hyprwm/Hyprland";
@@ -21,67 +21,51 @@
       import nixpkgs {
         localSystem.system = system;
         overlays = [
-          self.overlays.hyprland-plugins
+          self.overlays.hyprnav
           hyprland.overlays.hyprland-packages
         ];
       });
   in {
     packages = eachSystem (system: {
-      inherit
-        (pkgsFor.${system}.hyprlandPlugins)
-        borders-plus-plus
-        csgo-vulkan-fix
-        hyprbars
-        hyprexpo
-        hyprfocus
-        hyprscrolling
-        hyprtrails
-        hyprwinwrap
-        xtra-dispatchers
-        ;
-
-      hyprexpo-switcher = pkgsFor.${system}.callPackage ./hyprexpo-switcher {};
+      hyprnav = pkgsFor.${system}.hyprnav;
+      hyprnav-plugin = pkgsFor.${system}.hyprlandPlugins.hyprnav-plugin;
+      default = self.packages.${system}.hyprnav;
     });
 
     overlays = {
-      default = self.overlays.hyprland-plugins;
+      default = self.overlays.hyprnav;
 
-      hyprland-plugins = final: prev: let
+      hyprnav = final: prev: let
         inherit (final) callPackage;
       in {
+        hyprnav = callPackage ./hyprnav {};
         hyprlandPlugins =
-          (prev.hyprlandPlugins
-            or {})
+          (prev.hyprlandPlugins or {})
           // {
-            borders-plus-plus = callPackage ./borders-plus-plus {};
-            csgo-vulkan-fix = callPackage ./csgo-vulkan-fix {};
-            hyprbars = callPackage ./hyprbars {};
-            hyprexpo = callPackage ./hyprexpo {};
-            hyprfocus = callPackage ./hyprfocus {};
-            hyprscrolling = callPackage ./hyprscrolling {};
-            hyprtrails = callPackage ./hyprtrails {};
-            hyprwinwrap = callPackage ./hyprwinwrap {};
-            xtra-dispatchers = callPackage ./xtra-dispatchers {};
+            hyprnav-plugin = callPackage ./hyprnav-plugin {};
           };
-
-        hyprexpo-switcher = callPackage ./hyprexpo-switcher {};
       };
     };
 
-    checks = eachSystem (system: self.packages.${system});
+    checks = eachSystem (system: {
+      inherit (self.packages.${system}) hyprnav hyprnav-plugin;
+    });
 
     devShells = eachSystem (system:
       with pkgsFor.${system}; {
         default = mkShell.override {stdenv = gcc14Stdenv;} {
-          name = "hyprland-plugins";
+          name = "hyprnav";
           buildInputs = [
             hyprland.packages.${system}.hyprland
             qt6.qtbase
             qt6.qtdeclarative
             qt6.qtwayland
             kdePackages."layer-shell-qt"
+            libjpeg
             pkg-config
             cmake
+            cargo
+            rustc
           ];
           inputsFrom = [hyprland.packages.${system}.hyprland];
         };

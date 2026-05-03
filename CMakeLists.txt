@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.27)
-project(hyprland-plugins
-    DESCRIPTION "Official plugins for Hyprland"
+project(hyprnav
+    DESCRIPTION "Local hyprnav tooling for Hyprland"
     LANGUAGES CXX
 )
 
@@ -9,13 +9,4 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include(CTest)
 
-add_subdirectory(borders-plus-plus)
-add_subdirectory(csgo-vulkan-fix)
-add_subdirectory(hyprbars)
-add_subdirectory(hyprexpo)
-add_subdirectory(hyprexpo-switcher)
-add_subdirectory(hyprfocus)
-add_subdirectory(hyprscrolling)
-add_subdirectory(hyprtrails)
-add_subdirectory(hyprwinwrap)
-add_subdirectory(xtra-dispatchers)
+add_subdirectory(hyprnav-plugin)

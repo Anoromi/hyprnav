@@ -37,6 +37,8 @@
 # Nix
 result
 result-man
+hyprnav/result
+hyprnav-plugin/.reload/
 
 build/
 .cache/
@@ -44,3 +46,5 @@ build/
 # Rust / cxx-qt
 hyprnav/target/
 hyprnav/.current-path
+hyprnav/.daemon.log
+hyprnav/.grid-server.log

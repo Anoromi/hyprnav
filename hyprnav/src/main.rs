@@ -5,8 +5,8 @@ use hyprnav::cli::{
     SlotCommandSetArgs, SlotLaunchCommand, SlotNameCommand, SpawnArgs, SpawnInternalArgs,
 };
 use hyprnav::controller::qobject::{
-    hyprexpo_configure_root_window, hyprexpo_load_qml_from_module,
-    hyprexpo_set_quit_on_last_window_closed,
+    hyprnav_configure_root_window, hyprnav_load_qml_from_module,
+    hyprnav_set_quit_on_last_window_closed,
 };
 use hyprnav::protocol::{
     send_request_with_fallbacks, BatchMutationPayload, Request, SlotAssignmentMode, SpawnPrepared,
@@ -466,11 +466,11 @@ fn run_ui(mode: &str, reverse: bool, resident: bool) -> anyhow::Result<()> {
 
     if let Some(app) = app.as_mut() {
         QGuiApplication::set_desktop_file_name(&QString::from("hyprnav"));
-        hyprexpo_set_quit_on_last_window_closed(app, false);
+        hyprnav_set_quit_on_last_window_closed(app, false);
     }
 
     if let Some(engine) = engine.as_mut() {
-        if !hyprexpo_load_qml_from_module(
+        if !hyprnav_load_qml_from_module(
             engine,
             &QString::from("com.anoromi.hyprnav"),
             &QString::from(qml_type),
@@ -480,7 +480,7 @@ fn run_ui(mode: &str, reverse: bool, resident: bool) -> anyhow::Result<()> {
     }
 
     if let Some(engine) = engine.as_mut() {
-        if !hyprexpo_configure_root_window(engine) {
+        if !hyprnav_configure_root_window(engine) {
             return Err(anyhow::anyhow!("failed to configure switcher root window"));
         }
     }

@@ -2,7 +2,7 @@
 
 #include <QtCore/QAbstractListModel>
 
-void hyprexpo_emit_rows_changed(
+void hyprnav_emit_rows_changed(
     QAbstractListModel& model,
     std::int32_t firstRow,
     std::int32_t lastRow,

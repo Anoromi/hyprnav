@@ -104,20 +104,20 @@ pub mod qobject {
         type QQmlApplicationEngine = cxx_qt_lib::QQmlApplicationEngine;
 
         include!("hyprnav/cpp/layer_shell_bridge.hpp");
-        fn hyprexpo_activation_modifier_held() -> bool;
-        fn hyprexpo_configure_root_window(engine: Pin<&mut QQmlApplicationEngine>) -> bool;
-        fn hyprexpo_load_qml_from_module(
+        fn hyprnav_activation_modifier_held() -> bool;
+        fn hyprnav_configure_root_window(engine: Pin<&mut QQmlApplicationEngine>) -> bool;
+        fn hyprnav_load_qml_from_module(
             engine: Pin<&mut QQmlApplicationEngine>,
             uri: &QString,
             type_name: &QString,
         ) -> bool;
-        fn hyprexpo_map_root_window_resident();
-        fn hyprexpo_set_quit_on_last_window_closed(
+        fn hyprnav_map_root_window_resident();
+        fn hyprnav_set_quit_on_last_window_closed(
             app: Pin<&mut QGuiApplication>,
             quit_on_last_window_closed: bool,
         );
-        fn hyprexpo_set_root_window_interactive(interactive: bool);
-        fn hyprexpo_set_root_window_visible(visible: bool);
+        fn hyprnav_set_root_window_interactive(interactive: bool);
+        fn hyprnav_set_root_window_visible(visible: bool);
     }
 
     unsafe extern "C++Qt" {
@@ -128,7 +128,7 @@ pub mod qobject {
 
     unsafe extern "C++" {
         include!("hyprnav/cpp/model_bridge.hpp");
-        fn hyprexpo_emit_rows_changed(
+        fn hyprnav_emit_rows_changed(
             model: Pin<&mut QAbstractListModel>,
             first_row: i32,
             last_row: i32,
@@ -290,10 +290,10 @@ impl qobject::Controller {
         self.as_mut().set_resident_mode(resident_mode);
 
         if self.as_ref().rust().mode == UiMode::Switcher && resident_mode {
-            qobject::hyprexpo_set_root_window_visible(false);
+            qobject::hyprnav_set_root_window_visible(false);
         } else if uses_resident_grid_window(self.as_ref().rust().mode, resident_mode) {
-            qobject::hyprexpo_map_root_window_resident();
-            qobject::hyprexpo_set_root_window_interactive(false);
+            qobject::hyprnav_map_root_window_resident();
+            qobject::hyprnav_set_root_window_interactive(false);
         } else {
             if let Err(error) = self.as_mut().load_snapshot_and_show() {
                 warn!("failed to load UI snapshot: {error}");
@@ -566,7 +566,7 @@ impl qobject::Controller {
             return;
         }
 
-        if !qobject::hyprexpo_activation_modifier_held() {
+        if !qobject::hyprnav_activation_modifier_held() {
             self.as_mut().activate_current();
         }
     }
@@ -720,9 +720,9 @@ impl qobject::Controller {
             self.as_ref().rust().mode,
             self.as_ref().rust().resident_mode,
         ) {
-            qobject::hyprexpo_set_root_window_interactive(true);
+            qobject::hyprnav_set_root_window_interactive(true);
         } else {
-            qobject::hyprexpo_set_root_window_visible(true);
+            qobject::hyprnav_set_root_window_visible(true);
         }
     }
 
@@ -732,9 +732,9 @@ impl qobject::Controller {
             self.as_ref().rust().mode,
             self.as_ref().rust().resident_mode,
         ) {
-            qobject::hyprexpo_set_root_window_interactive(false);
+            qobject::hyprnav_set_root_window_interactive(false);
         } else {
-            qobject::hyprexpo_set_root_window_visible(false);
+            qobject::hyprnav_set_root_window_visible(false);
         }
     }
 
@@ -1034,7 +1034,7 @@ impl qobject::Controller {
         let roles = volatile_roles();
         let mut model: Pin<&mut qobject::QAbstractListModel> = self.as_mut().upcast_pin();
         for (first_row, last_row) in changed_ranges {
-            qobject::hyprexpo_emit_rows_changed(model.as_mut(), first_row, last_row, &roles);
+            qobject::hyprnav_emit_rows_changed(model.as_mut(), first_row, last_row, &roles);
         }
     }
 }

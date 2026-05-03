@@ -11,10 +11,10 @@ rustPlatform.buildRustPackage {
   pname = "hyprnav";
   version = "0.1";
   src = builtins.path {
-    name = "hyprland-plugins";
+    name = "hyprnav-project";
     path = ../.;
   };
-  sourceRoot = "hyprland-plugins/hyprnav";
+  sourceRoot = "hyprnav-project/hyprnav";
   cargoLock.lockFile = ./Cargo.lock;
   doCheck = false;
 
@@ -81,7 +81,7 @@ rustPlatform.buildRustPackage {
 
   meta = with lib; {
     description = "Rust/QML workspace navigation server and overlay for Hyprland";
-    license = licenses.bsd3;
+    license = licenses.mit;
     platforms = platforms.linux;
     mainProgram = "hyprnav";
   };

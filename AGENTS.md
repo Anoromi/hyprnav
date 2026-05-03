@@ -1,13 +1,13 @@
 # Purpose
 
 This fork is not being treated as a general-purpose `hyprland-plugins` checkout.
-For local agent work, this repo is specifically for `hyprexpo` and
-`hyprnav` development and their integration into the local
+For local agent work, this repo is specifically for `hyprnav` and
+`hyprnav-plugin` development and their integration into the local
 `/etc/nixos` Hyprland workflow.
 
 # Primary Scope
 
-- Default to `hyprexpo` and `hyprnav`.
+- Default to `hyprnav` and `hyprnav-plugin`.
 - Treat unrelated plugin directories as out of scope unless the user explicitly asks.
 - Evaluate changes by how they affect local Hyprland integration for either
   component, not upstream repo completeness.
@@ -29,16 +29,12 @@ files as one integration boundary.
 
 Preserve these defaults unless the user explicitly asks to change them:
 
-- Local plugin path: `/home/anoromi/code/stolen/hyprland-plugins/hyprexpo/hyprexpo.so`
-- Test keybind: `Win+B`
-- Test dispatcher: `hyprexpo:expo toggle`
+- Local plugin path: `/home/anoromi/code/stolen/hyprland-plugins/hyprnav-plugin/hyprnav-plugin.so`
 - Preserve the wrapped/local command name `hyprnav`
 - Preserve `hyprnav-dev-build`
 - Preserve the current switcher trigger bindings unless explicitly asked to
   change them
 
-Do not replace the local `.so` workflow with `hyprpm` unless explicitly
-requested.
 Do not replace the local switcher wrapper/dev-build flow unless explicitly
 requested.
 
@@ -46,11 +42,11 @@ requested.
 
 Default workflow:
 
-1. Change `hyprexpo` and/or `hyprnav` depending on the task.
+1. Change `hyprnav-plugin` and/or `hyprnav` depending on the task.
 2. For plugin changes:
-   - rebuild and reload with `hyprexpo-dev-reload`
+   - rebuild and reload with `hyprnav-plugin-dev-reload`
    - verify the plugin is loaded
-   - test behavior with `Win+B`
+   - verify preview/spawn integration through the `hyprnav` flows
 3. For switcher changes:
    - rebuild with `hyprnav-dev-build`
    - restart the running switcher daemon if needed
@@ -70,14 +66,13 @@ Use these checks for local verification:
 
 - `hyprctl configerrors`
 - `hyprctl plugin list`
-- `hyprctl dispatch hyprexpo:expo toggle`
-- `hyprexpo-dev-reload`
+- `hyprnav-plugin-dev-reload`
 - `hyprnav-dev-build`
 - `hyprnav daemon`
 - `hyprnav trigger`
+- `hyprnav grid`
 - `hyprctl -j layers`
 - `hyprctl -j clients`
-- in-session `Win+B` behavior
 - validate the switcher as a Hyprland overlay, not a normal client
 
 # Default Constraints

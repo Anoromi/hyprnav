@@ -202,7 +202,7 @@ pub fn legacy_state_root() -> PathBuf {
                 .map(|home| home.join(".local/state"))
                 .unwrap_or_else(|| PathBuf::from("/tmp"))
         })
-        .join("hyprexpo-switcher")
+        .join("hyprnav")
 }
 
 pub fn state_db_path(state_root: &Path) -> PathBuf {

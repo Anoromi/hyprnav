@@ -1,7 +1,7 @@
 # hyprnav
 
 `hyprnav` is the local workspace environment server and overlay client
-used alongside `hyprexpo`.
+used with `hyprnav-plugin`.
 
 The binary covers three surfaces:
 
@@ -425,7 +425,7 @@ hyprnav spawn rand -- bun run dev:desktop
 For local development in this repo:
 
 - build the switcher with `hyprnav-dev-build`
-- rebuild/reload the plugin with `hyprexpo-dev-reload`
+- rebuild/reload the plugin with `hyprnav-plugin-dev-reload`
 - preserve the local wrapped command name `hyprnav`
 
 The main external integration files are:

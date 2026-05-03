@@ -15,7 +15,7 @@ QPointer<QQuickWindow> g_rootWindow;
 QPointer<LayerShellQt::Window> g_layerWindow;
 }
 
-bool hyprexpo_configure_root_window(QQmlApplicationEngine& engine) {
+bool hyprnav_configure_root_window(QQmlApplicationEngine& engine) {
     if (engine.rootObjects().isEmpty())
         return false;
 
@@ -37,7 +37,6 @@ bool hyprexpo_configure_root_window(QQmlApplicationEngine& engine) {
             layerWindow->setLayer(LayerShellQt::Window::LayerTop);
             layerWindow->setKeyboardInteractivity(LayerShellQt::Window::KeyboardInteractivityExclusive);
             layerWindow->setScope(QStringLiteral("hyprnav"));
-            layerWindow->setWantsToBeOnActiveScreen(true);
             layerWindow->setMargins({});
             layerWindow->setExclusiveZone(-1);
             return true;
@@ -48,7 +47,7 @@ bool hyprexpo_configure_root_window(QQmlApplicationEngine& engine) {
     return true;
 }
 
-bool hyprexpo_load_qml_from_module(QQmlApplicationEngine& engine, const QString& uri, const QString& typeName) {
+bool hyprnav_load_qml_from_module(QQmlApplicationEngine& engine, const QString& uri, const QString& typeName) {
     engine.loadFromModule(uri, typeName);
     if (engine.rootObjects().isEmpty()) {
         qWarning() << "hyprnav failed to load QML root from module" << uri << typeName;
@@ -57,16 +56,16 @@ bool hyprexpo_load_qml_from_module(QQmlApplicationEngine& engine, const QString&
     return true;
 }
 
-void hyprexpo_set_quit_on_last_window_closed(QGuiApplication& app, bool quitOnLastWindowClosed) {
+void hyprnav_set_quit_on_last_window_closed(QGuiApplication& app, bool quitOnLastWindowClosed) {
     app.setQuitOnLastWindowClosed(quitOnLastWindowClosed);
 }
 
-bool hyprexpo_activation_modifier_held() {
+bool hyprnav_activation_modifier_held() {
     const auto modifiers = QGuiApplication::queryKeyboardModifiers();
     return modifiers.testFlag(Qt::MetaModifier) || modifiers.testFlag(Qt::AltModifier);
 }
 
-void hyprexpo_map_root_window_resident() {
+void hyprnav_map_root_window_resident() {
     if (!g_rootWindow)
         return;
 
@@ -76,7 +75,7 @@ void hyprexpo_map_root_window_resident() {
     g_rootWindow->show();
 }
 
-void hyprexpo_set_root_window_interactive(bool interactive) {
+void hyprnav_set_root_window_interactive(bool interactive) {
     if (!g_rootWindow)
         return;
 
@@ -92,7 +91,7 @@ void hyprexpo_set_root_window_interactive(bool interactive) {
         g_rootWindow->requestActivate();
 }
 
-void hyprexpo_set_root_window_visible(bool visible) {
+void hyprnav_set_root_window_visible(bool visible) {
     if (!g_rootWindow)
         return;
 
