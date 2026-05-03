@@ -5,6 +5,9 @@
 #include <hyprland/src/plugins/PluginAPI.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopTimer.hpp>
 #include <hyprland/src/desktop/DesktopTypes.hpp>
+#ifdef HYPRNAV_PLUGIN_HAS_EVENT_BUS
+#include <hyprland/src/helpers/signal/Signal.hpp>
+#endif
 
 #include <chrono>
 #include <cstdint>
@@ -71,7 +74,11 @@ class CSpawnManager {
     std::filesystem::path m_runtimeDir;
     std::filesystem::path m_socketPath;
     SP<CEventLoopTimer>   m_timer;
+#ifdef HYPRNAV_PLUGIN_HAS_EVENT_BUS
+    CHyprSignalListener   m_openListener;
+#else
     SP<HOOK_CALLBACK_FN>  m_openListener;
+#endif
 
     std::unordered_map<int, SClientState>         m_clients;
     std::unordered_map<std::string, SSpawnOperation> m_operations;

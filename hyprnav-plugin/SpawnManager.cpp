@@ -4,6 +4,9 @@
 #define private public
 #include <hyprland/src/Compositor.hpp>
 #include <hyprland/src/desktop/state/FocusState.hpp>
+#ifdef HYPRNAV_PLUGIN_HAS_EVENT_BUS
+#include <hyprland/src/event/EventBus.hpp>
+#endif
 #include <hyprland/src/helpers/Monitor.hpp>
 #include <hyprland/src/helpers/time/Time.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
@@ -114,6 +117,9 @@ void CSpawnManager::wakeTimer(std::chrono::milliseconds timeout) {
 }
 
 void CSpawnManager::registerEventListeners() {
+#ifdef HYPRNAV_PLUGIN_HAS_EVENT_BUS
+    m_openListener = Event::bus()->m_events.window.open.listen([this](PHLWINDOW window) { handleWindow(window); });
+#else
     if (!PHANDLE)
         return;
 
@@ -124,6 +130,7 @@ void CSpawnManager::registerEventListeners() {
             Log::logger->log(Log::ERR, "[hyprnav-plugin] openWindow hook payload had an unexpected type");
         }
     });
+#endif
 }
 
 void CSpawnManager::createSocket() {
@@ -508,7 +515,11 @@ bool CSpawnManager::restoreOriginalFocus(const SSpawnOperation& operation, PHLWI
 
     const auto originWindow = operation.originWindowAddress.has_value() ? findWindowByAddress(*operation.originWindowAddress) : nullptr;
     if (originWindow && originWindow != spawnedWindow) {
+#ifdef HYPRNAV_PLUGIN_HAS_FOCUS_REASON
+        Desktop::focusState()->fullWindowFocus(originWindow, Desktop::FOCUS_REASON_DESKTOP_STATE_CHANGE);
+#else
         Desktop::focusState()->fullWindowFocus(originWindow);
+#endif
         return true;
     }
 

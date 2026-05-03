@@ -55,6 +55,18 @@ pkg_check_modules(deps REQUIRED IMPORTED_TARGET
     wayland-server
     xkbcommon
 )
+
+execute_process(
+    COMMAND ${PKG_CONFIG_EXECUTABLE} --modversion hyprland
+    OUTPUT_VARIABLE HYPRNAV_PLUGIN_HYPRLAND_VERSION
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+
+if (HYPRNAV_PLUGIN_HYPRLAND_VERSION VERSION_GREATER_EQUAL "0.54.0")
+    target_compile_definitions(hyprnav-plugin PRIVATE HYPRNAV_PLUGIN_HAS_EVENT_BUS)
+    target_compile_definitions(hyprnav-plugin PRIVATE HYPRNAV_PLUGIN_HAS_FOCUS_REASON)
+endif()
+
 target_link_libraries(hyprnav-plugin PRIVATE rt PkgConfig::deps ${HYPRNAV_PLUGIN_JPEG_TARGET})
 
 install(TARGETS hyprnav-plugin)
