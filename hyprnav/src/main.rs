@@ -1,4 +1,4 @@
-use cxx_qt_lib::{QGuiApplication, QQmlApplicationEngine, QString, QUrl};
+use cxx_qt_lib::{QGuiApplication, QQmlApplicationEngine, QString};
 use hyprnav::cli::{
     parse_args, BatchArgs, ClientCommand, Command, EnvCommand, EnvTitleCommand, LockArgs,
     ResolveArgs, RunArgs, SlotAssignArgs, SlotClearArgs, SlotCommand, SlotCommandClearArgs,

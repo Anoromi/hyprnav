@@ -3,12 +3,14 @@
 
 #include <any>
 #define private public
+#define protected public
 #include <hyprland/src/render/Renderer.hpp>
 #include <hyprland/src/Compositor.hpp>
 #include <hyprland/src/desktop/state/FocusState.hpp>
 #include <hyprland/src/helpers/time/Time.hpp>
 #include <hyprland/src/managers/animation/DesktopAnimationManager.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
+#undef protected
 #undef private
 
 #include <algorithm>
@@ -25,6 +27,16 @@
 #include <unistd.h>
 
 static constexpr size_t MAX_CLIENT_LINE = 4096;
+
+#ifdef HYPRNAV_PLUGIN_HAS_RENDER_FRAMEBUFFER_INTERFACE
+#define HYPRNAV_RENDER_MODE_FULL_FAKE Render::RENDER_MODE_FULL_FAKE
+#define HYPRNAV_OPENGL Render::GL::g_pHyprOpenGL
+#define HYPRNAV_BLOCK_SCREEN_SHADER g_pHyprRenderer->m_renderData.blockScreenShader
+#else
+#define HYPRNAV_RENDER_MODE_FULL_FAKE RENDER_MODE_FULL_FAKE
+#define HYPRNAV_OPENGL g_pHyprOpenGL
+#define HYPRNAV_BLOCK_SCREEN_SHADER g_pHyprOpenGL->m_renderData.blockScreenShader
+#endif
 
 namespace {
 struct SJpegErrorManager {
@@ -375,16 +387,26 @@ bool CPreviewManager::renderWorkspacePreview(PHLMONITOR monitor, int workspaceID
     if (outSize.width <= 0 || outSize.height <= 0)
         return false;
 
-    CFramebuffer  framebuffer;
     PHLWORKSPACE  previousWorkspace = monitor->m_activeWorkspace;
     PHLWORKSPACE  previousSpecial   = monitor->m_activeSpecialWorkspace;
     const auto    targetWorkspace   = g_pCompositor->getWorkspaceByID(workspaceID);
     CScopedLayerSurfaceSuppressor suppressedHyprnavLayers{"hyprnav"};
 
+#ifdef HYPRNAV_PLUGIN_HAS_RENDER_FRAMEBUFFER_INTERFACE
+    HYPRNAV_OPENGL->makeEGLCurrent();
+#else
     g_pHyprRenderer->makeEGLCurrent();
+#endif
 
+#ifdef HYPRNAV_PLUGIN_HAS_RENDER_FRAMEBUFFER_INTERFACE
+    auto framebuffer = makeShared<HyprnavFramebuffer>();
+    if (!framebuffer->alloc(outSize.width, outSize.height, monitor->m_output->state->state().drmFormat))
+        return false;
+#else
+    HyprnavFramebuffer framebuffer;
     if (!framebuffer.alloc(outSize.width, outSize.height, monitor->m_output->state->state().drmFormat))
         return false;
+#endif
 
     if (previousSpecial)
         monitor->m_activeSpecialWorkspace.reset();
@@ -394,7 +416,11 @@ bool CPreviewManager::renderWorkspacePreview(PHLMONITOR monitor, int workspaceID
 
     CRegion fakeDamage{0, 0, INT16_MAX, INT16_MAX};
     g_pHyprRenderer->m_bBlockSurfaceFeedback = true;
-    if (!g_pHyprRenderer->beginRender(monitor, fakeDamage, RENDER_MODE_FULL_FAKE, nullptr, &framebuffer)) {
+#ifdef HYPRNAV_PLUGIN_HAS_RENDER_FRAMEBUFFER_INTERFACE
+    if (!g_pHyprRenderer->beginRender(monitor, fakeDamage, HYPRNAV_RENDER_MODE_FULL_FAKE, nullptr, framebuffer)) {
+#else
+    if (!g_pHyprRenderer->beginRender(monitor, fakeDamage, HYPRNAV_RENDER_MODE_FULL_FAKE, nullptr, &framebuffer)) {
+#endif
         g_pHyprRenderer->m_bBlockSurfaceFeedback = false;
 
         if (previousSpecial)
@@ -406,7 +432,11 @@ bool CPreviewManager::renderWorkspacePreview(PHLMONITOR monitor, int workspaceID
 
         return false;
     }
-    g_pHyprOpenGL->clear(CHyprColor{0, 0, 0, 1.0});
+#ifdef HYPRNAV_PLUGIN_HAS_RENDER_FRAMEBUFFER_INTERFACE
+    g_pHyprRenderer->draw(CClearPassElement::SClearData{CHyprColor{0, 0, 0, 1.0}}, fakeDamage);
+#else
+    HYPRNAV_OPENGL->clear(CHyprColor{0, 0, 0, 1.0});
+#endif
 
     CBox renderBox{0, 0, static_cast<double>(outSize.width), static_cast<double>(outSize.height)};
 
@@ -418,7 +448,7 @@ bool CPreviewManager::renderWorkspacePreview(PHLMONITOR monitor, int workspaceID
     } else
         g_pHyprRenderer->renderWorkspace(monitor, nullptr, Time::steadyNow(), renderBox);
 
-    g_pHyprOpenGL->m_renderData.blockScreenShader = true;
+    HYPRNAV_BLOCK_SCREEN_SHADER = true;
     g_pHyprRenderer->endRender();
     g_pHyprRenderer->m_bBlockSurfaceFeedback = false;
 
@@ -430,10 +460,14 @@ bool CPreviewManager::renderWorkspacePreview(PHLMONITOR monitor, int workspaceID
         previousWorkspace->m_visible = true;
 
     outPath = hyprnav_plugin::previewPath(std::getenv("XDG_RUNTIME_DIR"), previewInstanceSignature(), workspaceID);
+#ifdef HYPRNAV_PLUGIN_HAS_RENDER_FRAMEBUFFER_INTERFACE
+    return writeFramebufferJPEG(*framebuffer, outSize, outPath);
+#else
     return writeFramebufferJPEG(framebuffer, outSize, outPath);
+#endif
 }
 
-bool CPreviewManager::writeFramebufferJPEG(CFramebuffer& fb, const hyprnav_plugin::SPreviewSize& size, const std::filesystem::path& path) {
+bool CPreviewManager::writeFramebufferJPEG(HyprnavFramebuffer& fb, const hyprnav_plugin::SPreviewSize& size, const std::filesystem::path& path) {
     std::error_code ec;
     std::filesystem::create_directories(path.parent_path(), ec);
     const auto tempPath = path.string() + ".tmp";

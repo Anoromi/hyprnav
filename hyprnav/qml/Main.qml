@@ -113,8 +113,10 @@ Window {
         Rectangle {
             id: dialog
             anchors.centerIn: parent
-            property int cardWidth: 210
-            property int cardHeight: 216
+            property int cardWidth: 272
+            property int labelHeight: 24
+            property int previewHeight: Math.round(cardWidth * 9 / 16)
+            property int cardHeight: previewHeight + labelHeight + 1
             property int horizontalSpacing: 1
             property int verticalSpacing: 1
             property int cellWidth: cardWidth + horizontalSpacing
@@ -192,9 +194,8 @@ Window {
                                 Rectangle {
                                     id: previewFrame
                                     Layout.fillWidth: true
-                                    Layout.fillHeight: true
-                                    Layout.minimumHeight: 0
-                                    Layout.preferredHeight: 0
+                                    Layout.preferredHeight: dialog.previewHeight
+                                    Layout.maximumHeight: dialog.previewHeight
                                     radius: 0
                                     color: root.previewBackground
                                     clip: true
@@ -309,8 +310,8 @@ Window {
 
                                 Label {
                                     Layout.fillWidth: true
-                                    Layout.preferredHeight: 24
-                                    Layout.maximumHeight: 24
+                                    Layout.preferredHeight: dialog.labelHeight
+                                    Layout.maximumHeight: dialog.labelHeight
                                     text: workspaceName
                                     color: workspaceSelected ? root.textPrimary : root.textSecondary
                                     font.pixelSize: 13

@@ -1,4 +1,3 @@
-use crate::runtime_paths::{fallback_server_socket_paths, runtime_root};
 use anyhow::{anyhow, Context, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
@@ -436,27 +435,5 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("unknown variant"));
-    }
-}
-
-pub fn send_request_with_fallbacks<R: DeserializeOwned>(
-    preferred_path: &Path,
-    request: &Request,
-) -> Result<R> {
-    match send_request(preferred_path, request) {
-        Ok(response) => Ok(response),
-        Err(primary_error) => {
-            for candidate in fallback_server_socket_paths(&runtime_root()) {
-                if candidate == preferred_path {
-                    continue;
-                }
-
-                if let Ok(response) = send_request(&candidate, request) {
-                    return Ok(response);
-                }
-            }
-
-            Err(primary_error)
-        }
     }
 }

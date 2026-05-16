@@ -10,7 +10,7 @@ hyprlandPlugins.mkHyprlandPlugin {
   src = ./.;
 
   inherit (hyprland) nativeBuildInputs;
-  buildInputs = [ libjpeg ];
+  buildInputs = hyprland.buildInputs ++ [ libjpeg ];
 
   meta = with lib; {
     description = "Preview and spawn integration for hyprnav";

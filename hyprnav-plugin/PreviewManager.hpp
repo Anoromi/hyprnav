@@ -4,7 +4,11 @@
 
 #include <hyprland/src/desktop/DesktopTypes.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopTimer.hpp>
+#ifdef HYPRNAV_PLUGIN_HAS_RENDER_FRAMEBUFFER_INTERFACE
+#include <hyprland/src/render/gl/GLFramebuffer.hpp>
+#else
 #include <hyprland/src/render/Framebuffer.hpp>
+#endif
 
 #include <chrono>
 #include <cstdint>
@@ -13,6 +17,12 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+
+#ifdef HYPRNAV_PLUGIN_HAS_RENDER_FRAMEBUFFER_INTERFACE
+using HyprnavFramebuffer = Render::GL::CGLFramebuffer;
+#else
+using HyprnavFramebuffer = CFramebuffer;
+#endif
 
 class CPreviewManager {
   public:
@@ -44,7 +54,7 @@ class CPreviewManager {
     void                     onTimer(SP<CEventLoopTimer> self);
 
     bool                     renderWorkspacePreview(PHLMONITOR monitor, int workspaceID, std::filesystem::path& outPath, hyprnav_plugin::SPreviewSize& outSize);
-    bool                     writeFramebufferJPEG(CFramebuffer& fb, const hyprnav_plugin::SPreviewSize& size, const std::filesystem::path& path);
+    bool                     writeFramebufferJPEG(HyprnavFramebuffer& fb, const hyprnav_plugin::SPreviewSize& size, const std::filesystem::path& path);
 
     int                      m_serverFD      = -1;
     int                      m_previewHeight = 480;

@@ -67,6 +67,10 @@ if (HYPRNAV_PLUGIN_HYPRLAND_VERSION VERSION_GREATER_EQUAL "0.54.0")
     target_compile_definitions(hyprnav-plugin PRIVATE HYPRNAV_PLUGIN_HAS_FOCUS_REASON)
 endif()
 
+if (HYPRNAV_PLUGIN_HYPRLAND_VERSION VERSION_GREATER_EQUAL "0.55.0")
+    target_compile_definitions(hyprnav-plugin PRIVATE HYPRNAV_PLUGIN_HAS_RENDER_FRAMEBUFFER_INTERFACE)
+endif()
+
 target_link_libraries(hyprnav-plugin PRIVATE rt PkgConfig::deps ${HYPRNAV_PLUGIN_JPEG_TARGET})
 
 install(TARGETS hyprnav-plugin)

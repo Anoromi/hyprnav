@@ -1,4 +1,6 @@
-use crate::db::{environment_chain, environment_has_parent, SlotBindingRecord, StateStore};
+use crate::db::{
+    environment_chain, environment_has_parent, EnvironmentRecord, SlotBindingRecord, StateStore,
+};
 use crate::protocol::{
     read_request, write_response, BatchMutationOperationResult, BatchMutationRequest,
     BatchMutationResponse, GridCellSnapshot, GridSnapshot, NavigationLaunchResult,
@@ -255,13 +257,10 @@ fn start_hypr_event_thread(runtime: Arc<ServerRuntime>) {
                                         previous_workspace_id,
                                         next_workspace_id,
                                     );
-                                    let locked_environment_id =
-                                        runtime.store.locked_environment().ok().flatten();
                                     if let Ok(Some(environment_id)) =
-                                        resolve_environment_for_physical_workspace(
+                                        resolve_focus_environment_for_physical_workspace(
                                             &runtime.store,
                                             next_workspace_id,
-                                            locked_environment_id.as_deref(),
                                         )
                                     {
                                         if let Err(error) =
@@ -599,11 +598,9 @@ fn try_handle_request(runtime: &Arc<ServerRuntime>, request: Request) -> Result<
                 workspace_id,
                 locked_environment_id.as_deref(),
             )?;
-            if let Some(environment_id) = resolve_environment_for_physical_workspace(
-                &runtime.store,
-                workspace_id,
-                locked_environment_id.as_deref(),
-            )? {
+            if let Some(environment_id) =
+                resolve_focus_environment_for_physical_workspace(&runtime.store, workspace_id)?
+            {
                 runtime.store.record_environment_focus(&environment_id)?;
             }
             let launch = if let Some(record) = record.as_ref() {
@@ -889,7 +886,11 @@ fn apply_batch_mutation_request(
                 ));
             }
             let display_id = default_display_id(env.as_deref(), &resolved_env);
-            let live_workspace_ids = live_workspace_ids(&runtime.paths)?;
+            let live_workspace_ids = if matches!(assignment_mode, SlotAssignmentMode::Managed) {
+                live_workspace_ids(&runtime.paths)?
+            } else {
+                HashSet::new()
+            };
             match connection {
                 Some(connection) => runtime.store.assign_slot_with_connection(
                     connection,
@@ -1377,6 +1378,25 @@ fn resolve_environment_for_physical_workspace(
     Ok(record.map(|record| record.environment_id))
 }
 
+fn resolve_focus_environment_for_physical_workspace(
+    store: &StateStore,
+    workspace_id: i32,
+) -> Result<Option<String>> {
+    let bindings = store.list_local_bindings()?;
+    Ok(resolve_focus_environment_from_bindings(
+        &bindings,
+        workspace_id,
+    ))
+}
+
+fn resolve_focus_environment_from_bindings(
+    bindings: &[SlotBindingRecord],
+    workspace_id: i32,
+) -> Option<String> {
+    let (record, _) = resolve_slot_binding_for_workspace_id(bindings, workspace_id);
+    record.map(|record| record.environment_id)
+}
+
 fn resolve_slot_for_physical_workspace_with_store(
     store: &StateStore,
     bindings: &[SlotBindingRecord],
@@ -1465,8 +1485,16 @@ fn build_grid_snapshot(runtime: &ServerRuntime, cwd: Option<&str>) -> Result<Gri
         .collect::<HashMap<_, _>>();
     let current_workspace_id = current_active_workspace_id(&runtime.paths)?;
     let locked_env_id = runtime.store.locked_environment()?;
-    let _ = cwd;
-    let rows = runtime.store.list_environments()?;
+    let current_env_id = cwd
+        .map(resolve_environment_from_cwd)
+        .transpose()?
+        .filter(|value| !value.is_empty());
+    let mut rows = runtime.store.list_environments()?;
+    sort_grid_rows(
+        &mut rows,
+        locked_env_id.as_deref(),
+        current_env_id.as_deref(),
+    );
     let local_bindings = runtime.store.list_local_bindings()?;
     let binding_index = local_bindings
         .iter()
@@ -1562,6 +1590,20 @@ fn build_grid_snapshot(runtime: &ServerRuntime, cwd: Option<&str>) -> Result<Gri
         row_count,
         max_column_count,
     })
+}
+
+fn sort_grid_rows(
+    rows: &mut [EnvironmentRecord],
+    locked_env_id: Option<&str>,
+    current_env_id: Option<&str>,
+) {
+    rows.sort_by(|left, right| {
+        row_sort_key(&left.env_id, locked_env_id, current_env_id)
+            .cmp(&row_sort_key(&right.env_id, locked_env_id, current_env_id))
+            .then_with(|| right.last_focused_at.cmp(&left.last_focused_at))
+            .then_with(|| left.display_id.cmp(&right.display_id))
+            .then_with(|| left.env_id.cmp(&right.env_id))
+    });
 }
 
 fn resolve_slot_effective_from_bindings<'a>(
@@ -1667,12 +1709,7 @@ fn slot_indexes_for_environment(env_id: &str, bindings: &[SlotBindingRecord]) ->
     slot_indexes
 }
 
-fn row_sort_key(
-    env_id: &str,
-    display_id: &str,
-    locked_env_id: Option<&str>,
-    current_env_id: Option<&str>,
-) -> (i32, String, String) {
+fn row_sort_key(env_id: &str, locked_env_id: Option<&str>, current_env_id: Option<&str>) -> i32 {
     let rank = if locked_env_id == Some(env_id) {
         0
     } else if current_env_id == Some(env_id) {
@@ -1681,7 +1718,7 @@ fn row_sort_key(
         2
     };
 
-    (rank, display_id.to_owned(), env_id.to_owned())
+    rank
 }
 
 fn current_workspace_cards(runtime: &ServerRuntime) -> Result<Vec<WorkspaceCardData>> {
@@ -2135,6 +2172,18 @@ mod tests {
         }
     }
 
+    fn inherit_binding(env_id: &str, slot_index: i32) -> SlotBindingRecord {
+        SlotBindingRecord {
+            env_id: env_id.to_owned(),
+            display_id: env_id.to_owned(),
+            slot_index,
+            display_name: None,
+            binding_kind: SlotBindingKind::Inherit,
+            workspace_id: None,
+            launch_argv: None,
+        }
+    }
+
     fn test_db_path(label: &str) -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2143,7 +2192,9 @@ mod tests {
         let dir =
             env::temp_dir().join(format!("hyprnav-server-{label}-{}-{unique}", process::id()));
         fs::create_dir_all(&dir).unwrap();
-        dir.join("state.sqlite3")
+        let path = dir.join("state.sqlite3");
+        fs::File::create(&path).unwrap();
+        path
     }
 
     fn cleanup(path: &Path) {
@@ -2154,7 +2205,7 @@ mod tests {
         let db_path = test_db_path(label);
         let root = db_path.parent().unwrap().to_path_buf();
         let runtime_root = root.join("runtime");
-        let runtime_dir = runtime_root.join("hx/test");
+        let runtime_dir = crate::runtime_paths::runtime_directory(&runtime_root, "test");
         fs::create_dir_all(&runtime_dir).unwrap();
 
         let runtime = Arc::new(ServerRuntime {
@@ -2219,12 +2270,12 @@ mod tests {
     }
 
     fn build_grid_snapshot_from_data(
-        environments: Vec<EnvironmentRecord>,
+        mut environments: Vec<EnvironmentRecord>,
         local_bindings: Vec<SlotBindingRecord>,
         workspace_cards: Vec<WorkspaceCardSnapshot>,
         current_workspace_id: i32,
         locked_env_id: Option<&str>,
-        _current_env_id: Option<&str>,
+        current_env_id: Option<&str>,
     ) -> GridSnapshot {
         let cards_by_workspace = workspace_cards
             .into_iter()
@@ -2238,6 +2289,8 @@ mod tests {
         let mut items = Vec::new();
         let mut max_column_count = 0;
         let mut row_count = 0;
+
+        sort_grid_rows(&mut environments, locked_env_id, current_env_id);
 
         for environment in environments {
             let slot_indexes = slot_indexes_for_environment(&environment.env_id, &local_bindings);
@@ -2267,7 +2320,12 @@ mod tests {
                     physical_workspace_id: workspace_id,
                     binding_kind: record.binding_kind.as_str().to_owned(),
                     inherited: record.binding_environment_id != environment.env_id,
-                    workspace_name: workspace_display_label(card, &record, workspace_id),
+                    workspace_name: live_display_label(
+                        card.map(|item| item.subtitle.as_str()).unwrap_or_default(),
+                        card.map(|item| item.app_class.as_str()).unwrap_or_default(),
+                        record.display_name.as_deref(),
+                        &format!("Workspace {}", workspace_id),
+                    ),
                     subtitle: card
                         .map(|item| item.subtitle.clone())
                         .unwrap_or_else(|| format!("Workspace {}", workspace_id)),
@@ -2420,6 +2478,23 @@ mod tests {
     }
 
     #[test]
+    fn focus_environment_uses_concrete_workspace_owner_not_inherited_locked_env() {
+        let bindings = vec![binding("project", 1, 5), inherit_binding("project.task", 1)];
+
+        assert_eq!(
+            resolve_focus_environment_from_bindings(&bindings, 5),
+            Some("project".to_owned())
+        );
+    }
+
+    #[test]
+    fn focus_environment_ignores_ambiguous_workspace_owner() {
+        let bindings = vec![binding("env-a", 1, 5), binding("env-b", 2, 5)];
+
+        assert_eq!(resolve_focus_environment_from_bindings(&bindings, 5), None);
+    }
+
+    #[test]
     fn resolve_slot_for_physical_workspace_prefers_locked_env_effective_slot() {
         let path = test_db_path("locked-effective");
         let store = StateStore::new(&path).unwrap();
@@ -2509,6 +2584,7 @@ mod tests {
         assert_eq!(record.launch_argv, Some(vec!["kitty".to_owned()]));
     }
 
+    #[test]
     fn grid_snapshot_omits_empty_rows_and_uses_dense_row_indexes() {
         let snapshot = build_grid_snapshot_from_data(
             vec![
@@ -2553,9 +2629,38 @@ mod tests {
     }
 
     #[test]
-    fn grid_snapshot_prefers_top_row_for_initial_selection_after_row_compaction() {
+    fn grid_snapshot_orders_rows_by_recent_focus() {
+        let mut stale = environment("alpha", "Alpha");
+        stale.last_focused_at = 10;
+        let mut recent = environment("beta", "Beta");
+        recent.last_focused_at = 20;
+
         let snapshot = build_grid_snapshot_from_data(
-            vec![environment("alpha", "Alpha"), environment("beta", "Beta")],
+            vec![stale, recent],
+            vec![binding("alpha", 1, 11), binding("beta", 1, 22)],
+            vec![card(11, "alpha-1", false), card(22, "beta-1", true)],
+            22,
+            Some("beta"),
+            Some("alpha"),
+        );
+
+        assert_eq!(snapshot.row_count, 2);
+        assert_eq!(snapshot.items[0].environment_id, "beta");
+        assert_eq!(snapshot.items[0].row_index, 0);
+        assert!(snapshot.items[0].environment_locked);
+        assert_eq!(snapshot.items[1].environment_id, "alpha");
+        assert_eq!(snapshot.items[1].row_index, 1);
+    }
+
+    #[test]
+    fn grid_snapshot_prefers_top_row_for_initial_selection_after_row_compaction() {
+        let mut alpha = environment("alpha", "Alpha");
+        alpha.last_focused_at = 20;
+        let mut beta = environment("beta", "Beta");
+        beta.last_focused_at = 10;
+
+        let snapshot = build_grid_snapshot_from_data(
+            vec![alpha, beta],
             vec![binding("alpha", 1, 11), binding("beta", 1, 11)],
             vec![card(11, "shared", true)],
             11,
@@ -2565,9 +2670,54 @@ mod tests {
 
         assert_eq!(snapshot.row_count, 2);
         assert_eq!(snapshot.initial_index, 0);
-        assert_eq!(snapshot.items[0].environment_id, "alpha");
-        assert_eq!(snapshot.items[1].environment_id, "beta");
-        assert!(snapshot.items[1].environment_locked);
+        assert_eq!(snapshot.items[0].environment_id, "beta");
+        assert_eq!(snapshot.items[1].environment_id, "alpha");
+        assert!(snapshot.items[0].environment_locked);
+    }
+
+    #[test]
+    fn grid_snapshot_moves_locked_row_above_more_recent_rows() {
+        let mut project = environment("project", "Project");
+        project.last_focused_at = 20;
+        let mut task = environment("project.task", "Task");
+        task.last_focused_at = 10;
+
+        let snapshot = build_grid_snapshot_from_data(
+            vec![task, project],
+            vec![binding("project", 1, 5), inherit_binding("project.task", 1)],
+            vec![card(5, "project", true)],
+            5,
+            Some("project.task"),
+            Some("project.task"),
+        );
+
+        assert_eq!(snapshot.row_count, 2);
+        assert_eq!(snapshot.initial_index, 0);
+        assert_eq!(snapshot.items[0].environment_id, "project.task");
+        assert_eq!(snapshot.items[1].environment_id, "project");
+        assert!(snapshot.items[0].environment_locked);
+    }
+
+    #[test]
+    fn grid_snapshot_moves_current_row_above_more_recent_rows() {
+        let mut recent = environment("recent", "Recent");
+        recent.last_focused_at = 20;
+        let mut current = environment("current", "Current");
+        current.last_focused_at = 10;
+
+        let snapshot = build_grid_snapshot_from_data(
+            vec![recent, current],
+            vec![binding("recent", 1, 4), binding("current", 1, 5)],
+            vec![card(4, "recent", false), card(5, "current", true)],
+            5,
+            None,
+            Some("current"),
+        );
+
+        assert_eq!(snapshot.row_count, 2);
+        assert_eq!(snapshot.initial_index, 0);
+        assert_eq!(snapshot.items[0].environment_id, "current");
+        assert_eq!(snapshot.items[1].environment_id, "recent");
     }
 
     #[test]

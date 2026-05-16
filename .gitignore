@@ -48,3 +48,5 @@ hyprnav/target/
 hyprnav/.current-path
 hyprnav/.daemon.log
 hyprnav/.grid-server.log
+hyprnav/.qmlls.ini
+.qt-merged-dev/

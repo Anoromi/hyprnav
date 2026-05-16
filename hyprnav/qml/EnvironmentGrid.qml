@@ -136,12 +136,14 @@ Window {
         Rectangle {
             id: dialog
             anchors.centerIn: parent
-            property int cardWidth: 210
-            property int cardHeight: 216
+            property int cardWidth: 272
+            property int labelHeight: 24
+            property int previewHeight: Math.round(cardWidth * 9 / 16)
+            property int cardHeight: previewHeight + labelHeight + 1
             property int horizontalSpacing: 1
             property int rowSpacing: 1
-            property int rowHeaderHeight: 16
-            property int rowHeaderGap: 1
+            property int rowHeaderHeight: 24
+            property int rowHeaderGap: 2
             property int cellWidth: cardWidth + horizontalSpacing
             property int rowBlockHeight: rowHeaderHeight + rowHeaderGap + cardHeight
             property int contentColumnsWidth: Controller.gridColumnCount > 0
@@ -235,8 +237,8 @@ Window {
 
                     const left = selected.x
                     const right = left + selected.width
-                    const top = selected.y + selected.cardTop
-                    const bottom = top + dialog.cardHeight
+                    const top = selected.y
+                    const bottom = selected.y + selected.cardTop + dialog.cardHeight
                     const maxX = Math.max(0, contentWidth - width)
                     const maxY = Math.max(0, contentHeight - height)
                     let nextX = contentX
@@ -299,19 +301,6 @@ Window {
                             width: dialog.cardWidth
                             height: dialog.rowBlockHeight
 
-                            Label {
-                                visible: showEnvironmentLabel
-                                x: 0
-                                y: 0
-                                width: contentRoot.width
-                                text: environmentTitle.length > 0 ? environmentTitle : environmentDisplayId
-                                color: environmentLocked ? root.textPrimary : root.textSecondary
-                                font.pixelSize: 12
-                                font.family: "IBM Plex Sans"
-                                font.weight: Font.Medium
-                                elide: Text.ElideRight
-                            }
-
                             Rectangle {
                                 y: cardTop
                                 width: parent.width
@@ -336,9 +325,8 @@ Window {
                                     Rectangle {
                                         id: previewFrame
                                         Layout.fillWidth: true
-                                        Layout.fillHeight: true
-                                        Layout.minimumHeight: 0
-                                        Layout.preferredHeight: 0
+                                        Layout.preferredHeight: dialog.previewHeight
+                                        Layout.maximumHeight: dialog.previewHeight
                                         radius: 0
                                         color: root.previewBackground
                                         clip: true
@@ -430,8 +418,8 @@ Window {
 
                                     Label {
                                         Layout.fillWidth: true
-                                        Layout.preferredHeight: 24
-                                        Layout.maximumHeight: 24
+                                        Layout.preferredHeight: dialog.labelHeight
+                                        Layout.maximumHeight: dialog.labelHeight
                                         text: workspaceName
                                         color: workspaceSelected ? root.textPrimary : root.textSecondary
                                         font.pixelSize: 13
@@ -449,6 +437,33 @@ Window {
                                 anchors.fill: parent
                                 onClicked: Controller.activateWorkspaceAt(index)
                             }
+                        }
+                    }
+
+                    Repeater {
+                        model: Controller
+
+                        delegate: Label {
+                            required property int rowIndex
+                            required property string environmentDisplayId
+                            required property string environmentTitle
+                            required property bool environmentLocked
+                            required property bool showEnvironmentLabel
+
+                            visible: showEnvironmentLabel
+                            x: flick.contentX + 6
+                            y: rowIndex * (dialog.rowBlockHeight + dialog.rowSpacing)
+                            z: 10
+                            width: Math.max(0, flick.width - 12)
+                            height: dialog.rowHeaderHeight
+                            verticalAlignment: Text.AlignVCenter
+                            text: environmentTitle.length > 0 ? environmentTitle : environmentDisplayId
+                            color: environmentLocked ? root.textPrimary : root.textSecondary
+                            font.pixelSize: 13
+                            font.family: "IBM Plex Sans"
+                            font.weight: Font.Medium
+                            elide: Text.ElideRight
+                            clip: true
                         }
                     }
 

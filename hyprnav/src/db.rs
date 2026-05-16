@@ -1081,7 +1081,9 @@ mod tests {
             .as_nanos();
         let dir = env::temp_dir().join(format!("hyprnav-{label}-{}-{unique}", process::id()));
         fs::create_dir_all(&dir).unwrap();
-        dir.join("state.sqlite3")
+        let path = dir.join("state.sqlite3");
+        fs::File::create(&path).unwrap();
+        path
     }
 
     fn cleanup(path: &Path) {
@@ -1109,8 +1111,9 @@ mod tests {
     fn init_migrates_legacy_slot_schema_without_losing_rows() {
         let path = test_db_path("migrate");
         let connection = Connection::open(&path).unwrap();
+        let boot_id = current_boot_id().unwrap();
         connection
-            .execute_batch(
+            .execute_batch(&format!(
                 "
                 CREATE TABLE environments (
                   env_id TEXT PRIMARY KEY,
@@ -1144,8 +1147,11 @@ mod tests {
                 VALUES ('demo', 'demo', 1, 1);
                 INSERT INTO slot_bindings (env_id, slot_index, binding_kind, workspace_id, created_at, updated_at)
                 VALUES ('demo', 1, 'fixed', 5, 1, 1);
+                INSERT INTO global_state (key, value)
+                VALUES ('boot_id', '{}');
                 ",
-            )
+                boot_id.replace('\'', "''")
+            ))
             .unwrap();
         drop(connection);
 

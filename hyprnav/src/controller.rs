@@ -1,6 +1,5 @@
 use crate::protocol::{
-    send_request_with_fallbacks, GridCellSnapshot, GridSnapshot, Request, SwitcherSnapshot,
-    WorkspaceCardSnapshot,
+    send_request, GridCellSnapshot, GridSnapshot, Request, SwitcherSnapshot, WorkspaceCardSnapshot,
 };
 use crate::runtime_paths::resolve_runtime_paths;
 use crate::ui_session::{
@@ -651,6 +650,11 @@ impl qobject::Controller {
                 for command in drain_grid_session_commands() {
                     match command {
                         GridUiCommand::Open => {
+                            if let Err(error) = self.as_mut().refresh_snapshot(false) {
+                                warn!("failed to open grid: {error}");
+                                self.as_mut().hide_overlay();
+                                continue;
+                            }
                             self.as_mut().show_overlay();
                             let next_generation = self.as_ref().rust().open_generation + 1;
                             self.as_mut().set_open_generation(next_generation);
@@ -1016,7 +1020,7 @@ impl qobject::Controller {
 
     fn send_request<T: serde::de::DeserializeOwned>(&self, request: Request) -> anyhow::Result<T> {
         let paths = resolve_runtime_paths();
-        send_request_with_fallbacks(&paths.server_socket_path, &request)
+        send_request(&paths.server_socket_path, &request)
     }
 
     fn reset_model(mut self: Pin<&mut Self>) {
@@ -1277,9 +1281,13 @@ mod tests {
             environment_id: "env".into(),
             environment_display_id: "Env".into(),
             environment_title: String::new(),
+            binding_environment_id: Some("env".into()),
+            command_environment_id: None,
             slot_index: 1,
             slot_display_name: String::new(),
             physical_workspace_id: 1,
+            binding_kind: "fixed".into(),
+            inherited: false,
             environment_locked: false,
             show_environment_label: true,
             row_index: 0,

@@ -144,38 +144,6 @@ pub fn resolve_runtime_paths() -> RuntimePaths {
     }
 }
 
-pub fn fallback_switcher_socket_paths(runtime_dir: &Path) -> Vec<PathBuf> {
-    fallback_named_socket_paths(runtime_dir, "ui-hyprnav.sock")
-}
-
-pub fn fallback_grid_socket_paths(runtime_dir: &Path) -> Vec<PathBuf> {
-    fallback_named_socket_paths(runtime_dir, "ui-hyprnav-grid.sock")
-}
-
-pub fn fallback_server_socket_paths(runtime_dir: &Path) -> Vec<PathBuf> {
-    fallback_named_socket_paths(runtime_dir, "hyprnav.sock")
-}
-
-fn fallback_named_socket_paths(runtime_dir: &Path, socket_name: &str) -> Vec<PathBuf> {
-    let root = runtime_dir.join("hx");
-    let Ok(entries) = fs::read_dir(root) else {
-        return Vec::new();
-    };
-
-    let mut entries = entries
-        .flatten()
-        .filter_map(|entry| {
-            let path = entry.path().join(socket_name);
-            fs::metadata(&path)
-                .ok()
-                .map(|metadata| (path, metadata.mtime(), metadata.mtime_nsec()))
-        })
-        .collect::<Vec<_>>();
-
-    entries.sort_by(|left, right| (right.1, right.2).cmp(&(left.1, left.2)));
-    entries.into_iter().map(|entry| entry.0).collect()
-}
-
 pub fn ensure_parent_dir(path: &Path) -> Result<()> {
     let parent = path.parent().context("path had no parent")?;
     fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))
