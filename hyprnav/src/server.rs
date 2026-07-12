@@ -8,7 +8,9 @@ use crate::protocol::{
     SpawnPrepared, SpawnStarted, StatusSnapshot, SwitcherSnapshot, WorkspaceCardSnapshot,
     WorkspaceNavigationResult,
 };
-use crate::runtime_paths::{ensure_parent_dir, preview_path, resolve_runtime_paths, RuntimePaths};
+use crate::runtime_paths::{
+    append_switch_log, ensure_parent_dir, preview_path, resolve_runtime_paths, RuntimePaths,
+};
 use crate::spawn::{
     now_ms, parse_spawn_focus_policy, parse_spawn_target, SpawnFocusPolicy, SpawnOperationState,
     SpawnOriginSnapshot, SpawnRegistry,
@@ -28,7 +30,7 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use tracing::warn;
+use tracing::{debug, warn};
 
 const PREVIEW_POLL_INTERVAL_MS: u64 = 15_000;
 const PREVIEW_WORKER_SLEEP_MS: u64 = 100;
@@ -581,9 +583,42 @@ fn try_handle_request(runtime: &Arc<ServerRuntime>, request: Request) -> Result<
                 .ok_or_else(|| {
                     anyhow!("slot {slot} is not assigned for environment {resolved_env}")
                 })?;
+            debug!(
+                requested_env = ?env,
+                resolved_env,
+                slot,
+                workspace_id = record.workspace_id,
+                "workspace goto resolved"
+            );
+            append_switch_log(
+                "server.goto.slot",
+                format!(
+                    "requested_env={:?} resolved_env={} slot={} workspace_id={}",
+                    env, resolved_env, slot, record.workspace_id
+                ),
+            );
             goto_workspace(&runtime.paths, record.workspace_id)?;
             runtime.store.record_environment_focus(&resolved_env)?;
             let launch = attempt_slot_launch(runtime, &record)?;
+            debug!(
+                workspace_id = record.workspace_id,
+                launch_configured = launch.configured,
+                launch_attempted = launch.attempted,
+                launch_skipped = ?launch.skipped_reason,
+                launch_error = ?launch.error,
+                "workspace goto completed"
+            );
+            append_switch_log(
+                "server.goto.slot.result",
+                format!(
+                    "workspace_id={} launch_configured={} launch_attempted={} launch_skipped={:?} launch_error={:?}",
+                    record.workspace_id,
+                    launch.configured,
+                    launch.attempted,
+                    launch.skipped_reason,
+                    launch.error
+                ),
+            );
             Ok(serde_json::to_value(WorkspaceNavigationResult {
                 workspace_id: record.workspace_id,
                 slot_resolution: Some(slot_resolution_from_record(record)),
@@ -591,6 +626,11 @@ fn try_handle_request(runtime: &Arc<ServerRuntime>, request: Request) -> Result<
             })?)
         }
         Request::WorkspaceGotoPhysical { workspace_id } => {
+            debug!(workspace_id, "physical workspace goto requested");
+            append_switch_log(
+                "server.goto.physical",
+                format!("workspace_id={workspace_id}"),
+            );
             goto_workspace(&runtime.paths, workspace_id)?;
             let locked_environment_id = runtime.store.locked_environment()?;
             let (record, skipped_reason) = resolve_slot_for_physical_workspace(
@@ -610,11 +650,41 @@ fn try_handle_request(runtime: &Arc<ServerRuntime>, request: Request) -> Result<
                     configured: false,
                     attempted: false,
                     skipped_reason: Some(
-                        skipped_reason.unwrap_or(NavigationLaunchSkippedReason::NoSlotMapping),
+                        skipped_reason
+                            .clone()
+                            .unwrap_or(NavigationLaunchSkippedReason::NoSlotMapping),
                     ),
                     error: None,
                 }
             };
+            debug!(
+                workspace_id,
+                locked_environment_id,
+                resolved_env = ?record.as_ref().map(|record| record.environment_id.as_str()),
+                resolved_slot = ?record.as_ref().map(|record| record.slot_index),
+                binding_kind = ?record.as_ref().map(|record| record.binding_kind.as_str()),
+                skipped_reason = ?skipped_reason,
+                launch_configured = launch.configured,
+                launch_attempted = launch.attempted,
+                launch_skipped = ?launch.skipped_reason,
+                launch_error = ?launch.error,
+                "physical workspace goto completed"
+            );
+            append_switch_log(
+                "server.goto.physical.result",
+                format!(
+                    "workspace_id={workspace_id} locked_env={:?} resolved_env={:?} resolved_slot={:?} binding_kind={:?} skipped_reason={:?} launch_configured={} launch_attempted={} launch_skipped={:?} launch_error={:?}",
+                    locked_environment_id,
+                    record.as_ref().map(|record| record.environment_id.as_str()),
+                    record.as_ref().map(|record| record.slot_index),
+                    record.as_ref().map(|record| record.binding_kind.as_str()),
+                    skipped_reason,
+                    launch.configured,
+                    launch.attempted,
+                    launch.skipped_reason,
+                    launch.error
+                ),
+            );
             Ok(serde_json::to_value(WorkspaceNavigationResult {
                 workspace_id,
                 slot_resolution: record.map(slot_resolution_from_record),
@@ -741,6 +811,20 @@ fn try_handle_request(runtime: &Arc<ServerRuntime>, request: Request) -> Result<
         }
         Request::UiSnapshotSwitcher { reverse } => {
             let snapshot = build_switcher_snapshot(runtime, reverse)?;
+            debug!(
+                reverse,
+                item_count = snapshot.items.len(),
+                initial_index = snapshot.initial_index,
+                "built switcher UI snapshot"
+            );
+            append_switch_log(
+                "server.snapshot.switcher.response",
+                format!(
+                    "reverse={reverse} items={} initial_index={}",
+                    snapshot.items.len(),
+                    snapshot.initial_index
+                ),
+            );
             Ok(serde_json::to_value(snapshot)?)
         }
         Request::UiSnapshotGrid { cwd } => {
@@ -1114,7 +1198,9 @@ fn apply_batch_mutation_request(
 fn build_switcher_snapshot(runtime: &ServerRuntime, reverse: bool) -> Result<SwitcherSnapshot> {
     let local_bindings = runtime.store.list_local_bindings()?;
     let locked_environment_id = runtime.store.locked_environment()?;
-    let descriptors = current_workspace_cards(runtime)?
+    let descriptors = current_workspace_cards(runtime)?;
+    let card_count = descriptors.len();
+    let descriptors = descriptors
         .into_iter()
         .map(|mut item| {
             let (resolution, _) = resolve_slot_for_physical_workspace_with_store(
@@ -1150,6 +1236,35 @@ fn build_switcher_snapshot(runtime: &ServerRuntime, reverse: bool) -> Result<Swi
             })
             .collect::<Vec<_>>(),
         reverse,
+    );
+    let workspace_ids = descriptors
+        .iter()
+        .map(|item| item.workspace_id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let active_workspace_id = descriptors
+        .iter()
+        .find(|item| item.active)
+        .map(|item| item.workspace_id)
+        .unwrap_or(-1);
+    debug!(
+        reverse,
+        card_count,
+        item_count = descriptors.len(),
+        locked_environment_id,
+        workspace_ids,
+        active_workspace_id,
+        initial_index,
+        "switcher snapshot summary"
+    );
+    append_switch_log(
+        "server.snapshot.switcher",
+        format!(
+            "reverse={reverse} cards={card_count} items={} locked_env={:?} workspace_ids={} active_workspace_id={active_workspace_id} initial_index={initial_index}",
+            descriptors.len(),
+            locked_environment_id,
+            workspace_ids
+        ),
     );
 
     Ok(SwitcherSnapshot {
@@ -2001,10 +2116,25 @@ fn mapped_workspace_ids(paths: &RuntimePaths) -> Result<HashSet<i32>> {
 
 fn goto_workspace(paths: &RuntimePaths, workspace_id: i32) -> Result<()> {
     if workspace_id <= 0 {
+        warn!(workspace_id, "refusing invalid workspace goto");
+        append_switch_log(
+            "server.hyprctl.goto.invalid",
+            format!("workspace_id={workspace_id}"),
+        );
         return Err(anyhow!("workspace id must be positive"));
     }
 
-    run_hyprctl_command(paths, &["dispatch", "workspace", &workspace_id.to_string()])
+    debug!(workspace_id, "dispatching workspace goto");
+    append_switch_log(
+        "server.hyprctl.goto",
+        format!("workspace_id={workspace_id}"),
+    );
+    let dispatcher = workspace_goto_dispatcher(workspace_id);
+    run_hyprctl_command(paths, &["dispatch", &dispatcher])
+}
+
+fn workspace_goto_dispatcher(workspace_id: i32) -> String {
+    format!("hl.dsp.focus({{ workspace = {workspace_id} }})")
 }
 
 fn run_in_workspace(paths: &RuntimePaths, workspace_id: i32, argv: &[String]) -> Result<()> {
@@ -2013,8 +2143,20 @@ fn run_in_workspace(paths: &RuntimePaths, workspace_id: i32, argv: &[String]) ->
         .map(|item| shell_escape::escape(item.as_str().into()).to_string())
         .collect::<Vec<_>>()
         .join(" ");
-    let rule = format!("[workspace {workspace_id} silent] {command}");
-    run_hyprctl_command(paths, &["dispatch", "exec", &rule])
+    let dispatcher = workspace_exec_dispatcher(workspace_id, &command);
+    run_hyprctl_command(paths, &["dispatch", &dispatcher])
+}
+
+fn workspace_exec_dispatcher(workspace_id: i32, command: &str) -> String {
+    format!(
+        "hl.dsp.exec_cmd({}, {{ workspace = {:?} }})",
+        lua_string_literal(command),
+        format!("{workspace_id} silent")
+    )
+}
+
+fn lua_string_literal(value: &str) -> String {
+    serde_json::to_string(value).expect("serializing a string cannot fail")
 }
 
 fn run_hyprctl_json(paths: &RuntimePaths, args: &[&str]) -> Result<Vec<u8>> {
@@ -2041,14 +2183,46 @@ fn run_hyprctl_command(paths: &RuntimePaths, args: &[&str]) -> Result<()> {
         command.env("HYPRLAND_INSTANCE_SIGNATURE", &paths.instance_signature);
     }
 
-    let status = command
-        .status()
+    let output = command
+        .output()
         .with_context(|| format!("running hyprctl {:?}", args))?;
-    if !status.success() {
-        return Err(anyhow!("hyprctl {:?} failed with {}", args, status));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if let Some(error) = hyprctl_command_error(output.status.success(), &stdout, &stderr) {
+        warn!(args = ?args, status = %output.status, %error, "hyprctl command failed");
+        append_switch_log(
+            "server.hyprctl.error",
+            format!("args={:?} status={} error={error:?}", args, output.status),
+        );
+        return Err(anyhow!("hyprctl {:?} failed: {error}", args));
     }
 
+    debug!(args = ?args, status = %output.status, "hyprctl command succeeded");
+    append_switch_log(
+        "server.hyprctl.success",
+        format!("args={:?} status={}", args, output.status),
+    );
     Ok(())
+}
+
+fn hyprctl_command_error(status_success: bool, stdout: &str, stderr: &str) -> Option<String> {
+    let stdout = stdout.trim();
+    let stderr = stderr.trim();
+    let textual_error = [stdout, stderr]
+        .into_iter()
+        .find(|text| text.to_ascii_lowercase().starts_with("error:"));
+
+    if status_success && textual_error.is_none() {
+        return None;
+    }
+
+    Some(
+        textual_error
+            .or_else(|| (!stderr.is_empty()).then_some(stderr))
+            .or_else(|| (!stdout.is_empty()).then_some(stdout))
+            .unwrap_or("hyprctl exited unsuccessfully")
+            .to_owned(),
+    )
 }
 
 fn resolve_explicit_or_default(
@@ -2219,6 +2393,7 @@ mod tests {
                 grid_socket_path: runtime_dir.join("grid.sock"),
                 server_socket_path: runtime_dir.join("hyprnav.sock"),
                 hypr_event_socket_path: runtime_dir.join("events.sock"),
+                switch_log_path: runtime_dir.join("switch.log"),
                 state_root: root.clone(),
                 state_db_path: db_path.clone(),
             },
@@ -2735,6 +2910,53 @@ mod tests {
 
         registry.purge_expired(1_000 + LAUNCH_PENDING_TTL_MS);
         assert!(!registry.contains(&key));
+    }
+
+    #[test]
+    fn lua_string_literal_escapes_command_content() {
+        let command = "say \"hello\" 'there' \\\nnext";
+        let literal = lua_string_literal(command);
+        assert_eq!(serde_json::from_str::<String>(&literal).unwrap(), command);
+        assert!(literal.contains("\\\"hello\\\""));
+        assert!(literal.contains("\\\\"));
+        assert!(literal.contains("\\n"));
+    }
+
+    #[test]
+    fn workspace_exec_dispatcher_uses_hyprland_lua_rules() {
+        assert_eq!(
+            workspace_exec_dispatcher(111, "ghostty --title='hello world'"),
+            "hl.dsp.exec_cmd(\"ghostty --title='hello world'\", { workspace = \"111 silent\" })"
+        );
+    }
+
+    #[test]
+    fn workspace_goto_dispatcher_uses_hyprland_lua_api() {
+        assert_eq!(
+            workspace_goto_dispatcher(111),
+            "hl.dsp.focus({ workspace = 111 })"
+        );
+    }
+
+    #[test]
+    fn hyprctl_result_classification_accepts_ok() {
+        assert_eq!(hyprctl_command_error(true, "ok\n", ""), None);
+    }
+
+    #[test]
+    fn hyprctl_result_classification_rejects_nonzero_status() {
+        assert_eq!(
+            hyprctl_command_error(false, "", "request failed\n"),
+            Some("request failed".to_owned())
+        );
+    }
+
+    #[test]
+    fn hyprctl_result_classification_rejects_textual_error() {
+        assert_eq!(
+            hyprctl_command_error(true, "error: invalid dispatcher\n", ""),
+            Some("error: invalid dispatcher".to_owned())
+        );
     }
 
     #[test]
