@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use std::ffi::OsStr;
 use std::fs;
+use std::fs::OpenOptions;
 use std::hash::Hasher;
+use std::io::Write;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -18,6 +20,7 @@ pub struct RuntimePaths {
     pub grid_socket_path: PathBuf,
     pub server_socket_path: PathBuf,
     pub hypr_event_socket_path: PathBuf,
+    pub switch_log_path: PathBuf,
     pub state_root: PathBuf,
     pub state_db_path: PathBuf,
 }
@@ -136,12 +139,25 @@ pub fn resolve_runtime_paths() -> RuntimePaths {
         grid_socket_path: grid_socket_path(&runtime_root, &instance_signature),
         server_socket_path: server_socket_path(&runtime_root, &instance_signature),
         hypr_event_socket_path: hyprland_event_socket_path(&runtime_root, &instance_signature),
+        switch_log_path: runtime_directory(&runtime_root, &instance_signature).join("switch.log"),
         runtime_dir: runtime_directory(&runtime_root, &instance_signature),
         runtime_root,
         instance_signature,
         state_db_path: state_db_path(&state_root),
         state_root,
     }
+}
+
+pub fn append_switch_log(event: &str, message: String) {
+    let path = resolve_runtime_paths().switch_log_path;
+    if ensure_parent_dir(&path).is_err() {
+        return;
+    }
+
+    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    let _ = writeln!(file, "{event} {message}");
 }
 
 pub fn ensure_parent_dir(path: &Path) -> Result<()> {
