@@ -20,8 +20,6 @@ Window {
     property color cardBorder: "#30363d"
     property color cardSelectedBorder: "#8b949e"
     property color cardActiveBorder: "#55606c"
-    property color previewBackground: "#111316"
-    property color previewFallback: "#1a1d21"
     property color textPrimary: "#e6e9ed"
     property color textSecondary: "#a7afb8"
     property color textMuted: "#7d8791"
@@ -137,9 +135,7 @@ Window {
             id: dialog
             anchors.centerIn: parent
             property int cardWidth: 272
-            property int labelHeight: 24
-            property int previewHeight: Math.round(cardWidth * 9 / 16)
-            property int cardHeight: previewHeight + labelHeight + 1
+            property int cardHeight: 42
             property int horizontalSpacing: 1
             property int rowSpacing: 1
             property int rowHeaderHeight: 24
@@ -287,7 +283,6 @@ Window {
                             required property int physicalWorkspaceId
                             required property string workspaceName
                             required property bool workspaceActive
-                            required property url workspacePreview
                             required property string environmentDisplayId
                             required property string environmentTitle
                             required property bool environmentLocked
@@ -317,109 +312,30 @@ Window {
                                 scale: 1.0
                                 opacity: 1.0
 
-                                ColumnLayout {
+                                RowLayout {
                                     anchors.fill: parent
-                                    anchors.margins: 0
-                                    spacing: 1
+                                    anchors.leftMargin: 10
+                                    anchors.rightMargin: 8
+                                    spacing: 8
 
                                     Rectangle {
-                                        id: previewFrame
-                                        Layout.fillWidth: true
-                                        Layout.preferredHeight: dialog.previewHeight
-                                        Layout.maximumHeight: dialog.previewHeight
+                                        Layout.preferredWidth: 20
+                                        Layout.preferredHeight: 20
                                         radius: 0
-                                        color: root.previewBackground
-                                        clip: true
-                                        property url observedPreview: workspacePreview
-                                        property url displaySource: ""
-                                        property url pendingSource: ""
+                                        color: root.badgeBackground
 
-                                        function clearPreviewState() {
-                                            displaySource = ""
-                                            pendingSource = ""
-                                            loadingImage.source = ""
-                                        }
-
-                                        function syncPreviewSource() {
-                                            const nextSource = workspacePreview.toString()
-                                            const currentDisplay = displaySource.toString()
-                                            const currentPending = pendingSource.toString()
-
-                                            if (nextSource.length === 0) {
-                                                clearPreviewState()
-                                                return
-                                            }
-
-                                            if (nextSource === currentDisplay || nextSource === currentPending)
-                                                return
-
-                                            pendingSource = workspacePreview
-                                            loadingImage.source = pendingSource
-                                        }
-
-                                        Image {
-                                            id: displayImage
-                                            anchors.fill: parent
-                                            source: previewFrame.displaySource
-                                            fillMode: Image.PreserveAspectCrop
-                                            visible: previewFrame.displaySource.toString().length > 0
-                                        }
-
-                                        Image {
-                                            id: loadingImage
-                                            anchors.fill: parent
-                                            visible: false
-                                            asynchronous: true
-                                            fillMode: Image.PreserveAspectCrop
-
-                                            onStatusChanged: {
-                                                if (status === Image.Ready && source.toString() === previewFrame.pendingSource.toString()) {
-                                                    previewFrame.displaySource = previewFrame.pendingSource
-                                                    previewFrame.pendingSource = ""
-                                                    source = ""
-                                                } else if (status === Image.Error && source.toString() === previewFrame.pendingSource.toString()) {
-                                                    previewFrame.pendingSource = ""
-                                                    source = ""
-                                                }
-                                            }
-                                        }
-
-                                        Rectangle {
-                                            anchors.fill: parent
-                                            visible: previewFrame.displaySource.toString().length === 0
-                                            color: root.previewFallback
-                                        }
-
-                                        onObservedPreviewChanged: syncPreviewSource()
-
-                                        Component.onCompleted: syncPreviewSource()
-
-                                        Rectangle {
-                                            anchors.left: parent.left
-                                            anchors.leftMargin: 1
-                                            anchors.top: parent.top
-                                            anchors.topMargin: 1
-                                            radius: 0
-                                            color: root.badgeBackground
-                                            implicitHeight: 18
-                                            implicitWidth: slotBadgeLabel.implicitWidth + 6
-
-                                            Label {
-                                                id: slotBadgeLabel
-                                                anchors.centerIn: parent
-                                                text: slotIndex.toString()
-                                                color: root.badgeText
-                                                font.pixelSize: 10
-                                                font.family: "IBM Plex Sans"
-                                                font.weight: Font.Medium
-                                            }
+                                        Label {
+                                            anchors.centerIn: parent
+                                            text: slotIndex.toString()
+                                            color: root.badgeText
+                                            font.pixelSize: 10
+                                            font.family: "IBM Plex Sans"
+                                            font.weight: Font.Medium
                                         }
                                     }
 
                                     Label {
                                         Layout.fillWidth: true
-                                        Layout.preferredHeight: dialog.labelHeight
-                                        Layout.maximumHeight: dialog.labelHeight
                                         text: workspaceName
                                         color: workspaceSelected ? root.textPrimary : root.textSecondary
                                         font.pixelSize: 13
@@ -429,6 +345,15 @@ Window {
                                         maximumLineCount: 1
                                         wrapMode: Text.NoWrap
                                         clip: true
+                                    }
+
+                                    Label {
+                                        visible: workspaceActive
+                                        text: "Current"
+                                        color: root.textMuted
+                                        font.pixelSize: 10
+                                        font.family: "IBM Plex Sans"
+                                        font.weight: Font.Medium
                                     }
                                 }
                             }

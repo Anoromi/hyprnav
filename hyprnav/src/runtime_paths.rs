@@ -14,7 +14,6 @@ pub struct RuntimePaths {
     pub runtime_root: PathBuf,
     pub instance_signature: String,
     pub runtime_dir: PathBuf,
-    pub preview_socket_path: PathBuf,
     pub spawn_socket_path: PathBuf,
     pub switcher_socket_path: PathBuf,
     pub grid_socket_path: PathBuf,
@@ -46,10 +45,6 @@ pub fn runtime_directory(runtime_dir: &Path, instance_signature: &str) -> PathBu
     runtime_dir.join("hx").join(format!("{hashed:016x}"))
 }
 
-pub fn preview_socket_path(runtime_dir: &Path, instance_signature: &str) -> PathBuf {
-    runtime_directory(runtime_dir, instance_signature).join("preview.sock")
-}
-
 pub fn switcher_socket_path(runtime_dir: &Path, instance_signature: &str) -> PathBuf {
     runtime_directory(runtime_dir, instance_signature).join("ui-hyprnav.sock")
 }
@@ -78,10 +73,6 @@ pub fn hyprland_socket_path(runtime_dir: &Path, instance_signature: &str) -> Pat
         .join("hypr")
         .join(instance_signature)
         .join(".socket.sock")
-}
-
-pub fn preview_path(runtime_dir: &Path, instance_signature: &str, workspace_id: i32) -> PathBuf {
-    runtime_directory(runtime_dir, instance_signature).join(format!("workspace-{workspace_id}.jpg"))
 }
 
 pub fn discover_hyprland_instance_signature(runtime_dir: &Path, hinted: Option<&str>) -> String {
@@ -133,7 +124,6 @@ pub fn resolve_runtime_paths() -> RuntimePaths {
     let state_root = state_root();
 
     RuntimePaths {
-        preview_socket_path: preview_socket_path(&runtime_root, &instance_signature),
         spawn_socket_path: spawn_socket_path(&runtime_root, &instance_signature),
         switcher_socket_path: switcher_socket_path(&runtime_root, &instance_signature),
         grid_socket_path: grid_socket_path(&runtime_root, &instance_signature),

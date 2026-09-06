@@ -61,7 +61,6 @@
             qt6.qtdeclarative
             qt6.qtwayland
             kdePackages."layer-shell-qt"
-            libjpeg
             pkg-config
             cmake
             cargo

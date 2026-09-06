@@ -23,7 +23,6 @@ The main commands are:
 - environment and slot bindings
 - global lock state
 - Hyprland state queries
-- preview cache metadata
 - spawn operation tracking
 
 `trigger` opens the MRU workspace switcher UI.

@@ -1,7 +1,5 @@
 #include "common.hpp"
 
-#include <algorithm>
-#include <charconv>
 #include <filesystem>
 #include <format>
 #include <sstream>
@@ -24,117 +22,6 @@ static std::string shortInstanceToken(const char* hyprlandInstanceSignature) {
     std::ostringstream out;
     out << std::format("{:016x}", hash);
     return out.str();
-}
-
-static std::vector<std::string_view> splitWords(std::string_view line) {
-    std::vector<std::string_view> out;
-
-    while (!line.empty()) {
-        const auto first = line.find_first_not_of(" \t\r\n");
-        if (first == std::string_view::npos)
-            break;
-
-        line.remove_prefix(first);
-
-        const auto end = line.find_first_of(" \t\r\n");
-        if (end == std::string_view::npos) {
-            out.emplace_back(line);
-            break;
-        }
-
-        out.emplace_back(line.substr(0, end));
-        line.remove_prefix(end);
-    }
-
-    return out;
-}
-
-std::optional<SClientCommand> parseClientCommand(std::string_view line, std::string& error) {
-    error.clear();
-
-    const auto parts = splitWords(line);
-    if (parts.empty()) {
-        error = "empty command";
-        return std::nullopt;
-    }
-
-    SClientCommand cmd;
-
-    if (parts[0] == "HELLO")
-        cmd.command = eClientCommand::HELLO;
-    else if (parts[0] == "WATCH")
-        cmd.command = eClientCommand::WATCH;
-    else if (parts[0] == "REFRESH")
-        cmd.command = eClientCommand::REFRESH;
-    else if (parts[0] == "CLEAR")
-        cmd.command = eClientCommand::CLEAR;
-    else if (parts[0] == "PING")
-        cmd.command = eClientCommand::PING;
-    else {
-        error = std::format("unknown command: {}", parts[0]);
-        return std::nullopt;
-    }
-
-    if (cmd.command == eClientCommand::HELLO || cmd.command == eClientCommand::CLEAR || cmd.command == eClientCommand::PING) {
-        if (parts.size() != 1) {
-            error = "unexpected arguments";
-            return std::nullopt;
-        }
-
-        return cmd;
-    }
-
-    if (parts.size() < 2) {
-        error = "workspace ids required";
-        return std::nullopt;
-    }
-
-    for (size_t i = 1; i < parts.size(); ++i) {
-        int        id     = 0;
-        const auto begin  = parts[i].data();
-        const auto end    = parts[i].data() + parts[i].size();
-        const auto parsed = std::from_chars(begin, end, id);
-        if (parsed.ec != std::errc{} || parsed.ptr != end || id <= 0) {
-            error = std::format("invalid workspace id: {}", parts[i]);
-            return std::nullopt;
-        }
-
-        cmd.workspaceIDs.push_back(id);
-    }
-
-    cmd.workspaceIDs = dedupeWorkspaceIDs(cmd.workspaceIDs);
-    return cmd;
-}
-
-std::vector<int> dedupeWorkspaceIDs(const std::vector<int>& ids) {
-    std::vector<int> out;
-    out.reserve(ids.size());
-
-    for (const auto id : ids) {
-        if (std::find(out.begin(), out.end(), id) == out.end())
-            out.push_back(id);
-    }
-
-    return out;
-}
-
-SPreviewSize computePreviewSize(int sourceWidth, int sourceHeight, int targetHeight) {
-    if (sourceWidth <= 0 || sourceHeight <= 0 || targetHeight <= 0)
-        return {};
-
-    if (sourceWidth >= sourceHeight) {
-        const auto scale = static_cast<double>(targetHeight) / static_cast<double>(sourceHeight);
-        return {
-            .width  = std::max(1, static_cast<int>(sourceWidth * scale)),
-            .height = targetHeight,
-        };
-    }
-
-    const auto scale = static_cast<double>(targetHeight) / static_cast<double>(sourceWidth);
-    return {
-        .width  = targetHeight,
-        .height = std::max(1, static_cast<int>(sourceHeight * scale)),
-    };
 }
 
 std::string discoverHyprlandInstanceSignature(const char* runtimeDir, const char* hyprlandInstanceSignature) {
@@ -188,10 +75,6 @@ std::filesystem::path runtimeDirectory(const char* runtimeDir, const char* hyprl
     return std::filesystem::path(base) / "hx" / shortInstanceToken(hyprlandInstanceSignature);
 }
 
-std::filesystem::path socketPath(const char* runtimeDir, const char* hyprlandInstanceSignature) {
-    return runtimeDirectory(runtimeDir, hyprlandInstanceSignature) / "preview.sock";
-}
-
 std::filesystem::path spawnSocketPath(const char* runtimeDir, const char* hyprlandInstanceSignature) {
     return runtimeDirectory(runtimeDir, hyprlandInstanceSignature) / "spawn.sock";
 }
@@ -206,10 +89,6 @@ std::filesystem::path hyprlandEventSocketPath(const char* runtimeDir, const char
     const auto signature = hyprlandInstanceSignature && *hyprlandInstanceSignature ? hyprlandInstanceSignature : "default";
     const auto base      = runtimeDir && *runtimeDir ? runtimeDir : "/tmp";
     return std::filesystem::path(base) / "hypr" / signature / ".socket2.sock";
-}
-
-std::filesystem::path previewPath(const char* runtimeDir, const char* hyprlandInstanceSignature, int workspaceID) {
-    return runtimeDirectory(runtimeDir, hyprlandInstanceSignature) / std::format("workspace-{}.jpg", workspaceID);
 }
 
 std::string escapeJSON(std::string_view value) {
@@ -228,19 +107,6 @@ std::string escapeJSON(std::string_view value) {
     }
 
     return out;
-}
-
-std::string formatHelloEvent(const std::filesystem::path& socketPathValue, int previewHeight) {
-    return std::format("{{\"event\":\"hello\",\"socket\":\"{}\",\"previewHeight\":{}}}\n", escapeJSON(socketPathValue.string()), previewHeight);
-}
-
-std::string formatPreviewEvent(int workspaceID, const std::filesystem::path& imagePath, int width, int height, uint64_t generation) {
-    return std::format("{{\"event\":\"preview\",\"workspaceId\":{},\"path\":\"{}\",\"width\":{},\"height\":{},\"generation\":{}}}\n", workspaceID,
-                       escapeJSON(imagePath.string()), width, height, generation);
-}
-
-std::string formatErrorEvent(std::string_view message) {
-    return std::format("{{\"event\":\"error\",\"message\":\"{}\"}}\n", escapeJSON(message));
 }
 
 }

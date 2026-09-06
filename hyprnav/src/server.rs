@@ -9,7 +9,7 @@ use crate::protocol::{
     WorkspaceNavigationResult,
 };
 use crate::runtime_paths::{
-    append_switch_log, ensure_parent_dir, preview_path, resolve_runtime_paths, RuntimePaths,
+    append_switch_log, ensure_parent_dir, resolve_runtime_paths, RuntimePaths,
 };
 use crate::spawn::{
     now_ms, parse_spawn_focus_policy, parse_spawn_target, SpawnFocusPolicy, SpawnOperationState,
@@ -23,7 +23,6 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::process::Command;
@@ -32,9 +31,6 @@ use std::thread;
 use std::time::Duration;
 use tracing::{debug, warn};
 
-const PREVIEW_POLL_INTERVAL_MS: u64 = 15_000;
-const PREVIEW_WORKER_SLEEP_MS: u64 = 100;
-const PREVIEW_SOCKET_READ_TIMEOUT_MS: u64 = 200;
 const LAUNCH_PENDING_TTL_MS: u64 = 30_000;
 
 #[derive(Clone, Debug)]
@@ -47,8 +43,6 @@ struct WorkspaceCardData {
     app_class: String,
     window_count: i32,
     active: bool,
-    preview_path: String,
-    generation: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -92,7 +86,6 @@ struct ServerRuntime {
     paths: RuntimePaths,
     store: StateStore,
     spawn_registry: Mutex<SpawnRegistry>,
-    preview_refresh: Mutex<PreviewRefreshState>,
     pending_launches: Mutex<PendingLaunchRegistry>,
 }
 
@@ -106,14 +99,6 @@ struct PluginSpawnResponse {
 #[derive(Debug, Deserialize)]
 struct PluginSpawnError {
     message: String,
-}
-
-#[derive(Debug, Default)]
-struct PreviewRefreshState {
-    pending_ids: HashSet<i32>,
-    urgent_ids: HashSet<i32>,
-    last_requested_ms: HashMap<i32, u64>,
-    known_generations: HashMap<i32, u64>,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -170,18 +155,6 @@ impl PendingLaunchRegistry {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct PreviewSocketEvent {
-    #[serde(default)]
-    event: String,
-    #[serde(default, rename = "workspaceId")]
-    workspace_id: i32,
-    #[serde(default)]
-    path: String,
-    #[serde(default)]
-    generation: u64,
-}
-
 #[derive(Debug, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum PluginSpawnRequest<'a> {
@@ -208,12 +181,10 @@ pub fn run_server() -> Result<()> {
         store: StateStore::new(paths.state_db_path.clone())?,
         paths,
         spawn_registry: Mutex::new(SpawnRegistry::new()),
-        preview_refresh: Mutex::new(PreviewRefreshState::default()),
         pending_launches: Mutex::new(PendingLaunchRegistry::default()),
     });
     let listener = bind_listener(&runtime.paths.server_socket_path)?;
     start_spawn_cleanup_thread(runtime.clone());
-    start_preview_worker_thread(runtime.clone());
     start_hypr_event_thread(runtime.clone());
 
     loop {
@@ -254,11 +225,7 @@ fn start_hypr_event_thread(runtime: Arc<ServerRuntime>) {
                                 if next_workspace_id > 0
                                     && next_workspace_id != previous_workspace_id
                                 {
-                                    previous_workspace_id = record_workspace_transition(
-                                        &runtime.preview_refresh,
-                                        previous_workspace_id,
-                                        next_workspace_id,
-                                    );
+                                    previous_workspace_id = next_workspace_id;
                                     if let Ok(Some(environment_id)) =
                                         resolve_focus_environment_for_physical_workspace(
                                             &runtime.store,
@@ -385,47 +352,6 @@ fn start_spawn_cleanup_thread(runtime: Arc<ServerRuntime>) {
         };
         for key in keys_to_clear {
             pending.remove(&key);
-        }
-    });
-}
-
-fn start_preview_worker_thread(runtime: Arc<ServerRuntime>) {
-    thread::spawn(move || {
-        let mut stream: Option<UnixStream> = None;
-        let mut reader: Option<BufReader<UnixStream>> = None;
-
-        loop {
-            let now = now_ms();
-
-            if stream.is_none() || reader.is_none() {
-                if let Ok((next_stream, next_reader)) = connect_preview_socket(&runtime.paths) {
-                    stream = Some(next_stream);
-                    reader = Some(next_reader);
-                }
-            }
-
-            let due_ids = due_preview_refresh_ids(&runtime, now);
-            if let Some(active_stream) = stream.as_mut() {
-                if !due_ids.is_empty() {
-                    if let Err(error) = send_preview_refresh_request(active_stream, &due_ids) {
-                        warn!("preview refresh request failed: {error}");
-                        stream = None;
-                        reader = None;
-                    } else {
-                        mark_preview_refresh_ids_sent(&runtime, &due_ids, now);
-                    }
-                }
-            }
-
-            if let Some(active_reader) = reader.as_mut() {
-                if let Err(error) = drain_preview_events(&runtime, active_reader) {
-                    warn!("preview socket read failed: {error}");
-                    stream = None;
-                    reader = None;
-                }
-            }
-
-            thread::sleep(Duration::from_millis(PREVIEW_WORKER_SLEEP_MS));
         }
     });
 }
@@ -1278,8 +1204,6 @@ fn build_switcher_snapshot(runtime: &ServerRuntime, reverse: bool) -> Result<Swi
                 app_class: item.app_class,
                 window_count: item.window_count,
                 active: item.active,
-                preview_path: item.preview_path,
-                generation: item.generation,
             })
             .collect(),
         initial_index,
@@ -1635,19 +1559,6 @@ fn build_grid_snapshot(runtime: &ServerRuntime, cwd: Option<&str>) -> Result<Gri
 
             let workspace_id = record.workspace_id;
             let card = cards_by_workspace.get(&workspace_id);
-            let preview = preview_path(
-                &runtime.paths.runtime_root,
-                &runtime.paths.instance_signature,
-                workspace_id,
-            );
-            let preview_path = if let Some(card) = card {
-                card.preview_path.clone()
-            } else if preview.is_file() {
-                preview.to_string_lossy().into_owned()
-            } else {
-                String::new()
-            };
-            let generation = preview_generation(runtime, workspace_id, &preview_path);
             let active = workspace_id == current_workspace_id;
 
             row_items.push(GridCellSnapshot {
@@ -1668,8 +1579,6 @@ fn build_grid_snapshot(runtime: &ServerRuntime, cwd: Option<&str>) -> Result<Gri
                 app_class: card.map(|item| item.app_class.clone()).unwrap_or_default(),
                 window_count: card.map(|item| item.window_count).unwrap_or(0),
                 active,
-                preview_path,
-                generation,
                 environment_locked: locked_env_id.as_deref() == Some(environment.env_id.as_str()),
                 show_environment_label: column_index == 0,
                 row_index: row_count,
@@ -1840,11 +1749,10 @@ fn current_workspace_cards(runtime: &ServerRuntime) -> Result<Vec<WorkspaceCardD
     let monitors = run_hyprctl_json(&runtime.paths, &["-j", "monitors"])?;
     let workspaces = run_hyprctl_json(&runtime.paths, &["-j", "workspaces"])?;
     let clients = run_hyprctl_json(&runtime.paths, &["-j", "clients"])?;
-    current_workspace_cards_from_json(runtime, &monitors, &workspaces, &clients)
+    current_workspace_cards_from_json(&monitors, &workspaces, &clients)
 }
 
 fn current_workspace_cards_from_json(
-    runtime: &ServerRuntime,
     monitors: &[u8],
     workspaces: &[u8],
     clients: &[u8],
@@ -1853,207 +1761,17 @@ fn current_workspace_cards_from_json(
 
     Ok(descriptors
         .into_iter()
-        .map(|descriptor| {
-            let preview = preview_path(
-                &runtime.paths.runtime_root,
-                &runtime.paths.instance_signature,
-                descriptor.id,
-            );
-            let preview_path = if preview.is_file() {
-                preview.to_string_lossy().into_owned()
-            } else {
-                String::new()
-            };
-
-            WorkspaceCardData {
-                workspace_id: descriptor.id,
-                slot_index: 0,
-                slot_display_name: String::new(),
-                workspace_name: descriptor.name,
-                subtitle: descriptor.subtitle,
-                app_class: descriptor.app_class,
-                window_count: descriptor.window_count,
-                active: descriptor.active,
-                generation: preview_generation(runtime, descriptor.id, &preview_path),
-                preview_path,
-            }
+        .map(|descriptor| WorkspaceCardData {
+            workspace_id: descriptor.id,
+            slot_index: 0,
+            slot_display_name: String::new(),
+            workspace_name: descriptor.name,
+            subtitle: descriptor.subtitle,
+            app_class: descriptor.app_class,
+            window_count: descriptor.window_count,
+            active: descriptor.active,
         })
         .collect())
-}
-
-fn preview_generation(runtime: &ServerRuntime, workspace_id: i32, path: &str) -> u64 {
-    runtime
-        .preview_refresh
-        .lock()
-        .ok()
-        .and_then(|state| state.known_generations.get(&workspace_id).copied())
-        .filter(|generation| *generation > 0)
-        .unwrap_or_else(|| preview_generation_from_file(path))
-}
-
-fn enqueue_transition_preview_refresh_ids(
-    preview_refresh: &Mutex<PreviewRefreshState>,
-    workspace_ids: impl IntoIterator<Item = i32>,
-) {
-    let Ok(mut state) = preview_refresh.lock() else {
-        return;
-    };
-
-    for workspace_id in workspace_ids {
-        if workspace_id > 0 {
-            state.pending_ids.insert(workspace_id);
-        }
-    }
-}
-
-fn enqueue_opened_workspace_preview_refresh_ids(
-    preview_refresh: &Mutex<PreviewRefreshState>,
-    workspace_ids: impl IntoIterator<Item = i32>,
-) {
-    let Ok(mut state) = preview_refresh.lock() else {
-        return;
-    };
-
-    for workspace_id in workspace_ids {
-        if workspace_id > 0 {
-            state.pending_ids.insert(workspace_id);
-            state.urgent_ids.insert(workspace_id);
-        }
-    }
-}
-
-fn record_workspace_transition(
-    preview_refresh: &Mutex<PreviewRefreshState>,
-    previous_workspace_id: i32,
-    next_workspace_id: i32,
-) -> i32 {
-    if next_workspace_id <= 0 || next_workspace_id == previous_workspace_id {
-        return previous_workspace_id;
-    }
-
-    if previous_workspace_id > 0 {
-        enqueue_transition_preview_refresh_ids(preview_refresh, [previous_workspace_id]);
-    }
-    enqueue_opened_workspace_preview_refresh_ids(preview_refresh, [next_workspace_id]);
-
-    next_workspace_id
-}
-
-fn due_preview_refresh_ids(runtime: &ServerRuntime, now_ms: u64) -> Vec<i32> {
-    let Ok(state) = runtime.preview_refresh.lock() else {
-        return Vec::new();
-    };
-
-    state
-        .pending_ids
-        .iter()
-        .copied()
-        .filter(|workspace_id| {
-            if state.urgent_ids.contains(workspace_id) {
-                return true;
-            }
-            state
-                .last_requested_ms
-                .get(workspace_id)
-                .map(|last_requested_ms| {
-                    now_ms.saturating_sub(*last_requested_ms) >= PREVIEW_POLL_INTERVAL_MS
-                })
-                .unwrap_or(true)
-        })
-        .collect::<Vec<_>>()
-}
-
-fn mark_preview_refresh_ids_sent(runtime: &ServerRuntime, workspace_ids: &[i32], now_ms: u64) {
-    let Ok(mut state) = runtime.preview_refresh.lock() else {
-        return;
-    };
-
-    for workspace_id in workspace_ids {
-        state.pending_ids.remove(workspace_id);
-        state.urgent_ids.remove(workspace_id);
-        state.last_requested_ms.insert(*workspace_id, now_ms);
-    }
-}
-
-fn connect_preview_socket(paths: &RuntimePaths) -> Result<(UnixStream, BufReader<UnixStream>)> {
-    let mut stream = UnixStream::connect(&paths.preview_socket_path)
-        .with_context(|| format!("connecting to {}", paths.preview_socket_path.display()))?;
-    stream.set_read_timeout(Some(Duration::from_millis(PREVIEW_SOCKET_READ_TIMEOUT_MS)))?;
-    stream.write_all(b"HELLO\n")?;
-    stream.flush()?;
-    let reader = BufReader::new(stream.try_clone()?);
-    Ok((stream, reader))
-}
-
-fn send_preview_refresh_request(stream: &mut UnixStream, workspace_ids: &[i32]) -> Result<()> {
-    if workspace_ids.is_empty() {
-        return Ok(());
-    }
-
-    let payload = format!(
-        "REFRESH {}\n",
-        workspace_ids
-            .iter()
-            .map(|workspace_id| workspace_id.to_string())
-            .collect::<Vec<_>>()
-            .join(" ")
-    );
-    stream.write_all(payload.as_bytes())?;
-    stream.flush()?;
-    Ok(())
-}
-
-fn drain_preview_events(runtime: &ServerRuntime, reader: &mut BufReader<UnixStream>) -> Result<()> {
-    loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line) {
-            Ok(0) => return Err(anyhow!("preview socket closed")),
-            Ok(_) => {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-
-                let event = serde_json::from_str::<PreviewSocketEvent>(trimmed)
-                    .with_context(|| format!("decoding preview event: {trimmed}"))?;
-                if event.event == "preview" && event.workspace_id > 0 {
-                    let mut state = runtime
-                        .preview_refresh
-                        .lock()
-                        .map_err(|error| anyhow!("preview refresh state poisoned: {error}"))?;
-                    if event.generation > 0 {
-                        state
-                            .known_generations
-                            .insert(event.workspace_id, event.generation);
-                    } else if !event.path.is_empty() {
-                        state.known_generations.insert(
-                            event.workspace_id,
-                            preview_generation_from_file(&event.path),
-                        );
-                    }
-                }
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                return Ok(());
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-}
-
-fn preview_generation_from_file(path: &str) -> u64 {
-    if path.is_empty() {
-        return 0;
-    }
-
-    fs::metadata(path)
-        .map(|metadata| ((metadata.mtime() as u64) << 32) ^ (metadata.mtime_nsec() as u64))
-        .unwrap_or(0)
 }
 
 fn current_active_workspace_id(paths: &RuntimePaths) -> Result<i32> {
@@ -2387,7 +2105,6 @@ mod tests {
                 runtime_root: runtime_root.clone(),
                 instance_signature: "test".to_owned(),
                 runtime_dir: runtime_dir.clone(),
-                preview_socket_path: runtime_dir.join("preview.sock"),
                 spawn_socket_path: runtime_dir.join("spawn.sock"),
                 switcher_socket_path: runtime_dir.join("switcher.sock"),
                 grid_socket_path: runtime_dir.join("grid.sock"),
@@ -2399,7 +2116,6 @@ mod tests {
             },
             store: StateStore::new(&db_path).unwrap(),
             spawn_registry: Mutex::new(SpawnRegistry::new()),
-            preview_refresh: Mutex::new(PreviewRefreshState::default()),
             pending_launches: Mutex::new(PendingLaunchRegistry::default()),
         });
 
@@ -2425,23 +2141,7 @@ mod tests {
             app_class: String::new(),
             window_count: 1,
             active,
-            preview_path: String::new(),
-            generation: 0,
         }
-    }
-
-    fn workspace_fixture_json() -> (&'static [u8], &'static [u8], &'static [u8]) {
-        (
-            br#"[{"focused":true,"activeWorkspace":{"id":1}}]"#,
-            br#"[
-                {"id":1,"name":"1","windows":1,"lastwindowtitle":"Active"},
-                {"id":2,"name":"2","windows":1,"lastwindowtitle":"Other"}
-            ]"#,
-            br#"[
-                {"mapped":true,"workspace":{"id":1},"title":"Active","class":"term","focusHistoryID":0},
-                {"mapped":true,"workspace":{"id":2},"title":"Other","class":"browser","focusHistoryID":1}
-            ]"#,
-        )
     }
 
     fn build_grid_snapshot_from_data(
@@ -2507,10 +2207,6 @@ mod tests {
                     app_class: card.map(|item| item.app_class.clone()).unwrap_or_default(),
                     window_count: card.map(|item| item.window_count).unwrap_or(0),
                     active,
-                    preview_path: card
-                        .map(|item| item.preview_path.clone())
-                        .unwrap_or_default(),
-                    generation: card.map(|item| item.generation).unwrap_or(0),
                     environment_locked: locked_env_id == Some(environment.env_id.as_str()),
                     show_environment_label: column_index == 0,
                     row_index: row_count,
@@ -2546,85 +2242,6 @@ mod tests {
             row_count,
             max_column_count,
         }
-    }
-
-    #[test]
-    fn current_workspace_cards_does_not_queue_missing_previews() {
-        let (runtime, path) = test_runtime("missing-preview-no-queue");
-        let (monitors, workspaces, clients) = workspace_fixture_json();
-
-        let cards =
-            current_workspace_cards_from_json(&runtime, monitors, workspaces, clients).unwrap();
-
-        assert_eq!(cards.len(), 2);
-        assert!(cards.iter().all(|card| card.preview_path.is_empty()));
-        let state = runtime.preview_refresh.lock().unwrap();
-        assert!(state.pending_ids.is_empty());
-        assert!(state.urgent_ids.is_empty());
-
-        cleanup(&path);
-    }
-
-    #[test]
-    fn current_workspace_cards_exposes_existing_preview_without_queueing() {
-        let (runtime, path) = test_runtime("existing-preview-no-queue");
-        let (monitors, workspaces, clients) = workspace_fixture_json();
-        let preview = preview_path(
-            &runtime.paths.runtime_root,
-            &runtime.paths.instance_signature,
-            2,
-        );
-        fs::write(&preview, b"preview").unwrap();
-
-        let cards =
-            current_workspace_cards_from_json(&runtime, monitors, workspaces, clients).unwrap();
-        let card = cards
-            .iter()
-            .find(|card| card.workspace_id == 2)
-            .expect("workspace 2 card");
-
-        assert_eq!(card.preview_path, preview.to_string_lossy().as_ref());
-        let state = runtime.preview_refresh.lock().unwrap();
-        assert!(state.pending_ids.is_empty());
-        assert!(state.urgent_ids.is_empty());
-
-        cleanup(&path);
-    }
-
-    #[test]
-    fn record_workspace_transition_queues_previous_and_opened_workspaces() {
-        let preview_refresh = Mutex::new(PreviewRefreshState::default());
-
-        let next_previous = record_workspace_transition(&preview_refresh, 3, 4);
-
-        assert_eq!(next_previous, 4);
-        let state = preview_refresh.lock().unwrap();
-        assert_eq!(state.pending_ids, HashSet::from([3, 4]));
-        assert_eq!(state.urgent_ids, HashSet::from([4]));
-    }
-
-    #[test]
-    fn record_workspace_transition_ignores_invalid_or_unchanged_workspace() {
-        let preview_refresh = Mutex::new(PreviewRefreshState::default());
-
-        assert_eq!(record_workspace_transition(&preview_refresh, 3, 3), 3);
-        assert_eq!(record_workspace_transition(&preview_refresh, 3, -1), 3);
-
-        let state = preview_refresh.lock().unwrap();
-        assert!(state.pending_ids.is_empty());
-        assert!(state.urgent_ids.is_empty());
-    }
-
-    #[test]
-    fn record_workspace_transition_does_not_queue_invalid_previous_workspace() {
-        let preview_refresh = Mutex::new(PreviewRefreshState::default());
-
-        let next_previous = record_workspace_transition(&preview_refresh, -1, 4);
-
-        assert_eq!(next_previous, 4);
-        let state = preview_refresh.lock().unwrap();
-        assert_eq!(state.pending_ids, HashSet::from([4]));
-        assert_eq!(state.urgent_ids, HashSet::from([4]));
     }
 
     #[test]

@@ -8,7 +8,7 @@ hyprnav has three main roles:
 
   1. daemon
      Runs the persistent headless server. It stores environment mappings, lock
-     state, preview metadata, and runtime spawn operations.
+     state and runtime spawn operations.
 
   2. UI clients
      - trigger: MRU workspace overlay
@@ -69,7 +69,7 @@ pub struct Cli {
 pub enum Command {
     #[command(
         about = "Run the persistent headless server.",
-        long_about = "Run the persistent headless server.\n\nThis process owns environment state, the control socket, preview metadata, and runtime spawn operations. In the local Hyprland workflow it is typically started once per session."
+        long_about = "Run the persistent headless server.\n\nThis process owns environment state, the control socket, and runtime spawn operations. In the local Hyprland workflow it is typically started once per session."
     )]
     Daemon,
     #[command(

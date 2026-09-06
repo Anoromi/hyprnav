@@ -4,16 +4,17 @@
 #define private public
 #include <hyprland/src/Compositor.hpp>
 #include <hyprland/src/desktop/state/FocusState.hpp>
-#ifdef HYPRNAV_PLUGIN_HAS_EVENT_BUS
+#include <hyprland/src/desktop/state/GlobalWindowController.hpp>
+#include <hyprland/src/desktop/state/WindowState.hpp>
+#include <hyprland/src/state/MonitorState.hpp>
+#include <hyprland/src/state/WorkspaceState.hpp>
 #include <hyprland/src/event/EventBus.hpp>
-#endif
-#include <hyprland/src/helpers/Monitor.hpp>
+#include <hyprland/src/output/Monitor.hpp>
 #include <hyprland/src/helpers/time/Time.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
 #undef private
 
 #include <algorithm>
-#include <any>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -117,20 +118,7 @@ void CSpawnManager::wakeTimer(std::chrono::milliseconds timeout) {
 }
 
 void CSpawnManager::registerEventListeners() {
-#ifdef HYPRNAV_PLUGIN_HAS_EVENT_BUS
     m_openListener = Event::bus()->m_events.window.open.listen([this](PHLWINDOW window) { handleWindow(window); });
-#else
-    if (!PHANDLE)
-        return;
-
-    m_openListener = HyprlandAPI::registerCallbackDynamic(PHANDLE, "openWindow", [this](void*, SCallbackInfo&, std::any data) {
-        try {
-            handleWindow(std::any_cast<PHLWINDOW>(data));
-        } catch (const std::bad_any_cast&) {
-            Log::logger->log(Log::ERR, "[hyprnav-plugin] openWindow hook payload had an unexpected type");
-        }
-    });
-#endif
 }
 
 void CSpawnManager::createSocket() {
@@ -418,10 +406,11 @@ void CSpawnManager::handleWindow(PHLWINDOW window) {
             window->m_suppressedEvents |= Desktop::View::SUPPRESS_ACTIVATE_FOCUSONLY;
         }
 
-        g_pCompositor->moveWindowToWorkspaceSafe(window, workspace);
+        Desktop::globalWindowController()->moveWindowToWorkspace(window, workspace);
         operation->movedWindowAddresses.insert(windowAddress);
-        if (operation->focusPolicy == ESpawnFocusPolicy::Preserve &&
-            !operation->restoredWindowAddresses.contains(windowAddress)) {
+        if (operation->focusPolicy == ESpawnFocusPolicy::Follow) {
+            Desktop::focusState()->fullWindowFocus(window, Desktop::FOCUS_REASON_NEW_WINDOW);
+        } else if (!operation->restoredWindowAddresses.contains(windowAddress)) {
             restoreOriginalFocus(*operation, window);
             operation->restoredWindowAddresses.insert(windowAddress);
         }
@@ -477,24 +466,25 @@ pid_t CSpawnManager::readParentPID(pid_t pid) const {
 }
 
 PHLWORKSPACE CSpawnManager::ensureWorkspace(const SSpawnOperation& operation) const {
-    auto workspace = g_pCompositor->getWorkspaceByID(operation.workspaceID);
+    auto workspace = State::workspaceState()->query().id(operation.workspaceID).run();
     if (workspace)
         return workspace;
 
-    auto monitor = operation.targetMonitorID >= 0 ? g_pCompositor->getMonitorFromID(operation.targetMonitorID) : nullptr;
+    auto monitor = operation.targetMonitorID >= 0 ? State::monitorState()->query().id(operation.targetMonitorID).run() : nullptr;
     if (!monitor)
         monitor = Desktop::focusState()->monitor();
     if (!monitor)
         return nullptr;
 
-    return g_pCompositor->createNewWorkspace(operation.workspaceID, monitor->m_id, "", true);
+    return State::workspaceState()->create(operation.workspaceID, monitor->m_id, "", true);
 }
 
 PHLWINDOW CSpawnManager::findWindowByAddress(uintptr_t address) const {
     if (!g_pCompositor || address == 0)
         return nullptr;
 
-    for (const auto& window : g_pCompositor->m_windows) {
+    const auto& windows = Desktop::windowState()->windows();
+    for (const auto& window : windows) {
         if (window && reinterpret_cast<uintptr_t>(window.get()) == address)
             return window;
     }
@@ -506,20 +496,15 @@ bool CSpawnManager::restoreOriginalFocus(const SSpawnOperation& operation, PHLWI
     if (!g_pCompositor)
         return false;
 
-    const auto originMonitor =
-        operation.originMonitorID >= 0 ? g_pCompositor->getMonitorFromID(operation.originMonitorID) : nullptr;
+    const auto originMonitor = operation.originMonitorID >= 0 ? State::monitorState()->query().id(operation.originMonitorID).run() : nullptr;
     const auto originWorkspace =
-        operation.originWorkspaceID > 0 ? g_pCompositor->getWorkspaceByID(operation.originWorkspaceID) : nullptr;
+        operation.originWorkspaceID > 0 ? State::workspaceState()->query().id(operation.originWorkspaceID).run() : nullptr;
     if (originMonitor && originWorkspace)
         originMonitor->changeWorkspace(originWorkspace, false, true, true);
 
     const auto originWindow = operation.originWindowAddress.has_value() ? findWindowByAddress(*operation.originWindowAddress) : nullptr;
     if (originWindow && originWindow != spawnedWindow) {
-#ifdef HYPRNAV_PLUGIN_HAS_FOCUS_REASON
         Desktop::focusState()->fullWindowFocus(originWindow, Desktop::FOCUS_REASON_DESKTOP_STATE_CHANGE);
-#else
-        Desktop::focusState()->fullWindowFocus(originWindow);
-#endif
         return true;
     }
 

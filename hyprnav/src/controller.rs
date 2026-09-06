@@ -8,7 +8,7 @@ use crate::ui_session::{
 use cxx_qt::casting::Upcast;
 use cxx_qt::CxxQtType;
 use cxx_qt_lib::{
-    QByteArray, QHash, QHashPair_i32_QByteArray, QList, QModelIndex, QString, QUrl, QVariant,
+    QByteArray, QHash, QHashPair_i32_QByteArray, QList, QModelIndex, QString, QVariant,
 };
 use std::collections::BTreeMap;
 use std::pin::Pin;
@@ -21,8 +21,6 @@ const ROLE_SUBTITLE: i32 = 0x0103;
 const ROLE_APP_CLASS: i32 = 0x0104;
 const ROLE_WINDOW_COUNT: i32 = 0x0105;
 const ROLE_ACTIVE: i32 = 0x0106;
-const ROLE_PREVIEW: i32 = 0x0108;
-const ROLE_GENERATION: i32 = 0x0109;
 const ROLE_ENVIRONMENT_ID: i32 = 0x010a;
 const ROLE_ENVIRONMENT_DISPLAY_ID: i32 = 0x010b;
 const ROLE_ENVIRONMENT_TITLE: i32 = 0x0112;
@@ -44,8 +42,6 @@ struct UiItem {
     app_class: String,
     window_count: i32,
     active: bool,
-    preview_path: String,
-    generation: u64,
     environment_id: String,
     environment_display_id: String,
     environment_title: String,
@@ -89,9 +85,6 @@ pub mod qobject {
 
         include!("cxx-qt-lib/qstring.h");
         type QString = cxx_qt_lib::QString;
-
-        include!("cxx-qt-lib/qurl.h");
-        type QUrl = cxx_qt_lib::QUrl;
 
         include!("cxx-qt-lib/qvariant.h");
         type QVariant = cxx_qt_lib::QVariant;
@@ -336,16 +329,6 @@ impl qobject::Controller {
             ROLE_APP_CLASS => QVariant::from(&QString::from(item.app_class.as_str())),
             ROLE_WINDOW_COUNT => QVariant::from(&item.window_count),
             ROLE_ACTIVE => QVariant::from(&item.active),
-            ROLE_PREVIEW => {
-                if item.preview_path.is_empty() {
-                    QVariant::default()
-                } else {
-                    let mut url = QUrl::from_local_file(&QString::from(item.preview_path.as_str()));
-                    url.set_query(&QString::from(format!("g={}", item.generation).as_str()));
-                    QVariant::from(&url)
-                }
-            }
-            ROLE_GENERATION => QVariant::from(&(item.generation as u64)),
             ROLE_ENVIRONMENT_ID => QVariant::from(&QString::from(item.environment_id.as_str())),
             ROLE_ENVIRONMENT_DISPLAY_ID => {
                 QVariant::from(&QString::from(item.environment_display_id.as_str()))
@@ -383,14 +366,6 @@ impl qobject::Controller {
             QByteArray::from("workspaceWindowCount".as_bytes()),
         );
         roles.insert(ROLE_ACTIVE, QByteArray::from("workspaceActive".as_bytes()));
-        roles.insert(
-            ROLE_PREVIEW,
-            QByteArray::from("workspacePreview".as_bytes()),
-        );
-        roles.insert(
-            ROLE_GENERATION,
-            QByteArray::from("workspaceGeneration".as_bytes()),
-        );
         roles.insert(
             ROLE_ENVIRONMENT_ID,
             QByteArray::from("environmentId".as_bytes()),
@@ -1059,8 +1034,6 @@ fn item_from_switcher_snapshot(item: WorkspaceCardSnapshot) -> UiItem {
         app_class: item.app_class,
         window_count: item.window_count,
         active: item.active,
-        preview_path: item.preview_path,
-        generation: item.generation,
         ..UiItem::default()
     }
 }
@@ -1073,8 +1046,6 @@ fn item_from_grid_snapshot(item: GridCellSnapshot) -> UiItem {
         app_class: item.app_class,
         window_count: item.window_count,
         active: item.active,
-        preview_path: item.preview_path,
-        generation: item.generation,
         environment_id: item.environment_id,
         environment_display_id: item.environment_display_id,
         environment_title: item.environment_title,
@@ -1131,8 +1102,6 @@ fn volatile_item_eq(left: &UiItem, right: &UiItem) -> bool {
         && left.window_count == right.window_count
         && left.active == right.active
         && left.slot_index == right.slot_index
-        && left.preview_path == right.preview_path
-        && left.generation == right.generation
         && left.environment_title == right.environment_title
         && left.slot_display_name == right.slot_display_name
 }
@@ -1196,8 +1165,6 @@ fn volatile_roles() -> QList<i32> {
         ROLE_WINDOW_COUNT,
         ROLE_ACTIVE,
         ROLE_SLOT_INDEX,
-        ROLE_PREVIEW,
-        ROLE_GENERATION,
         ROLE_ENVIRONMENT_TITLE,
         ROLE_SLOT_DISPLAY_NAME,
     ]
@@ -1253,13 +1220,11 @@ mod tests {
         let current = vec![UiItem {
             workspace_id: 4,
             workspace_name: "one".into(),
-            generation: 1,
             ..UiItem::default()
         }];
         let next = vec![UiItem {
             workspace_id: 4,
             workspace_name: "two".into(),
-            generation: 2,
             active: true,
             ..UiItem::default()
         }];
@@ -1276,8 +1241,6 @@ mod tests {
             app_class: String::new(),
             window_count: 1,
             active: false,
-            preview_path: String::new(),
-            generation: 1,
             environment_id: "env".into(),
             environment_display_id: "Env".into(),
             environment_title: String::new(),
@@ -1307,19 +1270,16 @@ mod tests {
             UiItem {
                 workspace_id: 1,
                 workspace_name: "one".into(),
-                generation: 1,
                 ..UiItem::default()
             },
             UiItem {
                 workspace_id: 2,
                 workspace_name: "two".into(),
-                generation: 1,
                 ..UiItem::default()
             },
             UiItem {
                 workspace_id: 3,
                 workspace_name: "three".into(),
-                generation: 1,
                 ..UiItem::default()
             },
         ];
@@ -1327,11 +1287,10 @@ mod tests {
             current[0].clone(),
             UiItem {
                 workspace_name: "second".into(),
-                generation: 2,
                 ..current[1].clone()
             },
             UiItem {
-                preview_path: "/tmp/preview.png".into(),
+                active: true,
                 ..current[2].clone()
             },
         ];

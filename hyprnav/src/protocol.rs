@@ -13,8 +13,6 @@ pub struct WorkspaceCardSnapshot {
     pub app_class: String,
     pub window_count: i32,
     pub active: bool,
-    pub preview_path: String,
-    pub generation: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -40,8 +38,6 @@ pub struct GridCellSnapshot {
     pub app_class: String,
     pub window_count: i32,
     pub active: bool,
-    pub preview_path: String,
-    pub generation: u64,
     pub environment_locked: bool,
     pub show_environment_label: bool,
     pub row_index: i32,

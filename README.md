@@ -5,7 +5,7 @@ Local Hyprland workspace navigation tooling for this NixOS setup.
 This repository contains two active components:
 
 - `hyprnav`: the Rust/QML workspace environment daemon and overlays.
-- `hyprnav-plugin`: the Hyprland plugin that provides preview images and plugin-assisted spawn placement for `hyprnav`.
+- `hyprnav-plugin`: the Hyprland plugin that provides PID-tree spawn placement for `hyprnav`.
 
 The local integration source of truth lives in:
 

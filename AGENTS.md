@@ -46,7 +46,7 @@ Default workflow:
 2. For plugin changes:
    - rebuild and reload with `hyprnav-plugin-dev-reload`
    - verify the plugin is loaded
-   - verify preview/spawn integration through the `hyprnav` flows
+   - verify spawn integration through the `hyprnav` flows
 3. For switcher changes:
    - rebuild with `hyprnav-dev-build`
    - restart the running switcher daemon if needed
@@ -61,6 +61,12 @@ Do not assume the upstream repo flake or devShell is the source of truth for
 local development. Prefer the local NixOS integration workflow already in use.
 
 # Validation
+
+For plugin tests, first load, unload, and exercise the plugin in a disposable
+nested or headless Hyprland instance with an isolated runtime state directory.
+Do not test an unverified plugin against the live desktop compositor. Only move
+to live-compositor validation after the isolated test passes and the user
+explicitly approves it.
 
 Use these checks for local verification:
 

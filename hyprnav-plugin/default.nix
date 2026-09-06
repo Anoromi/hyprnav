@@ -2,7 +2,6 @@
   lib,
   hyprland,
   hyprlandPlugins,
-  libjpeg,
 }:
 hyprlandPlugins.mkHyprlandPlugin {
   pluginName = "hyprnav-plugin";
@@ -10,10 +9,10 @@ hyprlandPlugins.mkHyprlandPlugin {
   src = ./.;
 
   inherit (hyprland) nativeBuildInputs;
-  buildInputs = hyprland.buildInputs ++ [ libjpeg ];
+  buildInputs = hyprland.buildInputs;
 
   meta = with lib; {
-    description = "Preview and spawn integration for hyprnav";
+    description = "Spawn placement integration for hyprnav";
     license = licenses.mit;
     platforms = platforms.linux;
   };
