@@ -1,4 +1,6 @@
-/* global browser, workspaceUrl */
+/* global workspaceUrl */
+if (typeof importScripts === 'function') importScripts('url.js');
+const browser = globalThis.browser || globalThis.chrome;
 const TAB_KEY = 'hyprnav-name';
 const CONFIG_KEY = 'hyprnav-tabs';
 let port;
@@ -19,6 +21,19 @@ async function waitForUrl(id, url) {
   }
   throw new Error('Tab did not navigate to the requested URL within six seconds');
 }
+async function tabName(id) {
+  if (browser.sessions?.getTabValue) return browser.sessions.getTabValue(id, TAB_KEY);
+  return (await browser.storage.session.get(`${TAB_KEY}:${id}`))[`${TAB_KEY}:${id}`];
+}
+async function nameTab(id, name) {
+  if (browser.sessions?.setTabValue) return browser.sessions.setTabValue(id, TAB_KEY, name);
+  await browser.storage.session.set({ [`${TAB_KEY}:${id}`]: name });
+}
+if (!browser.sessions?.setTabValue) {
+  browser.tabs.onRemoved.addListener(id => {
+    void browser.storage.session.remove(`${TAB_KEY}:${id}`);
+  });
+}
 async function configurations() {
   return (await browser.storage.local.get(CONFIG_KEY))[CONFIG_KEY] || {};
 }
@@ -26,12 +41,12 @@ async function locate(name, config) {
   const tabs = (await browser.tabs.query({})).filter(tab => !tab.incognito);
   const tagged = [];
   for (const tab of tabs) {
-    if (await browser.sessions.getTabValue(tab.id, TAB_KEY) === name) tagged.push(tab);
+    if (await tabName(tab.id) === name) tagged.push(tab);
   }
   if (tagged.length > 1) throw new Error(`Multiple tabs are named ${name}; close the duplicate`);
   if (tagged.length) {
     // Firefox may briefly expose about:blank while a new tab starts loading.
-    for (let attempt = 0; tagged[0].url === 'about:blank' && attempt < 60; attempt++) {
+    for (let attempt = 0; (!tagged[0].url || tagged[0].url === 'about:blank') && attempt < 60; attempt++) {
       await new Promise(resolve => setTimeout(resolve, 50));
       tagged[0] = await browser.tabs.get(tagged[0].id);
     }
@@ -46,9 +61,9 @@ async function locate(name, config) {
   });
   if (matches.length > 1) throw new Error(`Multiple matching tabs for ${name}; close the duplicates`);
   if (matches.length) {
-    const otherName = await browser.sessions.getTabValue(matches[0].id, TAB_KEY);
+    const otherName = await tabName(matches[0].id);
     if (otherName && otherName !== name) throw new Error(`Tab already belongs to ${otherName}`);
-    await browser.sessions.setTabValue(matches[0].id, TAB_KEY, name);
+    await nameTab(matches[0].id, name);
     return matches[0];
   }
   return null;
@@ -78,12 +93,12 @@ async function handle(message) {
     let tab = await locate(name, config);
     if (!tab) {
       tab = await browser.tabs.create({ url, active: true });
-      await browser.sessions.setTabValue(tab.id, TAB_KEY, name);
+      await nameTab(tab.id, name);
     }
     configs[name] = config;
     await browser.storage.local.set({ [CONFIG_KEY]: configs });
     await browser.tabs.update(tab.id, { active: true });
-    tab = await waitForUrl(tab.id, tab.url === 'about:blank' ? url : tab.url);
+    tab = await waitForUrl(tab.id, !tab.url || tab.url === 'about:blank' ? url : tab.url);
     await browser.windows.update(tab.windowId, { focused: true });
     return { name, tab_id: tab.id, url: tab.url };
   }
@@ -95,7 +110,7 @@ async function handle(message) {
   const url = workspaceUrl(tab?.url || config.url, config.param, value);
   if (!tab) {
     tab = await browser.tabs.create({ url, active: true });
-    await browser.sessions.setTabValue(tab.id, TAB_KEY, name);
+    await nameTab(tab.id, name);
   } else {
     await browser.tabs.update(tab.id, tab.url === url ? { active: true } : { url, active: true });
   }
@@ -104,6 +119,7 @@ async function handle(message) {
   return { name, tab_id: tab.id, workspace: value, url: tab.url };
 }
 function connect() {
+  if (port) return;
   const connection = browser.runtime.connectNative('hyprnav_browser');
   port = connection;
   connection.onMessage.addListener(message => {
@@ -115,8 +131,14 @@ function connect() {
     });
   });
   connection.onDisconnect.addListener(() => {
+    // Reading lastError acknowledges Chrome's native-host disconnect error.
+    void browser.runtime.lastError;
     port = null;
     setTimeout(connect, 3000);
+    if (browser.alarms) void browser.alarms.create('hyprnav-reconnect', { delayInMinutes: 1 });
   });
 }
+if (browser.alarms) browser.alarms.onAlarm.addListener(alarm => {
+  if (alarm.name === 'hyprnav-reconnect') connect();
+});
 connect();

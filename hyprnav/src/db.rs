@@ -1157,6 +1157,7 @@ mod tests {
         let path = test_db_path("browser-targets");
         let store = StateStore::new(&path).unwrap();
         let target = crate::browser::BrowserTarget {
+            browser: crate::browser::BrowserKind::Firefox,
             name: "demo".into(),
             workspace: "work".into(),
         };
@@ -1197,6 +1198,7 @@ mod tests {
             )
             .unwrap();
         let child = crate::browser::BrowserTarget {
+            browser: crate::browser::BrowserKind::Firefox,
             name: "demo".into(),
             workspace: "personal".into(),
         };

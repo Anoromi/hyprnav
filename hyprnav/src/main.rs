@@ -49,19 +49,31 @@ fn main() -> anyhow::Result<()> {
             use hyprnav::cli::TabCommand;
             use serde_json::json;
             match command {
-                TabCommand::Install => browser::install(),
-                TabCommand::NativeHost => browser::native_host(),
-                TabCommand::List => print_json(browser::request(json!({"op":"list"}))),
-                TabCommand::Open { name, url, param } => print_json(browser::request(
+                TabCommand::Install { browser, host_dir } => browser::install(browser, host_dir),
+                TabCommand::NativeHost { browser } => browser::native_host(browser),
+                TabCommand::List { browser } => {
+                    print_json(browser::request(browser, json!({"op":"list"})))
+                }
+                TabCommand::Open {
+                    browser,
+                    name,
+                    url,
+                    param,
+                } => print_json(browser::request(
+                    browser,
                     json!({"op":"open", "name":name, "url":url, "param":param}),
                 )),
-                TabCommand::Goto { name, workspace } => {
-                    print_json(browser::navigate(&browser::BrowserTarget {
-                        name,
-                        workspace,
-                    }))
-                }
+                TabCommand::Goto {
+                    browser,
+                    name,
+                    workspace,
+                } => print_json(browser::navigate(&browser::BrowserTarget {
+                    browser,
+                    name,
+                    workspace,
+                })),
                 TabCommand::Assign {
+                    browser,
                     env,
                     slot,
                     name,
@@ -71,7 +83,11 @@ fn main() -> anyhow::Result<()> {
                     print_json(send::<Value>(Request::BrowserSlotSet {
                         env,
                         slot,
-                        target: browser::BrowserTarget { name, workspace },
+                        target: browser::BrowserTarget {
+                            browser,
+                            name,
+                            workspace,
+                        },
                     }))
                 }
                 TabCommand::Clear(args) => {

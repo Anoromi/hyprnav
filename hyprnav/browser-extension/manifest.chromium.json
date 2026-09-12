@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "Hyprnav browser navigation",
+  "version": "0.2.0",
+  "description": "Navigate named tabs using one workspace query parameter.",
+  "permissions": [
+    "tabs",
+    "storage",
+    "nativeMessaging",
+    "alarms"
+  ],
+  "minimum_chrome_version": "112",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA4Cov6w+Qlv1EbkWjiOsRsh5n1/oMoWKsgc5MUlwsWcOfqB9LlSTixKAuthafLXLdVLP1rKA8mP4TcNi4NkgMrKfPw+sPDzADz+zT/Sv2OWUuKoUmIDKaNtsqZSIluIXPfnLUnv1Uc0tVMKZ+ve5v9ee6n3cK6ZTHoaNYfoF11LoYSONiGtbsMTNXWCAuhK9HVylf+W5TixJwnAYxa4IFc5bje5wsrTu1hb4VyzdgbCGXyLs64TiB3v4JrdSWurm70IQohyHI6XCSMuBwgePcpoo6wOBjvdKCNuzxE0jsITri+ihRoRjFnXXCbACt359sNf3INuHo+tqHKCfkMOMrgQIDAQAB",
+  "background": {
+    "service_worker": "background.js"
+  }
+}

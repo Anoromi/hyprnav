@@ -1,4 +1,4 @@
-//! Local Firefox/Zen native-messaging transport. No listening TCP port.
+//! Local Firefox/Chromium native-messaging transport. No listening TCP port.
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -14,14 +14,39 @@ use std::time::{Duration, Instant};
 const LIMIT: usize = 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(8);
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum BrowserKind {
+    #[default]
+    Firefox,
+    Chromium,
+}
+impl BrowserKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Firefox => "firefox",
+            Self::Chromium => "chromium",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct BrowserTarget {
+    #[serde(default)]
+    pub browser: BrowserKind,
     pub name: String,
     pub workspace: String,
 }
 
-fn socket_path() -> PathBuf {
-    crate::runtime_paths::runtime_root().join("hyprnav-browser/control.sock")
+fn socket_path(browser: BrowserKind) -> PathBuf {
+    // Keep the existing Firefox path for running hosts and saved slots.
+    let name = match browser {
+        BrowserKind::Firefox => "control.sock",
+        BrowserKind::Chromium => "chromium.sock",
+    };
+    crate::runtime_paths::runtime_root()
+        .join("hyprnav-browser")
+        .join(name)
 }
 
 fn read_frame(reader: &mut impl Read) -> Result<Value> {
@@ -47,9 +72,9 @@ fn write_frame(writer: &mut impl Write, value: &Value) -> Result<()> {
     Ok(())
 }
 
-pub fn request(value: Value) -> Result<Value> {
-    let mut stream = UnixStream::connect(socket_path()).context(
-        "browser bridge unavailable; run `hyprnav tab install` and load the Firefox/Zen extension",
+pub fn request(browser: BrowserKind, value: Value) -> Result<Value> {
+    let mut stream = UnixStream::connect(socket_path(browser)).context(
+        "browser bridge unavailable; run `hyprnav tab install` and load the matching browser extension",
     )?;
     stream.set_read_timeout(Some(TIMEOUT + Duration::from_secs(2)))?;
     stream.set_write_timeout(Some(TIMEOUT))?;
@@ -62,11 +87,14 @@ pub fn request(value: Value) -> Result<Value> {
 }
 
 pub fn navigate(target: &BrowserTarget) -> Result<Value> {
-    request(json!({"op":"goto", "name":target.name, "workspace":target.workspace}))
+    request(
+        target.browser,
+        json!({"op":"goto", "name":target.name, "workspace":target.workspace}),
+    )
 }
 
-pub fn native_host() -> Result<()> {
-    let path = socket_path();
+pub fn native_host(browser: BrowserKind) -> Result<()> {
+    let path = socket_path(browser);
     let parent = path.parent().unwrap();
     fs::create_dir_all(parent)?;
     fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
@@ -74,11 +102,14 @@ pub fn native_host() -> Result<()> {
         .create(true)
         .truncate(false)
         .write(true)
-        .open(parent.join("lock"))?;
+        .open(parent.join(match browser {
+            BrowserKind::Firefox => "lock",
+            BrowserKind::Chromium => "chromium.lock",
+        }))?;
     // Hold an exclusive lock before removing a stale socket. A second browser
     // profile must never steal the active profile's connection.
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        bail!("another browser profile owns the hyprnav bridge");
+        bail!("another profile of this browser family owns the hyprnav bridge");
     }
     if path.exists() {
         fs::remove_file(&path)?;
@@ -135,9 +166,15 @@ pub fn native_host() -> Result<()> {
     Ok(())
 }
 
-pub fn install() -> Result<()> {
+pub fn install(browser: BrowserKind, host_dir: Option<PathBuf>) -> Result<()> {
     let home = PathBuf::from(std::env::var_os("HOME").context("HOME is unset")?);
-    let directory = home.join(".mozilla/native-messaging-hosts");
+    let directory = host_dir.unwrap_or_else(|| match browser {
+        BrowserKind::Firefox => home.join(".mozilla/native-messaging-hosts"),
+        BrowserKind::Chromium => std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".config"))
+            .join("chromium/NativeMessagingHosts"),
+    });
     fs::create_dir_all(&directory)?;
     let launcher = directory.join("hyprnav-browser");
     // Follow the user's local wrapper so dev builds remain authoritative.
@@ -155,19 +192,32 @@ pub fn install() -> Result<()> {
     fs::write(
         &launcher,
         format!(
-            "#!/bin/sh\nexec {} tab native-host\n",
-            shell_escape::escape(wrapper.to_string_lossy())
+            "#!/bin/sh\nexec {} tab native-host --browser {}\n",
+            shell_escape::escape(wrapper.to_string_lossy()),
+            browser.as_str()
         ),
     )?;
     fs::set_permissions(&launcher, fs::Permissions::from_mode(0o700))?;
     let manifest = directory.join("hyprnav_browser.json");
-    fs::write(
-        &manifest,
-        serde_json::to_vec_pretty(&json!({
-            "name":"hyprnav_browser", "description":"Hyprnav browser navigation",
-            "path":launcher, "type":"stdio", "allowed_extensions":["hyprnav@anoromi.local"]
-        }))?,
-    )?;
+    let mut registration = json!({
+        "name":"hyprnav_browser", "description":"Hyprnav browser navigation", "path":launcher, "type":"stdio"
+    });
+    match browser {
+        BrowserKind::Firefox => {
+            registration["allowed_extensions"] = json!(["hyprnav@anoromi.local"])
+        }
+        BrowserKind::Chromium => {
+            registration["allowed_origins"] = json!([format!(
+                "chrome-extension://{}/",
+                include_str!("../browser-extension/chromium-id").trim()
+            )])
+        }
+    }
+    // Atomically replace an existing manual file or Nix-managed symlink, never
+    // follow a symlink into the immutable store when installing for development.
+    let temporary = directory.join(format!(".hyprnav_browser.{}.json", std::process::id()));
+    fs::write(&temporary, serde_json::to_vec_pretty(&registration)?)?;
+    fs::rename(&temporary, &manifest)?;
     println!("Installed {}", manifest.display());
     Ok(())
 }
@@ -175,6 +225,20 @@ pub fn install() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn legacy_targets_default_to_firefox_and_chromium_is_preserved() {
+        let legacy: BrowserTarget =
+            serde_json::from_value(json!({"name":"app","workspace":"work"})).unwrap();
+        assert_eq!(legacy.browser, BrowserKind::Firefox);
+        let chrome: BrowserTarget =
+            serde_json::from_value(json!({"browser":"chromium","name":"app","workspace":"work"}))
+                .unwrap();
+        assert_eq!(serde_json::to_value(chrome).unwrap()["browser"], "chromium");
+        assert_ne!(
+            socket_path(BrowserKind::Firefox),
+            socket_path(BrowserKind::Chromium)
+        );
+    }
     #[test]
     fn frames_round_trip_unicode_and_reject_oversized_input() {
         let value = json!({"workspace":"日本語 & ?=#"});

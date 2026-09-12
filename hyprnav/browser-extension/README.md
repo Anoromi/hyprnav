@@ -1,18 +1,20 @@
 # Browser navigation
 
-Firefox/Zen extension + `hyprnav tab` native host. A named tab can be used by
+Firefox/Zen and Chromium extensions + `hyprnav tab` native host. A named tab can be used by
 several environment slots, each with a different `workspace` query value.
 
 ## Nix integration
 
 The flake exports `packages.<system>.hyprnav-browser-extension`, containing
-`share/hyprnav/hyprnav.xpi`. It can also be built with
+`share/hyprnav/hyprnav.xpi` and the unpacked MV3 extension at
+`share/hyprnav/chromium`. It can also be built with
 `pkgs.callPackage "${inputs.hyprnav}/hyprnav/browser-extension" {}` using the
 system's nixpkgs.
 
 The local `/etc/nixos/anoromi/vicinae-browser.nix` installs this XPI through
 Zen's existing extension policies and registers `hyprnav_browser` as a native
-host. Its launcher calls the existing profile's `hyprnav` wrapper, preserving
+host. It also loads the Chromium extension and registers its native host.
+Its launcher calls the existing profile's `hyprnav` wrapper, preserving
 local dev builds. After `nixos-rebuild switch` and restarting Zen, manual
 `tab install` and temporary add-on loading are unnecessary. This uses the
 unsigned-extension setting already configured for Vicinae.
@@ -28,12 +30,19 @@ unsigned-extension setting already configured for Vicinae.
 The development extension must be loaded again after restarting the browser.
 A permanent distribution needs a signed Firefox extension. The native host
 registration follows the existing local `hyprnav` wrapper across dev builds.
-Only one browser profile can own the bridge at a time. Private tabs are excluded.
+Firefox and Chromium have separate bridges and can run simultaneously.
+Only one profile per browser family can own its bridge at a time. Private tabs are excluded.
 
 Demo: https://interactions-33e667f674b8cc14518350eea9255a5d.anoromi.com/?space=hyprnav-browser-demo
 
 Demo source:
 `/home/anoromi/code/experiments/interaction-platform/spaces/hyprnav-browser-demo/`
+
+For Chromium, run `hyprnav tab install --browser chromium`, enable developer
+mode at `chrome://extensions`, and load the build's `share/hyprnav/chromium`
+directory using **Load unpacked**. For derivatives or a custom profile directory,
+use `tab install --browser chromium --host-dir /path/to/NativeMessagingHosts`.
+Firefox derivatives use the Firefox manifest and native host registration.
 
 ## Commands
 
@@ -49,6 +58,12 @@ hyprnav goto --env project --slot 1
 hyprnav slot resolve --env project --slot 1
 hyprnav tab clear --env project --slot 1
 ```
+
+Add `--browser chromium` to `tab open`, `tab goto`, `tab list`, and `tab assign`
+to select Chromium. `--browser firefox` is the default, including for existing
+saved slots. Assignment saves the browser family with the target, so normal
+`hyprnav goto --env … --slot …` chooses the correct browser automatically.
+The same tab name can exist independently in both browsers.
 
 `tab open --param <name>` selects a different query parameter, default `workspace`.
 It adopts one matching tab or creates a tab. Names are stored with browser

@@ -67,7 +67,7 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Control named Firefox/Zen tabs and their workspace query parameter.
+    /// Control named Firefox and Chromium tabs and their workspace query parameter.
     #[command(subcommand)]
     Tab(TabCommand),
     #[command(
@@ -506,14 +506,28 @@ pub fn parse_args() -> Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum TabCommand {
-    /// Install the native messaging host for Firefox/Zen.
-    Install,
+    /// Register the native host for a browser family.
+    Install {
+        #[arg(long, value_enum, default_value = "firefox")]
+        browser: crate::browser::BrowserKind,
+        /// Override the native host directory for a Chromium/Firefox derivative.
+        #[arg(long)]
+        host_dir: Option<std::path::PathBuf>,
+    },
     #[command(hide = true)]
-    NativeHost,
-    /// List named tabs managed by the extension.
-    List,
+    NativeHost {
+        #[arg(long, value_enum, default_value = "firefox")]
+        browser: crate::browser::BrowserKind,
+    },
+    /// List named tabs in the selected browser family.
+    List {
+        #[arg(long, value_enum, default_value = "firefox")]
+        browser: crate::browser::BrowserKind,
+    },
     /// Name an existing matching tab, or open it if absent.
     Open {
+        #[arg(long, value_enum, default_value = "firefox")]
+        browser: crate::browser::BrowserKind,
         #[arg(long)]
         name: String,
         #[arg(long)]
@@ -523,6 +537,8 @@ pub enum TabCommand {
     },
     /// Focus a named tab and change only its workspace query parameter.
     Goto {
+        #[arg(long, value_enum, default_value = "firefox")]
+        browser: crate::browser::BrowserKind,
         #[arg(long)]
         name: String,
         #[arg(long)]
@@ -530,6 +546,8 @@ pub enum TabCommand {
     },
     /// Attach browser navigation to an existing local environment slot.
     Assign {
+        #[arg(long, value_enum, default_value = "firefox")]
+        browser: crate::browser::BrowserKind,
         #[arg(long)]
         env: Option<String>,
         #[arg(long)]

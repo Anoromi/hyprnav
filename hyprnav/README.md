@@ -434,6 +434,6 @@ The main external integration files are:
 
 ## Browser workspace navigation
 
-`hyprnav tab` connects Firefox/Zen tabs to environment slots. Different slots
+`hyprnav tab` connects Firefox/Zen and Chromium tabs to environment slots. Different slots
 can reuse one named tab and change only its `workspace` query parameter.
 See [browser setup and demo](browser-extension/README.md).
