@@ -508,9 +508,16 @@ impl qobject::Controller {
                     return;
                 }
 
-                if let Err(error) = self.as_ref().send_request::<serde_json::Value>(
-                    Request::WorkspaceGotoPhysical { workspace_id },
-                ) {
+                let item = &self.rust().items[self.rust().current_index.max(0) as usize];
+                let request = if item.environment_id.is_empty() {
+                    Request::WorkspaceGotoPhysical { workspace_id }
+                } else {
+                    Request::WorkspaceGoto {
+                        env: Some(item.environment_id.clone()),
+                        slot: item.slot_index,
+                    }
+                };
+                if let Err(error) = self.as_ref().send_request::<serde_json::Value>(request) {
                     warn!("failed to activate workspace {workspace_id}: {error}");
                     return;
                 }
@@ -720,7 +727,7 @@ impl qobject::Controller {
     fn apply_switcher_snapshot(
         mut self: Pin<&mut Self>,
         snapshot: SwitcherSnapshot,
-        preferred_workspace_id: Option<i32>,
+        preferred_workspace_id: Option<(i32, String, i32)>,
     ) {
         let items = snapshot
             .items
@@ -728,10 +735,16 @@ impl qobject::Controller {
             .map(item_from_switcher_snapshot)
             .collect::<Vec<_>>();
         let current_index = preferred_workspace_id
-            .and_then(|workspace_id| {
+            .and_then(|key| {
                 items
                     .iter()
-                    .position(|item| item.workspace_id == workspace_id)
+                    .position(|item| {
+                        (
+                            item.workspace_id,
+                            item.environment_id.clone(),
+                            item.slot_index,
+                        ) == key
+                    })
                     .map(|index| index as i32)
             })
             .unwrap_or_else(|| normalize_index(snapshot.initial_index, items.len()));
@@ -957,7 +970,7 @@ impl qobject::Controller {
             .unwrap_or(-1)
     }
 
-    fn current_switcher_selection_workspace_id(&self) -> Option<i32> {
+    fn current_switcher_selection_workspace_id(&self) -> Option<(i32, String, i32)> {
         if self.rust().mode != UiMode::Switcher {
             return None;
         }
@@ -965,7 +978,13 @@ impl qobject::Controller {
         self.rust()
             .items
             .get(self.rust().current_index.max(0) as usize)
-            .map(|item| item.workspace_id)
+            .map(|item| {
+                (
+                    item.workspace_id,
+                    item.environment_id.clone(),
+                    item.slot_index,
+                )
+            })
     }
 
     fn current_grid_selection_key(&self) -> Option<GridSelectionKey> {
@@ -1028,6 +1047,7 @@ impl ControllerRust {
 fn item_from_switcher_snapshot(item: WorkspaceCardSnapshot) -> UiItem {
     UiItem {
         workspace_id: item.workspace_id,
+        environment_id: item.environment_id.unwrap_or_default(),
         slot_index: item.slot_index,
         workspace_name: item.workspace_name,
         subtitle: item.subtitle,
@@ -1069,10 +1089,11 @@ fn build_row_indices(items: &[UiItem]) -> Vec<Vec<usize>> {
 
 fn switcher_snapshot_is_structural_match(current: &[UiItem], next: &[UiItem]) -> bool {
     current.len() == next.len()
-        && current
-            .iter()
-            .zip(next.iter())
-            .all(|(left, right)| left.workspace_id == right.workspace_id)
+        && current.iter().zip(next.iter()).all(|(left, right)| {
+            left.workspace_id == right.workspace_id
+                && left.environment_id == right.environment_id
+                && left.slot_index == right.slot_index
+        })
 }
 
 fn grid_snapshot_is_structural_match(current: &[UiItem], next: &[UiItem]) -> bool {
@@ -1206,6 +1227,29 @@ mod tests {
         switcher_snapshot_is_structural_match, uses_resident_grid_window, volatile_item_eq,
         GridCellSnapshot, UiItem, UiMode,
     };
+
+    #[test]
+    fn browser_slots_on_one_workspace_have_distinct_switcher_identities() {
+        let one = UiItem {
+            workspace_id: 3,
+            environment_id: "demo".into(),
+            slot_index: 1,
+            ..UiItem::default()
+        };
+        let two = UiItem {
+            slot_index: 2,
+            ..one.clone()
+        };
+        assert!(!switcher_snapshot_is_structural_match(
+            &[one.clone()],
+            &[two]
+        ));
+        let physical = UiItem {
+            environment_id: String::new(),
+            ..one.clone()
+        };
+        assert!(!switcher_snapshot_is_structural_match(&[one], &[physical]));
+    }
 
     #[test]
     fn uses_resident_window_only_for_resident_grid() {

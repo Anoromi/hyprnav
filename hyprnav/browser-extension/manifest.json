@@ -1,0 +1,28 @@
+{
+  "manifest_version": 2,
+  "name": "Hyprnav browser navigation",
+  "version": "0.1.0",
+  "description": "Navigate named tabs using one workspace query parameter.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "hyprnav@anoromi.local",
+      "data_collection_permissions": {
+        "required": [
+          "none"
+        ]
+      }
+    }
+  },
+  "permissions": [
+    "tabs",
+    "storage",
+    "sessions",
+    "nativeMessaging"
+  ],
+  "background": {
+    "scripts": [
+      "url.js",
+      "background.js"
+    ]
+  }
+}

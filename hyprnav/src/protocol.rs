@@ -6,6 +6,9 @@ use std::path::Path;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct WorkspaceCardSnapshot {
+    /// Present for a browser slot; activation uses env/slot instead of a raw workspace.
+    #[serde(default)]
+    pub environment_id: Option<String>,
     pub workspace_id: i32,
     pub slot_index: i32,
     pub workspace_name: String,
@@ -221,6 +224,15 @@ pub struct BatchMutationResponse {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Request {
+    BrowserSlotSet {
+        env: Option<String>,
+        slot: i32,
+        target: crate::browser::BrowserTarget,
+    },
+    BrowserSlotClear {
+        env: Option<String>,
+        slot: i32,
+    },
     Ping,
     StatusGet {
         cwd: Option<String>,

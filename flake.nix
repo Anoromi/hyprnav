@@ -27,6 +27,7 @@
       });
   in {
     packages = eachSystem (system: {
+      hyprnav-browser-extension = pkgsFor.${system}.hyprnav-browser-extension;
       hyprnav = pkgsFor.${system}.hyprnav;
       hyprnav-plugin = pkgsFor.${system}.hyprlandPlugins.hyprnav-plugin;
       default = self.packages.${system}.hyprnav;
@@ -39,6 +40,7 @@
         inherit (final) callPackage;
       in {
         hyprnav = callPackage ./hyprnav {};
+        hyprnav-browser-extension = callPackage ./hyprnav/browser-extension {};
         hyprlandPlugins =
           (prev.hyprlandPlugins or {})
           // {

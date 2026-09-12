@@ -75,6 +75,8 @@ rustPlatform.buildRustPackage {
   '';
 
   postInstall = ''
+    mkdir -p $out/share/hyprnav
+    cp -r browser-extension $out/share/hyprnav/browser-extension
     mkdir -p $out/share/applications
     install -m 0644 ${./hyprnav.desktop} $out/share/applications/hyprnav.desktop
   '';

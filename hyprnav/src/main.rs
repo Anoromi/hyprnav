@@ -38,11 +38,51 @@ fn main() -> anyhow::Result<()> {
 
     let _ = tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
         .without_time()
         .try_init();
 
     let cli = parse_args();
     match cli.command.unwrap_or(Command::Daemon) {
+        Command::Tab(command) => {
+            use hyprnav::browser;
+            use hyprnav::cli::TabCommand;
+            use serde_json::json;
+            match command {
+                TabCommand::Install => browser::install(),
+                TabCommand::NativeHost => browser::native_host(),
+                TabCommand::List => print_json(browser::request(json!({"op":"list"}))),
+                TabCommand::Open { name, url, param } => print_json(browser::request(
+                    json!({"op":"open", "name":name, "url":url, "param":param}),
+                )),
+                TabCommand::Goto { name, workspace } => {
+                    print_json(browser::navigate(&browser::BrowserTarget {
+                        name,
+                        workspace,
+                    }))
+                }
+                TabCommand::Assign {
+                    env,
+                    slot,
+                    name,
+                    workspace,
+                } => {
+                    ensure_server_running()?;
+                    print_json(send::<Value>(Request::BrowserSlotSet {
+                        env,
+                        slot,
+                        target: browser::BrowserTarget { name, workspace },
+                    }))
+                }
+                TabCommand::Clear(args) => {
+                    ensure_server_running()?;
+                    print_json(send::<Value>(Request::BrowserSlotClear {
+                        env: args.env,
+                        slot: args.slot,
+                    }))
+                }
+            }
+        }
         Command::Daemon => {
             if server_running() {
                 return Ok(());

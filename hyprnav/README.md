@@ -431,3 +431,9 @@ The main external integration files are:
 
 - `/etc/nixos/anoromi/hyprland.nix`
 - `/etc/nixos/anoromi/config/hypr/hyprland.conf`
+
+## Browser workspace navigation
+
+`hyprnav tab` connects Firefox/Zen tabs to environment slots. Different slots
+can reuse one named tab and change only its `workspace` query parameter.
+See [browser setup and demo](browser-extension/README.md).

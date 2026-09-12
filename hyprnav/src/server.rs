@@ -494,12 +494,29 @@ fn try_handle_request(runtime: &Arc<ServerRuntime>, request: Request) -> Result<
                 .ok_or_else(|| {
                     anyhow!("slot {slot} is not assigned for environment {resolved_env}")
                 })?;
-            Ok(serde_json::to_value(slot_resolution_from_record(record))?)
+            let mut result = serde_json::to_value(slot_resolution_from_record(record))?;
+            result["browser_target"] =
+                serde_json::to_value(runtime.store.browser_target(&resolved_env, slot)?)?;
+            Ok(result)
         }
         Request::LockSet { env } => {
             apply_mutation_request(runtime, BatchMutationRequest::LockSet { env })
         }
         Request::LockClear => apply_mutation_request(runtime, BatchMutationRequest::LockClear),
+        Request::BrowserSlotSet { env, slot, target } => {
+            ensure_positive_slot(slot)?;
+            let env = resolve_required_environment(env.as_deref(), &runtime.store)?;
+            runtime
+                .store
+                .set_browser_target(&env, slot, Some(&target))?;
+            Ok(json!({"environment_id":env, "slot_index":slot, "browser_target":target}))
+        }
+        Request::BrowserSlotClear { env, slot } => {
+            ensure_positive_slot(slot)?;
+            let env = resolve_required_environment(env.as_deref(), &runtime.store)?;
+            runtime.store.set_browser_target(&env, slot, None)?;
+            Ok(json!({"environment_id":env, "slot_index":slot}))
+        }
         Request::WorkspaceGoto { env, slot } => {
             ensure_positive_slot(slot)?;
             let resolved_env = resolve_required_environment(env.as_deref(), &runtime.store)?;
@@ -1193,19 +1210,46 @@ fn build_switcher_snapshot(runtime: &ServerRuntime, reverse: bool) -> Result<Swi
         ),
     );
 
+    let mut items: Vec<WorkspaceCardSnapshot> = descriptors
+        .into_iter()
+        .map(|item| WorkspaceCardSnapshot {
+            environment_id: None,
+            workspace_id: item.workspace_id,
+            slot_index: item.slot_index,
+            workspace_name: item.workspace_name,
+            subtitle: item.subtitle,
+            app_class: item.app_class,
+            window_count: item.window_count,
+            active: item.active,
+        })
+        .collect();
+    // Browser slots share a physical workspace but retain separate env/slot identities.
+    for cell in build_grid_snapshot(runtime, None)?.items {
+        if runtime
+            .store
+            .browser_target(&cell.environment_id, cell.slot_index)?
+            .is_none()
+        {
+            continue;
+        }
+        items.push(WorkspaceCardSnapshot {
+            environment_id: Some(cell.environment_id),
+            workspace_id: cell.physical_workspace_id,
+            slot_index: cell.slot_index,
+            workspace_name: cell.workspace_name,
+            subtitle: cell.subtitle,
+            app_class: cell.app_class,
+            window_count: 1,
+            active: false,
+        });
+    }
+    let initial_index = if reverse && !items.is_empty() {
+        items.len() as i32 - 1
+    } else {
+        initial_index
+    };
     Ok(SwitcherSnapshot {
-        items: descriptors
-            .into_iter()
-            .map(|item| WorkspaceCardSnapshot {
-                workspace_id: item.workspace_id,
-                slot_index: item.slot_index,
-                workspace_name: item.workspace_name,
-                subtitle: item.subtitle,
-                app_class: item.app_class,
-                window_count: item.window_count,
-                active: item.active,
-            })
-            .collect(),
+        items,
         initial_index,
     })
 }
@@ -1310,6 +1354,19 @@ fn attempt_slot_launch(
     runtime: &ServerRuntime,
     record: &crate::db::SlotResolutionRecord,
 ) -> Result<NavigationLaunchResult> {
+    if let Some(target) = runtime
+        .store
+        .browser_target(&record.environment_id, record.slot_index)?
+    {
+        // Navigation runs on every visit, including when the browser already exists.
+        crate::browser::navigate(&target)?;
+        return Ok(NavigationLaunchResult {
+            configured: true,
+            attempted: true,
+            skipped_reason: None,
+            error: None,
+        });
+    }
     let Some(argv) = record.launch_argv.as_ref() else {
         return Ok(skipped_launch(
             NavigationLaunchSkippedReason::NoLaunchConfigured,
@@ -1559,7 +1616,10 @@ fn build_grid_snapshot(runtime: &ServerRuntime, cwd: Option<&str>) -> Result<Gri
 
             let workspace_id = record.workspace_id;
             let card = cards_by_workspace.get(&workspace_id);
-            let active = workspace_id == current_workspace_id;
+            let browser_target = runtime
+                .store
+                .browser_target(&environment.env_id, record.slot_index)?;
+            let active = workspace_id == current_workspace_id && browser_target.is_none();
 
             row_items.push(GridCellSnapshot {
                 environment_id: environment.env_id.clone(),
@@ -1572,9 +1632,19 @@ fn build_grid_snapshot(runtime: &ServerRuntime, cwd: Option<&str>) -> Result<Gri
                 physical_workspace_id: workspace_id,
                 binding_kind: record.binding_kind.as_str().to_owned(),
                 inherited: record.binding_environment_id != environment.env_id,
-                workspace_name: workspace_display_label(card, &record, workspace_id),
-                subtitle: card
-                    .map(|item| item.subtitle.clone())
+                workspace_name: browser_target
+                    .as_ref()
+                    .map(|target| {
+                        record
+                            .display_name
+                            .clone()
+                            .unwrap_or_else(|| target.workspace.clone())
+                    })
+                    .unwrap_or_else(|| workspace_display_label(card, &record, workspace_id)),
+                subtitle: browser_target
+                    .as_ref()
+                    .map(|target| format!("{} · {}", target.name, target.workspace))
+                    .or_else(|| card.map(|item| item.subtitle.clone()))
                     .unwrap_or_else(|| format!("Workspace {}", workspace_id)),
                 app_class: card.map(|item| item.app_class.clone()).unwrap_or_default(),
                 window_count: card.map(|item| item.window_count).unwrap_or(0),
@@ -2134,6 +2204,7 @@ mod tests {
 
     fn card(workspace_id: i32, subtitle: &str, active: bool) -> WorkspaceCardSnapshot {
         WorkspaceCardSnapshot {
+            environment_id: None,
             workspace_id,
             slot_index: 0,
             workspace_name: workspace_id.to_string(),

@@ -311,6 +311,59 @@ impl StateStore {
         }
     }
 
+    pub fn set_browser_target(
+        &self,
+        env: &str,
+        slot: i32,
+        target: Option<&crate::browser::BrowserTarget>,
+    ) -> Result<()> {
+        self.with_transaction(|connection| {
+            if let Some(target) = target {
+                if target.name.trim().is_empty() || target.workspace.is_empty() {
+                    return Err(anyhow!("tab name and workspace must not be empty"));
+                }
+                if self.get_local_slot_with_connection(connection, env, slot)?.is_none() {
+                    return Err(anyhow!("assign a local slot before attaching a browser target"));
+                }
+                connection.execute("INSERT INTO browser_targets VALUES (?1, ?2, ?3)
+                    ON CONFLICT(env_id, slot_index) DO UPDATE SET target_json = excluded.target_json",
+                    params![env, slot, serde_json::to_string(target)?])?;
+            } else {
+                connection.execute("DELETE FROM browser_targets WHERE env_id = ?1 AND slot_index = ?2", params![env, slot])?;
+            }
+            Ok(())
+        })
+    }
+
+    pub fn browser_target(
+        &self,
+        env: &str,
+        slot: i32,
+    ) -> Result<Option<crate::browser::BrowserTarget>> {
+        let connection = self.open()?;
+        for ancestor in environment_chain(env) {
+            let target: Option<String> = connection
+                .query_row(
+                    "SELECT target_json FROM browser_targets WHERE env_id = ?1 AND slot_index = ?2",
+                    params![ancestor, slot],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(target) = target {
+                return Ok(Some(serde_json::from_str(&target)?));
+            }
+            // A concrete child slot stops inheritance, just like workspace resolution.
+            if let Some(binding) =
+                self.get_local_slot_with_connection(&connection, &ancestor, slot)?
+            {
+                if binding.binding_kind.is_concrete() {
+                    break;
+                }
+            }
+        }
+        Ok(None)
+    }
+
     fn init(&self) -> Result<()> {
         let connection = self.open()?;
         connection.execute_batch(
@@ -357,6 +410,11 @@ impl StateStore {
         )?;
         migrate_environments_schema(&connection)?;
         migrate_slot_bindings_schema(&connection)?;
+        connection.execute_batch("CREATE TABLE IF NOT EXISTS browser_targets (
+            env_id TEXT NOT NULL, slot_index INTEGER NOT NULL, target_json TEXT NOT NULL,
+            PRIMARY KEY(env_id, slot_index));
+            CREATE TRIGGER IF NOT EXISTS clear_browser_target AFTER DELETE ON slot_bindings
+            BEGIN DELETE FROM browser_targets WHERE env_id = OLD.env_id AND slot_index = OLD.slot_index; END;")?;
         Ok(())
     }
 
@@ -1092,6 +1150,95 @@ mod tests {
 
     fn fixed(workspace_id: i32) -> SlotAssignmentMode {
         SlotAssignmentMode::Fixed { workspace_id }
+    }
+
+    #[test]
+    fn browser_targets_inherit_override_and_follow_slot_lifetime() {
+        let path = test_db_path("browser-targets");
+        let store = StateStore::new(&path).unwrap();
+        let target = crate::browser::BrowserTarget {
+            name: "demo".into(),
+            workspace: "work".into(),
+        };
+        assert!(store.set_browser_target("demo", 1, Some(&target)).is_err());
+        store
+            .assign_slot(
+                "demo",
+                1,
+                &SlotAssignmentMode::Fixed { workspace_id: 3 },
+                "demo",
+                None,
+                None,
+                &HashSet::new(),
+                None,
+                None,
+            )
+            .unwrap();
+        store.set_browser_target("demo", 1, Some(&target)).unwrap();
+        assert_eq!(
+            store
+                .browser_target("demo.child", 1)
+                .unwrap()
+                .unwrap()
+                .workspace,
+            "work"
+        );
+        store
+            .assign_slot(
+                "demo.child",
+                1,
+                &SlotAssignmentMode::Inherit,
+                "demo.child",
+                None,
+                None,
+                &HashSet::new(),
+                None,
+                None,
+            )
+            .unwrap();
+        let child = crate::browser::BrowserTarget {
+            name: "demo".into(),
+            workspace: "personal".into(),
+        };
+        store
+            .set_browser_target("demo.child", 1, Some(&child))
+            .unwrap();
+        assert_eq!(
+            store
+                .browser_target("demo.child", 1)
+                .unwrap()
+                .unwrap()
+                .workspace,
+            "personal"
+        );
+        store.set_browser_target("demo.child", 1, None).unwrap();
+        assert_eq!(
+            store
+                .browser_target("demo.child", 1)
+                .unwrap()
+                .unwrap()
+                .workspace,
+            "work"
+        );
+        store
+            .assign_slot(
+                "demo.child",
+                1,
+                &SlotAssignmentMode::Fixed { workspace_id: 4 },
+                "demo.child",
+                None,
+                None,
+                &HashSet::new(),
+                None,
+                None,
+            )
+            .unwrap();
+        assert!(store.browser_target("demo.child", 1).unwrap().is_none());
+        store
+            .with_transaction(|connection| store.clear_slot_with_connection(connection, "demo", 1))
+            .unwrap();
+        assert!(store.browser_target("demo", 1).unwrap().is_none());
+        cleanup(&path);
     }
 
     #[test]

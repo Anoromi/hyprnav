@@ -67,6 +67,9 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Control named Firefox/Zen tabs and their workspace query parameter.
+    #[command(subcommand)]
+    Tab(TabCommand),
     #[command(
         about = "Run the persistent headless server.",
         long_about = "Run the persistent headless server.\n\nThis process owns environment state, the control socket, and runtime spawn operations. In the local Hyprland workflow it is typically started once per session."
@@ -499,4 +502,43 @@ pub fn parse_args() -> Cli {
     } else {
         cli
     }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TabCommand {
+    /// Install the native messaging host for Firefox/Zen.
+    Install,
+    #[command(hide = true)]
+    NativeHost,
+    /// List named tabs managed by the extension.
+    List,
+    /// Name an existing matching tab, or open it if absent.
+    Open {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        url: String,
+        #[arg(long, default_value = "workspace")]
+        param: String,
+    },
+    /// Focus a named tab and change only its workspace query parameter.
+    Goto {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        workspace: String,
+    },
+    /// Attach browser navigation to an existing local environment slot.
+    Assign {
+        #[arg(long)]
+        env: Option<String>,
+        #[arg(long)]
+        slot: i32,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        workspace: String,
+    },
+    /// Remove a slot's browser navigation target.
+    Clear(ResolveArgs),
 }
