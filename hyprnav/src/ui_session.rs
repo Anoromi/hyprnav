@@ -1,4 +1,4 @@
-use crate::runtime_paths::{ensure_parent_dir, resolve_runtime_paths};
+use crate::runtime_paths::{append_switch_log, ensure_parent_dir, resolve_runtime_paths};
 use anyhow::{Context, Result};
 use crossbeam_channel::{unbounded, Receiver};
 use std::fs;
@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::thread::JoinHandle;
 use std::time::Duration;
+use tracing::{debug, warn};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UiSessionCommand {
@@ -28,6 +29,15 @@ pub enum GridUiCommand {
 
 static SWITCHER_COMMAND_RX: OnceLock<Mutex<Receiver<UiSessionCommand>>> = OnceLock::new();
 static GRID_COMMAND_RX: OnceLock<Mutex<Receiver<GridUiCommand>>> = OnceLock::new();
+
+pub fn switcher_command_name(command: UiSessionCommand) -> &'static str {
+    match command {
+        UiSessionCommand::StepForward => "step_forward",
+        UiSessionCommand::StepReverse => "step_reverse",
+        UiSessionCommand::Activate => "activate",
+        UiSessionCommand::Cancel => "cancel",
+    }
+}
 
 pub struct UiSessionHandle {
     stop: Arc<AtomicBool>,
@@ -63,6 +73,11 @@ pub fn drain_switcher_session_commands() -> Vec<UiSessionCommand> {
     let mut commands = Vec::new();
     while let Ok(command) = receiver.try_recv() {
         commands.push(command);
+    }
+
+    if !commands.is_empty() {
+        debug!(count = commands.len(), "drained switcher session commands");
+        append_switch_log("socket.switcher.drain", format!("count={}", commands.len()));
     }
 
     commands
@@ -117,12 +132,46 @@ fn send_switcher_command(command: UiSessionCommand) -> Result<bool> {
         UiSessionCommand::Activate => "ACTIVATE\n",
         UiSessionCommand::Cancel => "CANCEL\n",
     };
-    send_switcher_command_line(line)
+    let paths = resolve_runtime_paths();
+    let result = send_command_line_to_socket(&paths.switcher_socket_path, line);
+    let success = result.is_ok();
+    debug!(
+        command = switcher_command_name(command),
+        path = %paths.switcher_socket_path.display(),
+        success,
+        "sent switcher session command"
+    );
+    append_switch_log(
+        "socket.switcher.send",
+        format!(
+            "command={} path={} success={success}",
+            switcher_command_name(command),
+            paths.switcher_socket_path.display()
+        ),
+    );
+    Ok(success)
 }
 
 fn send_switcher_command_line(line: &str) -> Result<bool> {
     let paths = resolve_runtime_paths();
-    Ok(send_command_line_to_socket(&paths.switcher_socket_path, line).is_ok())
+    let command = line.trim();
+    let result = send_command_line_to_socket(&paths.switcher_socket_path, line);
+    let success = result.is_ok();
+    debug!(
+        command,
+        path = %paths.switcher_socket_path.display(),
+        success,
+        "sent switcher session line"
+    );
+    append_switch_log(
+        "socket.switcher.send",
+        format!(
+            "command={} path={} success={success}",
+            command,
+            paths.switcher_socket_path.display()
+        ),
+    );
+    Ok(success)
 }
 
 pub fn send_grid_open_command() -> Result<bool> {
@@ -149,6 +198,11 @@ fn start_switcher_session_listener_at(socket_path: &Path) -> Result<UiSessionHan
     let listener = UnixListener::bind(socket_path)
         .with_context(|| format!("binding {}", socket_path.display()))?;
     listener.set_nonblocking(true)?;
+    debug!(path = %socket_path.display(), "bound switcher session listener");
+    append_switch_log(
+        "socket.switcher.listen",
+        format!("path={}", socket_path.display()),
+    );
 
     let (sender, receiver) = unbounded();
     let _ = SWITCHER_COMMAND_RX.set(Mutex::new(receiver));
@@ -160,12 +214,19 @@ fn start_switcher_session_listener_at(socket_path: &Path) -> Result<UiSessionHan
         while !stop_thread.load(Ordering::Relaxed) {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    let _ = handle_session_client(stream, &sender);
+                    debug!("accepted switcher session client");
+                    append_switch_log("socket.switcher.accept", "");
+                    if let Err(error) = handle_session_client(stream, &sender) {
+                        warn!("failed to handle switcher session client: {error}");
+                        append_switch_log("socket.switcher.client_error", format!("error={error}"));
+                    }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                     thread::sleep(Duration::from_millis(25));
                 }
                 Err(_) => {
+                    warn!("failed to accept switcher session client");
+                    append_switch_log("socket.switcher.accept_error", "");
                     thread::sleep(Duration::from_millis(100));
                 }
             }
@@ -230,6 +291,8 @@ fn handle_session_client(
         "CANCEL" => Some(UiSessionCommand::Cancel),
         "PING" => None,
         other => {
+            warn!(command = other, "unknown switcher session command");
+            append_switch_log("socket.switcher.unknown", format!("command={other}"));
             stream.write_all(format!("ERROR unknown command: {other}\n").as_bytes())?;
             stream.flush()?;
             return Ok(());
@@ -237,7 +300,18 @@ fn handle_session_client(
     };
 
     if let Some(command) = command {
+        debug!(
+            command = switcher_command_name(command),
+            "received switcher command"
+        );
+        append_switch_log(
+            "socket.switcher.receive",
+            format!("command={}", switcher_command_name(command)),
+        );
         let _ = sender.send(command);
+    } else {
+        debug!("received switcher ping");
+        append_switch_log("socket.switcher.receive", "command=ping");
     }
 
     stream.write_all(b"OK\n")?;
@@ -324,6 +398,23 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    #[test]
+    fn switcher_command_names_are_stable() {
+        assert_eq!(
+            switcher_command_name(UiSessionCommand::StepForward),
+            "step_forward"
+        );
+        assert_eq!(
+            switcher_command_name(UiSessionCommand::StepReverse),
+            "step_reverse"
+        );
+        assert_eq!(
+            switcher_command_name(UiSessionCommand::Activate),
+            "activate"
+        );
+        assert_eq!(switcher_command_name(UiSessionCommand::Cancel), "cancel");
     }
 
     #[test]

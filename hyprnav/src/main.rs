@@ -12,7 +12,7 @@ use hyprnav::protocol::{
     send_request, BatchMutationPayload, Request, SlotAssignmentMode, SpawnPrepared, SpawnStarted,
     StatusSnapshot,
 };
-use hyprnav::runtime_paths::resolve_runtime_paths;
+use hyprnav::runtime_paths::{append_switch_log, resolve_runtime_paths};
 use hyprnav::server::run_server;
 use hyprnav::spawn::{current_pid, exec_command};
 use hyprnav::ui_session::{
@@ -28,6 +28,7 @@ use std::process::Command as ProcessCommand;
 use std::process::ExitStatus;
 use std::thread;
 use std::time::Duration;
+use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 fn main() -> anyhow::Result<()> {
@@ -100,6 +101,8 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Command::Daemon => {
+            info!("hyprnav command entry: daemon");
+            append_switch_log("cli.command", "name=daemon");
             if server_running() {
                 return Ok(());
             }
@@ -107,6 +110,11 @@ fn main() -> anyhow::Result<()> {
             run_server()
         }
         Command::Trigger(args) => {
+            info!(reverse = args.reverse, "hyprnav command entry: trigger");
+            append_switch_log(
+                "cli.command",
+                format!("name=trigger reverse={}", args.reverse),
+            );
             ensure_server_running()?;
             ensure_switcher_server_open(args.reverse)
         }
@@ -114,20 +122,28 @@ fn main() -> anyhow::Result<()> {
             ensure_server_running()?;
             match command {
                 hyprnav::cli::SwitcherCommand::Activate => {
+                    info!("hyprnav command entry: switcher activate");
+                    append_switch_log("cli.command", "name=switcher.activate");
                     let _ =
                         send_switcher_command_with_startup_grace(send_switcher_activate_command)?;
                 }
                 hyprnav::cli::SwitcherCommand::Cancel => {
+                    info!("hyprnav command entry: switcher cancel");
+                    append_switch_log("cli.command", "name=switcher.cancel");
                     let _ = send_switcher_command_with_startup_grace(send_switcher_cancel_command)?;
                 }
             }
             Ok(())
         }
         Command::Grid => {
+            info!("hyprnav command entry: grid");
+            append_switch_log("cli.command", "name=grid");
             ensure_server_running()?;
             ensure_grid_server_open()
         }
         Command::SwitcherServer => {
+            info!("hyprnav command entry: switcher-server");
+            append_switch_log("cli.command", "name=switcher-server");
             ensure_server_running()?;
             if send_switcher_ping_command()? {
                 return Ok(());
@@ -453,22 +469,40 @@ fn ensure_grid_server_open() -> anyhow::Result<()> {
 }
 
 fn ensure_switcher_server_open(reverse: bool) -> anyhow::Result<()> {
-    if send_switcher_step_command(reverse)? {
+    let initial_sent = send_switcher_step_command(reverse)?;
+    debug!(reverse, sent = initial_sent, "switcher initial socket step");
+    append_switch_log(
+        "cli.switcher.initial_step",
+        format!("reverse={reverse} sent={initial_sent}"),
+    );
+    if initial_sent {
         return Ok(());
     }
 
     let current_exe = std::env::current_exe()?;
+    info!(reverse, "spawning hyprnav switcher-server");
+    append_switch_log("cli.switcher.spawn", format!("reverse={reverse}"));
     ProcessCommand::new(current_exe)
         .arg("switcher-server")
         .spawn()?;
 
-    for _ in 0..40 {
+    for attempt in 0..40 {
         thread::sleep(Duration::from_millis(25));
         if send_switcher_step_command(reverse)? {
+            debug!(reverse, attempt = attempt + 1, "switcher became available");
+            append_switch_log(
+                "cli.switcher.retry_success",
+                format!("reverse={reverse} attempt={}", attempt + 1),
+            );
             return Ok(());
         }
     }
 
+    warn!(reverse, "timed out waiting for hyprnav switcher-server");
+    append_switch_log(
+        "cli.switcher.timeout",
+        format!("reverse={reverse} attempts=40"),
+    );
     Err(anyhow::anyhow!(
         "timed out waiting for hyprnav switcher-server"
     ))
@@ -479,14 +513,26 @@ fn send_switcher_command_with_startup_grace(
 ) -> anyhow::Result<bool> {
     for attempt in 0..10 {
         if send_command()? {
+            debug!(attempt = attempt + 1, "switcher command delivered");
+            append_switch_log(
+                "cli.switcher.command_success",
+                format!("attempt={}", attempt + 1),
+            );
             return Ok(true);
         }
 
         if attempt < 9 {
+            debug!(attempt = attempt + 1, "switcher command delivery retry");
+            append_switch_log(
+                "cli.switcher.command_retry",
+                format!("attempt={}", attempt + 1),
+            );
             thread::sleep(Duration::from_millis(25));
         }
     }
 
+    warn!("switcher command was not delivered after startup grace");
+    append_switch_log("cli.switcher.command_failed", "attempts=10");
     Ok(false)
 }
 

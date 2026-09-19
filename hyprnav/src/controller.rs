@@ -1,9 +1,10 @@
 use crate::protocol::{
     send_request, GridCellSnapshot, GridSnapshot, Request, SwitcherSnapshot, WorkspaceCardSnapshot,
 };
-use crate::runtime_paths::resolve_runtime_paths;
+use crate::runtime_paths::{append_switch_log, resolve_runtime_paths};
 use crate::ui_session::{
-    drain_grid_session_commands, drain_switcher_session_commands, GridUiCommand, UiSessionCommand,
+    drain_grid_session_commands, drain_switcher_session_commands, switcher_command_name,
+    GridUiCommand, UiSessionCommand,
 };
 use cxx_qt::casting::Upcast;
 use cxx_qt::CxxQtType;
@@ -13,7 +14,7 @@ use cxx_qt_lib::{
 use std::collections::BTreeMap;
 use std::pin::Pin;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::warn;
+use tracing::{debug, warn};
 
 const ROLE_ID: i32 = 0x0101;
 const ROLE_NAME: i32 = 0x0102;
@@ -59,6 +60,15 @@ enum UiMode {
     #[default]
     Switcher,
     Grid,
+}
+
+impl UiMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Switcher => "switcher",
+            Self::Grid => "grid",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -473,6 +483,10 @@ impl qobject::Controller {
     }
 
     pub fn activate_current(mut self: Pin<&mut Self>) {
+        let mode = self.as_ref().rust().mode;
+        let visible = *self.visible();
+        let current_index = self.as_ref().rust().current_index;
+        let item_count = self.as_ref().rust().items.len();
         match self.as_ref().rust().mode {
             UiMode::Grid => {
                 let Some((environment_id, slot_index)) = ({
@@ -482,12 +496,57 @@ impl qobject::Controller {
                         .get(rust.current_index.max(0) as usize)
                         .map(|item| (item.environment_id.clone(), item.slot_index))
                 }) else {
+                    debug!(
+                        mode = mode.as_str(),
+                        current_index, item_count, "activation skipped: no selected grid item"
+                    );
+                    append_switch_log(
+                        "ui.activate.skip",
+                        format!(
+                            "mode={} visible={visible} index={current_index} item_count={item_count} reason=no_grid_item",
+                            mode.as_str()
+                        ),
+                    );
                     return;
                 };
                 if slot_index <= 0 || environment_id.is_empty() {
+                    debug!(
+                        mode = mode.as_str(),
+                        current_index,
+                        item_count,
+                        environment_id,
+                        slot_index,
+                        "activation skipped: invalid grid selection"
+                    );
+                    append_switch_log(
+                        "ui.activate.skip",
+                        format!(
+                            "mode={} visible={visible} index={current_index} env={} slot={} item_count={item_count} reason=invalid_grid_selection",
+                            mode.as_str(),
+                            environment_id,
+                            slot_index
+                        ),
+                    );
                     return;
                 }
 
+                debug!(
+                    mode = mode.as_str(),
+                    current_index,
+                    item_count,
+                    environment_id,
+                    slot_index,
+                    "activating grid selection"
+                );
+                append_switch_log(
+                    "ui.activate",
+                    format!(
+                        "mode={} visible={visible} index={current_index} env={} slot={} item_count={item_count}",
+                        mode.as_str(),
+                        environment_id,
+                        slot_index
+                    ),
+                );
                 if let Err(error) =
                     self.as_ref()
                         .send_request::<serde_json::Value>(Request::WorkspaceGoto {
@@ -499,16 +558,50 @@ impl qobject::Controller {
                         "failed to activate environment {} slot {}: {error}",
                         environment_id, slot_index
                     );
+                    append_switch_log(
+                        "ui.activate.error",
+                        format!(
+                            "mode={} env={} slot={} error={error}",
+                            mode.as_str(),
+                            environment_id,
+                            slot_index
+                        ),
+                    );
                     return;
                 }
             }
             UiMode::Switcher => {
                 let workspace_id = self.as_ref().current_physical_workspace_id();
                 if workspace_id <= 0 {
+                    debug!(
+                        mode = mode.as_str(),
+                        current_index,
+                        item_count,
+                        workspace_id,
+                        "activation skipped: invalid workspace"
+                    );
+                    append_switch_log(
+                        "ui.activate.skip",
+                        format!(
+                            "mode={} visible={visible} index={current_index} workspace_id={workspace_id} item_count={item_count} reason=invalid_workspace",
+                            mode.as_str()
+                        ),
+                    );
                     return;
                 }
 
-                let item = &self.rust().items[self.rust().current_index.max(0) as usize];
+                debug!(
+                    mode = mode.as_str(),
+                    current_index, item_count, workspace_id, "activating switcher selection"
+                );
+                append_switch_log(
+                    "ui.activate",
+                    format!(
+                        "mode={} visible={visible} index={current_index} workspace_id={workspace_id} item_count={item_count}",
+                        mode.as_str()
+                    ),
+                );
+                let item = &self.rust().items[current_index.max(0) as usize];
                 let request = if item.environment_id.is_empty() {
                     Request::WorkspaceGotoPhysical { workspace_id }
                 } else {
@@ -519,11 +612,20 @@ impl qobject::Controller {
                 };
                 if let Err(error) = self.as_ref().send_request::<serde_json::Value>(request) {
                     warn!("failed to activate workspace {workspace_id}: {error}");
+                    append_switch_log(
+                        "ui.activate.error",
+                        format!(
+                            "mode={} workspace_id={workspace_id} error={error}",
+                            mode.as_str()
+                        ),
+                    );
                     return;
                 }
             }
         }
 
+        debug!(mode = mode.as_str(), "activation succeeded; hiding overlay");
+        append_switch_log("ui.activate.success", format!("mode={}", mode.as_str()));
         self.as_mut().hide_overlay();
     }
 
@@ -588,6 +690,34 @@ impl qobject::Controller {
         match self.as_ref().rust().mode {
             UiMode::Switcher => {
                 for command in drain_switcher_session_commands() {
+                    let visible = *self.visible();
+                    let current_index = self.as_ref().rust().current_index;
+                    let item_count = self.as_ref().rust().items.len();
+                    let action = match command {
+                        UiSessionCommand::StepForward | UiSessionCommand::StepReverse
+                            if !visible =>
+                        {
+                            "open"
+                        }
+                        UiSessionCommand::StepForward | UiSessionCommand::StepReverse => "step",
+                        UiSessionCommand::Activate => "activate",
+                        UiSessionCommand::Cancel => "cancel",
+                    };
+                    debug!(
+                        command = switcher_command_name(command),
+                        visible,
+                        current_index,
+                        item_count,
+                        action,
+                        "processing switcher session command"
+                    );
+                    append_switch_log(
+                        "ui.command",
+                        format!(
+                            "command={} visible={visible} index={current_index} item_count={item_count} action={action}",
+                            switcher_command_name(command)
+                        ),
+                    );
                     match command {
                         UiSessionCommand::StepForward => {
                             if !*self.visible() {
@@ -660,34 +790,64 @@ impl qobject::Controller {
     }
 
     fn refresh_snapshot(mut self: Pin<&mut Self>, preserve_selection: bool) -> anyhow::Result<()> {
+        let mode = self.as_ref().rust().mode;
+        let preferred_workspace_id = if mode == UiMode::Switcher && preserve_selection {
+            self.as_ref().current_switcher_selection_workspace_id()
+        } else {
+            None
+        };
+        let preferred_grid_selection = if mode == UiMode::Grid && preserve_selection {
+            self.as_ref().current_grid_selection_key()
+        } else {
+            None
+        };
+        debug!(
+            mode = mode.as_str(),
+            preserve_selection,
+            preferred_workspace_id = ?preferred_workspace_id,
+            preferred_grid_selection = ?preferred_grid_selection,
+            "refreshing UI snapshot"
+        );
+        append_switch_log(
+            "ui.refresh.start",
+            format!(
+                "mode={} preserve_selection={preserve_selection} preferred_workspace_id={:?} preferred_grid_selection={:?}",
+                mode.as_str(),
+                preferred_workspace_id,
+                preferred_grid_selection
+            ),
+        );
         self.as_mut().set_loading(true);
         let result = match self.as_ref().rust().mode {
             UiMode::Switcher => {
-                let preferred_workspace_id = preserve_selection
-                    .then(|| self.as_ref().current_switcher_selection_workspace_id())
-                    .flatten();
-                let snapshot = self.as_ref().send_request::<SwitcherSnapshot>(
-                    Request::UiSnapshotSwitcher {
+                match self
+                    .as_ref()
+                    .send_request::<SwitcherSnapshot>(Request::UiSnapshotSwitcher {
                         reverse: self.as_ref().rust().reverse,
-                    },
-                )?;
-                self.as_mut()
-                    .apply_switcher_snapshot(snapshot, preferred_workspace_id);
-                Ok(())
+                    }) {
+                    Ok(snapshot) => {
+                        self.as_mut()
+                            .apply_switcher_snapshot(snapshot, preferred_workspace_id);
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
             }
             UiMode::Grid => {
-                let preferred_selection = preserve_selection
-                    .then(|| self.as_ref().current_grid_selection_key())
-                    .flatten();
                 let cwd = std::env::current_dir()
                     .ok()
                     .map(|path| path.to_string_lossy().into_owned());
-                let snapshot = self
+                match self
                     .as_ref()
-                    .send_request::<GridSnapshot>(Request::UiSnapshotGrid { cwd })?;
-                self.as_mut()
-                    .apply_grid_snapshot(snapshot, preferred_selection);
-                Ok(())
+                    .send_request::<GridSnapshot>(Request::UiSnapshotGrid { cwd })
+                {
+                    Ok(snapshot) => {
+                        self.as_mut()
+                            .apply_grid_snapshot(snapshot, preferred_grid_selection);
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
             }
         };
 
@@ -695,13 +855,41 @@ impl qobject::Controller {
         if result.is_ok() {
             self.as_mut().rust_mut().last_snapshot_ms = now_ms_qt();
             self.as_mut().set_has_snapshot(true);
+            debug!(mode = mode.as_str(), "UI snapshot refreshed");
+            append_switch_log("ui.refresh.success", format!("mode={}", mode.as_str()));
+        } else if let Err(error) = &result {
+            warn!(
+                mode = mode.as_str(),
+                "failed to refresh UI snapshot: {error}"
+            );
+            append_switch_log(
+                "ui.refresh.error",
+                format!("mode={} error={error}", mode.as_str()),
+            );
         }
 
         result
     }
 
     fn show_overlay(mut self: Pin<&mut Self>) {
+        let previous_visible = *self.visible();
+        let mode = self.as_ref().rust().mode;
+        let resident_mode = self.as_ref().rust().resident_mode;
         self.as_mut().set_visible(true);
+        debug!(
+            mode = mode.as_str(),
+            resident_mode,
+            previous_visible,
+            visible = true,
+            "showing overlay"
+        );
+        append_switch_log(
+            "ui.overlay.show",
+            format!(
+                "mode={} resident={resident_mode} previous_visible={previous_visible} visible=true",
+                mode.as_str()
+            ),
+        );
         if uses_resident_grid_window(
             self.as_ref().rust().mode,
             self.as_ref().rust().resident_mode,
@@ -713,7 +901,24 @@ impl qobject::Controller {
     }
 
     fn hide_overlay(mut self: Pin<&mut Self>) {
+        let previous_visible = *self.visible();
+        let mode = self.as_ref().rust().mode;
+        let resident_mode = self.as_ref().rust().resident_mode;
         self.as_mut().set_visible(false);
+        debug!(
+            mode = mode.as_str(),
+            resident_mode,
+            previous_visible,
+            visible = false,
+            "hiding overlay"
+        );
+        append_switch_log(
+            "ui.overlay.hide",
+            format!(
+                "mode={} resident={resident_mode} previous_visible={previous_visible} visible=false",
+                mode.as_str()
+            ),
+        );
         if uses_resident_grid_window(
             self.as_ref().rust().mode,
             self.as_ref().rust().resident_mode,
@@ -735,11 +940,12 @@ impl qobject::Controller {
             .map(item_from_switcher_snapshot)
             .collect::<Vec<_>>();
         let current_index = preferred_workspace_id
+            .as_ref()
             .and_then(|key| {
                 items
                     .iter()
                     .position(|item| {
-                        (
+                        &(
                             item.workspace_id,
                             item.environment_id.clone(),
                             item.slot_index,
@@ -748,6 +954,10 @@ impl qobject::Controller {
                     .map(|index| index as i32)
             })
             .unwrap_or_else(|| normalize_index(snapshot.initial_index, items.len()));
+        let chosen_workspace_id = items
+            .get(current_index.max(0) as usize)
+            .map(|item| item.workspace_id)
+            .unwrap_or(-1);
 
         let unchanged_snapshot = {
             let binding = self.as_ref();
@@ -759,6 +969,26 @@ impl qobject::Controller {
         };
 
         if unchanged_snapshot {
+            debug!(
+                item_count = items.len(),
+                initial_index = snapshot.initial_index,
+                preferred_workspace_id = ?preferred_workspace_id,
+                current_index,
+                chosen_workspace_id,
+                update = "unchanged",
+                "applied switcher snapshot"
+            );
+            append_switch_log(
+                "ui.snapshot.switcher",
+                format!(
+                    "items={} initial_index={} preferred_workspace_id={:?} current_index={} chosen_workspace_id={} update=unchanged",
+                    items.len(),
+                    snapshot.initial_index,
+                    preferred_workspace_id,
+                    current_index,
+                    chosen_workspace_id
+                ),
+            );
             self.as_mut().set_current_index(current_index);
             self.as_mut().set_grid_mode(false);
             self.as_mut().set_grid_row_count(0);
@@ -787,8 +1017,48 @@ impl qobject::Controller {
         self.as_mut().set_grid_row_count(0);
         self.as_mut().set_grid_column_count(0);
         if let Some(changed_ranges) = changed_ranges {
+            debug!(
+                item_count = self.as_ref().rust().items.len(),
+                initial_index = snapshot.initial_index,
+                preferred_workspace_id = ?preferred_workspace_id,
+                current_index,
+                chosen_workspace_id,
+                update = "structural",
+                "applied switcher snapshot"
+            );
+            append_switch_log(
+                "ui.snapshot.switcher",
+                format!(
+                    "items={} initial_index={} preferred_workspace_id={:?} current_index={} chosen_workspace_id={} update=structural",
+                    self.as_ref().rust().items.len(),
+                    snapshot.initial_index,
+                    preferred_workspace_id,
+                    current_index,
+                    chosen_workspace_id
+                ),
+            );
             self.as_mut().emit_rows_changed(changed_ranges);
         } else {
+            debug!(
+                item_count = self.as_ref().rust().items.len(),
+                initial_index = snapshot.initial_index,
+                preferred_workspace_id = ?preferred_workspace_id,
+                current_index,
+                chosen_workspace_id,
+                update = "reset",
+                "applied switcher snapshot"
+            );
+            append_switch_log(
+                "ui.snapshot.switcher",
+                format!(
+                    "items={} initial_index={} preferred_workspace_id={:?} current_index={} chosen_workspace_id={} update=reset",
+                    self.as_ref().rust().items.len(),
+                    snapshot.initial_index,
+                    preferred_workspace_id,
+                    current_index,
+                    chosen_workspace_id
+                ),
+            );
             self.as_mut().reset_model();
         }
     }
@@ -1008,6 +1278,20 @@ impl qobject::Controller {
             return;
         }
 
+        let previous_index = *self.current_index();
+        let item_count = self.as_ref().rust().items.len();
+        debug!(
+            previous_index,
+            next_index = normalized,
+            item_count,
+            "selection changed"
+        );
+        append_switch_log(
+            "ui.selection",
+            format!(
+                "previous_index={previous_index} next_index={normalized} item_count={item_count}"
+            ),
+        );
         self.as_mut().rust_mut().last_navigation_ms = now_ms_qt();
         self.as_mut().set_current_index(normalized);
     }

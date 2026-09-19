@@ -49,6 +49,9 @@ Default workflow:
    - verify spawn integration through the `hyprnav` flows
 3. For switcher changes:
    - rebuild with `hyprnav-dev-build`
+   - build local `hyprnav/default.nix` with the activated system's nixpkgs;
+     do not use the repo flake for this flow, since its glibc may be incompatible
+     with the active Mesa driver
    - restart the running switcher daemon if needed
    - test using the existing switcher trigger flow
 4. Touch `/etc/nixos` only when integration behavior actually needs it.
