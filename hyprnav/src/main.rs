@@ -2,6 +2,7 @@ use cxx_qt_lib::{QGuiApplication, QQmlApplicationEngine, QString};
 use hyprnav::cli::{
     parse_args, BatchArgs, ClientCommand, Command, EnvCommand, EnvTitleCommand, LockArgs,
     ResolveArgs, RunArgs, SlotAssignArgs, SlotClearArgs, SlotCommand, SlotCommandClearArgs,
+    SlotTempArgs,
     SlotCommandSetArgs, SlotLaunchCommand, SlotNameCommand, SpawnArgs, SpawnInternalArgs,
 };
 use hyprnav::controller::qobject::{
@@ -207,6 +208,13 @@ fn main() -> anyhow::Result<()> {
             match command {
                 SlotCommand::Assign(args) => handle_slot_assign(args),
                 SlotCommand::Clear(args) => handle_slot_clear(args),
+                SlotCommand::Temp(args) => handle_slot_temp(args),
+                SlotCommand::Remove(args) => print_json(send::<Value>(Request::SlotRemove {
+                    env: args.env,
+                    slot: args.slot,
+                    name: args.name,
+                })),
+                SlotCommand::Temps => print_json(send::<Value>(Request::SlotTempList)),
                 SlotCommand::Resolve(args) => handle_resolve(args),
                 SlotCommand::Command(command) => match command {
                     SlotLaunchCommand::Set(args) => handle_slot_command_set(args),
@@ -309,6 +317,37 @@ fn handle_slot_assign(args: SlotAssignArgs) -> anyhow::Result<()> {
         launch_argv: args.launch.then_some(args.command),
         display_name: args.name,
     }))
+}
+
+fn handle_slot_temp(args: SlotTempArgs) -> anyhow::Result<()> {
+    let created: Value = send(Request::SlotTempCreate {
+        env: args.env,
+        cwd: args.cwd,
+        name: args.name,
+        owner: Some(args.owner.unwrap_or_else(|| "cli".to_owned())),
+        client: None,
+        launch_argv: if args.command.is_empty() {
+            None
+        } else {
+            Some(args.command.clone())
+        },
+    })?;
+    if args.command.is_empty() {
+        println!("{}", serde_json::to_string_pretty(&created)?);
+        return Ok(());
+    }
+    let workspace = created
+        .get("physical_workspace_id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| anyhow::anyhow!("daemon did not return a workspace for the new slot"))?;
+    eprintln!("{}", serde_json::to_string(&created)?);
+    handle_spawn(SpawnArgs {
+        no_focus: args.no_focus,
+        no_stick: false,
+        print_workspace_id: false,
+        workspace: workspace.to_string(),
+        command: args.command,
+    })
 }
 
 fn handle_slot_clear(args: SlotClearArgs) -> anyhow::Result<()> {

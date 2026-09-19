@@ -78,6 +78,20 @@ pub struct SlotResolutionRecord {
     pub launch_argv: Option<Vec<String>>,
 }
 
+/// Slot indexes at or above this are temporary, unnumbered slots.
+pub const TEMP_SLOT_START: i32 = 1000;
+
+/// Extra bookkeeping for a temporary slot; the binding itself is an ordinary
+/// managed `slot_bindings` row.
+#[derive(Clone, Debug)]
+pub struct TempSlotMeta {
+    pub env_id: String,
+    pub slot_index: i32,
+    pub workspace_id: Option<i32>,
+    pub owner: Option<String>,
+    pub empty_since: Option<i64>,
+}
+
 #[derive(Clone, Debug)]
 pub struct StickRecord {
     pub stick_id: String,
@@ -156,6 +170,90 @@ impl StateStore {
     pub fn locked_environment(&self) -> Result<Option<String>> {
         let connection = self.open()?;
         self.locked_environment_with_connection(&connection)
+    }
+
+    // ---- temporary slots
+
+    /// Create an unnumbered temporary slot on a fresh managed workspace.
+    /// Returns the allocated slot index (TEMP_SLOT_START or above).
+    pub fn create_temp_slot(
+        &self,
+        env_id: &str,
+        display_id: &str,
+        source_path: Option<&str>,
+        client_id: Option<&str>,
+        live_workspace_ids: &HashSet<i32>,
+        display_name: Option<&str>,
+        owner: Option<&str>,
+        launch_argv: Option<&[String]>,
+    ) -> Result<i32> {
+        let connection = self.open()?;
+        let next: Option<i32> = connection.query_row(
+            "SELECT MAX(slot_index) FROM slot_bindings WHERE env_id = ?1 AND slot_index >= ?2",
+            params![env_id, TEMP_SLOT_START],
+            |row| row.get(0),
+        )?;
+        let slot_index = next.map(|value| value + 1).unwrap_or(TEMP_SLOT_START);
+        let count: i64 = connection.query_row(
+            "SELECT COUNT(*) FROM slot_bindings WHERE env_id = ?1 AND temporary = 1",
+            params![env_id],
+            |row| row.get(0),
+        )?;
+        let default_name = format!("Temp {}", count + 1);
+        self.assign_slot_with_connection(
+            &connection,
+            env_id,
+            slot_index,
+            &SlotAssignmentMode::Managed,
+            display_id,
+            source_path,
+            client_id,
+            live_workspace_ids,
+            launch_argv,
+            Some(display_name.unwrap_or(default_name.as_str())),
+        )?;
+        connection.execute(
+            "UPDATE slot_bindings SET temporary = 1, owner = ?3, empty_since = NULL WHERE env_id = ?1 AND slot_index = ?2",
+            params![env_id, slot_index, owner],
+        )?;
+        Ok(slot_index)
+    }
+
+    pub fn list_temp_slots(&self) -> Result<Vec<TempSlotMeta>> {
+        let connection = self.open()?;
+        let mut statement = connection.prepare(
+            "SELECT env_id, slot_index, workspace_id, owner, empty_since FROM slot_bindings WHERE temporary = 1 ORDER BY env_id, slot_index",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(TempSlotMeta {
+                env_id: row.get(0)?,
+                slot_index: row.get(1)?,
+                workspace_id: row.get(2)?,
+                owner: row.get(3)?,
+                empty_since: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn set_temp_slot_empty_since(&self, env_id: &str, slot_index: i32, empty_since: Option<i64>) -> Result<()> {
+        let connection = self.open()?;
+        connection.execute(
+            "UPDATE slot_bindings SET empty_since = ?3 WHERE env_id = ?1 AND slot_index = ?2",
+            params![env_id, slot_index, empty_since],
+        )?;
+        Ok(())
+    }
+
+    pub fn find_slot_by_name(&self, env_id: &str, name: &str) -> Result<Option<i32>> {
+        let connection = self.open()?;
+        Ok(connection
+            .query_row(
+                "SELECT slot_index FROM slot_bindings WHERE env_id = ?1 AND display_name = ?2 COLLATE NOCASE ORDER BY slot_index LIMIT 1",
+                params![env_id, name],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
     // ---- sticks: spawned process trees pinned to a workspace
@@ -469,6 +567,9 @@ impl StateStore {
               updated_by_client_id TEXT NULL,
               created_at INTEGER NOT NULL,
               updated_at INTEGER NOT NULL,
+              temporary INTEGER NOT NULL DEFAULT 0,
+              owner TEXT NULL,
+              empty_since INTEGER NULL,
               PRIMARY KEY (env_id, slot_index)
             );
 
@@ -1054,6 +1155,19 @@ fn now_unix() -> i64 {
         .unwrap_or_default()
 }
 
+fn add_temporary_slot_columns(connection: &Connection) -> Result<()> {
+    connection.execute(
+        "ALTER TABLE slot_bindings ADD COLUMN temporary INTEGER NOT NULL DEFAULT 0",
+        [],
+    )?;
+    connection.execute("ALTER TABLE slot_bindings ADD COLUMN owner TEXT NULL", [])?;
+    connection.execute(
+        "ALTER TABLE slot_bindings ADD COLUMN empty_since INTEGER NULL",
+        [],
+    )?;
+    Ok(())
+}
+
 fn migrate_slot_bindings_schema(connection: &Connection) -> Result<()> {
     let table_sql = connection
         .query_row(
@@ -1072,6 +1186,7 @@ fn migrate_slot_bindings_schema(connection: &Connection) -> Result<()> {
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let has_launch_argv_json = columns.iter().any(|column| column == "launch_argv_json");
     let has_display_name = columns.iter().any(|column| column == "display_name");
+    let has_temporary = columns.iter().any(|column| column == "temporary");
     let needs_rebuild =
         !table_sql.contains("'inherit'") || table_sql.contains("workspace_id INTEGER NOT NULL");
 
@@ -1087,6 +1202,9 @@ fn migrate_slot_bindings_schema(connection: &Connection) -> Result<()> {
                 "ALTER TABLE slot_bindings ADD COLUMN display_name TEXT NULL",
                 [],
             )?;
+        }
+        if !has_temporary {
+            add_temporary_slot_columns(connection)?;
         }
         return Ok(());
     }
@@ -1104,6 +1222,9 @@ fn migrate_slot_bindings_schema(connection: &Connection) -> Result<()> {
           updated_by_client_id TEXT NULL,
           created_at INTEGER NOT NULL,
           updated_at INTEGER NOT NULL,
+          temporary INTEGER NOT NULL DEFAULT 0,
+          owner TEXT NULL,
+          empty_since INTEGER NULL,
           PRIMARY KEY (env_id, slot_index)
         );
         ",

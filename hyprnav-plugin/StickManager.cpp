@@ -13,6 +13,7 @@
 #include <hyprland/src/output/Monitor.hpp>
 #include <hyprland/src/helpers/time/Time.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
+#include <hyprland/src/managers/EventManager.hpp>
 #undef private
 
 #include <algorithm>
@@ -631,6 +632,15 @@ void CStickManager::place(SStickRoot& root, PHLWINDOW window, bool early) {
 
     if (window->m_workspace != workspace)
         Desktop::globalWindowController()->moveWindowToWorkspace(window, workspace);
+
+    // The window may have been placed before it mapped (early path), in which
+    // case IPC clients saw an openwindow event with the pre-placement
+    // workspace. Tell them where it really is, like a movewindow would.
+    if (g_pEventManager && window->m_isMapped) {
+        const auto address = std::format("{:x}", reinterpret_cast<uintptr_t>(window.get()));
+        g_pEventManager->postEvent(SHyprIPCEvent{"movewindow", std::format("{},{}", address, workspace->m_name)});
+        g_pEventManager->postEvent(SHyprIPCEvent{"movewindowv2", std::format("{},{},{}", address, workspace->m_id, workspace->m_name)});
+    }
 
     if (follow) {
         root.followConsumed = true;

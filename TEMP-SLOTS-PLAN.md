@@ -1,6 +1,6 @@
 # Temporary slots and the grid palette: plan
 
-Date: 2026-09-20. Decided in discussion; not implemented.
+Date: 2026-09-20. Implemented the same day; lab-verified (see TEMP-SLOTS-TESTING.md).
 
 ## Decisions
 

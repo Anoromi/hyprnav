@@ -61,3 +61,13 @@ hyprnav-dev-build
 hyprctl plugin list      # expect hyprnav-plugin
 hyprnav status           # expect a "sticks" field
 ```
+
+## Follow-up fix (2026-09-20)
+
+Windows placed at `window.openEarly` reached IPC clients with the
+pre-placement workspace in `openwindow`, and no move event followed, so
+Quickshell (and anything else reading `.socket2.sock`) kept them on the wrong
+workspace: wrong thumbnails, wrong window lists. The plugin now posts
+`movewindow` and `movewindowv2` after placement at `window.open`. Verified in
+the lab: Quickshell reports the spawned kitty on workspace 103 and the grid
+thumbnail lands on the right frame.

@@ -283,6 +283,54 @@ pub enum SlotCommand {
     )]
     #[command(subcommand)]
     Name(SlotNameCommand),
+    #[command(
+        about = "Create a temporary, unnumbered slot on a fresh managed workspace.",
+        long_about = "Create a temporary, unnumbered slot on a fresh managed workspace.\n\nTemporary slots have no digit; they show up in the grid by name. They are released automatically once their workspace has been empty for 30 seconds, or with `slot remove`. Pass `-- <command>` to spawn a process tree into the new slot (sticky, no focus change). Environment resolution: --env, then --cwd, then the current directory."
+    )]
+    Temp(SlotTempArgs),
+    #[command(
+        about = "Remove a slot by number or name.",
+        long_about = "Remove a slot by number or name. Windows on its workspace are left alone. Requires either --env or a global lock."
+    )]
+    Remove(SlotRemoveArgs),
+    #[command(about = "List temporary slots with their owner and empty timer.")]
+    Temps,
+}
+
+#[derive(Debug, Args)]
+#[command(trailing_var_arg = true)]
+pub struct SlotTempArgs {
+    /// Explicit environment ID.
+    #[arg(long)]
+    pub env: Option<String>,
+    /// Path used for environment derivation when --env is omitted.
+    #[arg(long)]
+    pub cwd: Option<String>,
+    /// Display name. Defaults to "Temp N" until a window gives it a title.
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Who created the slot (cli, grid, or an agent id). Default: cli.
+    #[arg(long)]
+    pub owner: Option<String>,
+    /// Keep focus here instead of following the spawned window.
+    #[arg(long)]
+    pub no_focus: bool,
+    /// Command to spawn into the slot after `--`.
+    #[arg(last = true)]
+    pub command: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct SlotRemoveArgs {
+    /// Slot number (numbered or temporary index).
+    #[arg(long)]
+    pub slot: Option<i32>,
+    /// Slot display name, case-insensitive.
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Explicit environment ID. Otherwise the locked environment is used.
+    #[arg(long)]
+    pub env: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]

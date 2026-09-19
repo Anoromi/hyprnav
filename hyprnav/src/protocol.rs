@@ -45,6 +45,17 @@ pub struct GridCellSnapshot {
     /// A spawned process tree is stuck to this workspace.
     #[serde(default)]
     pub stuck: bool,
+    /// Temporary slot: released after its workspace stays empty for a while.
+    #[serde(default)]
+    pub temporary: bool,
+    /// No digit; reachable only by name, grid or CLI.
+    #[serde(default)]
+    pub unnumbered: bool,
+    #[serde(default)]
+    pub owner: Option<String>,
+    /// How long the temporary slot's workspace has been empty, if it is.
+    #[serde(default)]
+    pub empty_for_ms: Option<u64>,
     pub show_environment_label: bool,
     pub row_index: i32,
     pub column_index: i32,
@@ -322,6 +333,22 @@ pub enum Request {
         #[serde(default)]
         no_stick: bool,
     },
+    /// Create an unnumbered temporary slot in an environment.
+    SlotTempCreate {
+        env: Option<String>,
+        cwd: Option<String>,
+        name: Option<String>,
+        owner: Option<String>,
+        client: Option<String>,
+        launch_argv: Option<Vec<String>>,
+    },
+    /// Remove any slot by index or name.
+    SlotRemove {
+        env: Option<String>,
+        slot: Option<i32>,
+        name: Option<String>,
+    },
+    SlotTempList,
     StickList,
     StickRelease {
         stick_id: String,

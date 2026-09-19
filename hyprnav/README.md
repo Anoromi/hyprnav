@@ -437,3 +437,22 @@ The main external integration files are:
 `hyprnav tab` connects Firefox/Zen and Chromium tabs to environment slots. Different slots
 can reuse one named tab and change only its `workspace` query parameter.
 See [browser setup and demo](browser-extension/README.md).
+
+## Temporary slots
+
+`hyprnav slot temp [--env X] [--name N] [--owner who] [-- cmd]` creates an
+unnumbered slot (index 1000 and up) on a fresh managed workspace. With a
+command it spawns the process tree into that slot with a stick and keeps
+focus where it is. Temporary slots show up in the grid by name, never by
+digit. They are released once their workspace has been empty for 30 seconds,
+or with `hyprnav slot remove --env X --slot S|--name N`. `hyprnav slot temps`
+lists them with owner and empty timer. Grid cells carry `temporary`,
+`unnumbered`, `owner` and `empty_for_ms`.
+
+## Sticks
+
+`hyprnav spawn` pins the spawned process tree to its workspace: later
+windows from that tree (dialogs, pickers, second windows) open there,
+silently, for as long as the tree or any of its windows lives. `spawn
+--no-stick` restores the old behaviour. `hyprnav stick list|release|add|move`
+inspects and changes sticks. Requires hyprnav-plugin.

@@ -1,7 +1,10 @@
 use crate::db::{
     environment_chain, environment_has_parent, EnvironmentRecord, SlotBindingRecord, StateStore,
-    StickRecord,
+    StickRecord, TempSlotMeta, TEMP_SLOT_START,
 };
+
+/// A temporary slot whose workspace has been empty this long is released.
+const TEMP_SLOT_GRACE_SECS: i64 = 30;
 use crate::protocol::{
     read_request, write_response, BatchMutationOperationResult, BatchMutationRequest,
     BatchMutationResponse, GridCellSnapshot, GridSnapshot, NavigationLaunchResult,
@@ -347,9 +350,59 @@ fn start_stick_sync_thread(runtime: Arc<ServerRuntime>) {
     });
 }
 
+/// Release temporary slots whose workspace has been empty for the grace period.
+fn reap_temp_slots(runtime: &ServerRuntime) {
+    let temps = match runtime.store.list_temp_slots() {
+        Ok(temps) if !temps.is_empty() => temps,
+        _ => return,
+    };
+    let occupied = match mapped_workspace_ids(&runtime.paths) {
+        Ok(ids) => ids,
+        Err(error) => {
+            warn!("temp slot reaper: cannot list clients: {error}");
+            return;
+        }
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    for temp in temps {
+        let has_windows = temp
+            .workspace_id
+            .map(|id| occupied.contains(&id))
+            .unwrap_or(false);
+        match (has_windows, temp.empty_since) {
+            (true, Some(_)) => {
+                let _ = runtime
+                    .store
+                    .set_temp_slot_empty_since(&temp.env_id, temp.slot_index, None);
+            }
+            (false, None) => {
+                let _ = runtime
+                    .store
+                    .set_temp_slot_empty_since(&temp.env_id, temp.slot_index, Some(now));
+            }
+            (false, Some(since)) if now - since >= TEMP_SLOT_GRACE_SECS => {
+                debug!(env = %temp.env_id, slot = temp.slot_index, "releasing temporary slot");
+                if let Err(error) = runtime.store.clear_slot(&temp.env_id, temp.slot_index) {
+                    warn!("temp slot reaper: clear failed: {error}");
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn start_spawn_cleanup_thread(runtime: Arc<ServerRuntime>) {
-    thread::spawn(move || loop {
+    thread::spawn(move || {
+        let mut tick: u32 = 0;
+        loop {
         thread::sleep(Duration::from_millis(250));
+        tick = tick.wrapping_add(1);
+        if tick % 8 == 0 {
+            reap_temp_slots(&runtime);
+        }
 
         let expired = {
             let registry = match runtime.spawn_registry.lock() {
@@ -433,7 +486,7 @@ fn start_spawn_cleanup_thread(runtime: Arc<ServerRuntime>) {
         for key in keys_to_clear {
             pending.remove(&key);
         }
-    });
+    }});
 }
 
 fn handle_stream(stream: UnixStream, runtime: Arc<ServerRuntime>) {
@@ -839,6 +892,58 @@ fn try_handle_request(runtime: &Arc<ServerRuntime>, request: Request) -> Result<
             }
 
             Ok(json!({"operation_id": operation_id, "finished": true}))
+        }
+        Request::SlotTempCreate {
+            env,
+            cwd,
+            name,
+            owner,
+            client,
+            launch_argv,
+        } => {
+            let resolved_env = resolve_explicit_or_default_with_connection(
+                env.as_deref(),
+                cwd.as_deref(),
+                &runtime.store,
+                None,
+            )?;
+            let display_id = default_display_id(env.as_deref(), &resolved_env);
+            let live = live_workspace_ids(&runtime.paths)?;
+            let slot = runtime.store.create_temp_slot(
+                &resolved_env,
+                &display_id,
+                cwd.as_deref(),
+                client.as_deref(),
+                &live,
+                name.as_deref(),
+                owner.as_deref(),
+                launch_argv.as_deref(),
+            )?;
+            let mut result = slot_configuration_response(&runtime.store, &resolved_env, slot)?;
+            result["temporary"] = json!(true);
+            result["slot"] = json!(slot);
+            Ok(result)
+        }
+        Request::SlotRemove { env, slot, name } => {
+            let resolved_env =
+                resolve_required_environment(env.as_deref(), &runtime.store)?;
+            let slot = match (slot, name) {
+                (Some(slot), _) => slot,
+                (None, Some(name)) => runtime
+                    .store
+                    .find_slot_by_name(&resolved_env, &name)?
+                    .ok_or_else(|| anyhow!("no slot named {name:?} in {resolved_env}"))?,
+                (None, None) => return Err(anyhow!("slot remove needs --slot or --name")),
+            };
+            runtime.store.clear_slot(&resolved_env, slot)?;
+            Ok(json!({"removed": true, "env_id": resolved_env, "slot": slot}))
+        }
+        Request::SlotTempList => {
+            let temps = runtime.store.list_temp_slots()?;
+            Ok(json!(temps.iter().map(|t| json!({
+                "env_id": t.env_id, "slot": t.slot_index, "workspace_id": t.workspace_id,
+                "owner": t.owner, "empty_since": t.empty_since,
+            })).collect::<Vec<_>>()))
         }
         Request::StickList => {
             let records = runtime.store.list_sticks()?;
@@ -1749,6 +1854,17 @@ fn build_grid_snapshot(runtime: &ServerRuntime, cwd: Option<&str>) -> Result<Gri
         .into_iter()
         .map(|stick| stick.workspace_id)
         .collect::<HashSet<i32>>();
+    let temp_meta = runtime
+        .store
+        .list_temp_slots()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|meta| ((meta.env_id.clone(), meta.slot_index), meta))
+        .collect::<HashMap<(String, i32), TempSlotMeta>>();
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
 
     let mut items = Vec::new();
     let mut max_column_count = 0;
@@ -1804,6 +1920,15 @@ fn build_grid_snapshot(runtime: &ServerRuntime, cwd: Option<&str>) -> Result<Gri
                 active,
                 environment_locked: locked_env_id.as_deref() == Some(environment.env_id.as_str()),
                 stuck: stuck_workspaces.contains(&workspace_id),
+                temporary: temp_meta.contains_key(&(record.binding_environment_id.clone(), record.slot_index)),
+                unnumbered: record.slot_index >= TEMP_SLOT_START,
+                owner: temp_meta
+                    .get(&(record.binding_environment_id.clone(), record.slot_index))
+                    .and_then(|meta| meta.owner.clone()),
+                empty_for_ms: temp_meta
+                    .get(&(record.binding_environment_id.clone(), record.slot_index))
+                    .and_then(|meta| meta.empty_since)
+                    .map(|since| ((now_unix - since).max(0) as u64) * 1000),
                 show_environment_label: column_index == 0,
                 row_index: row_count,
                 column_index: column_index as i32,
@@ -2438,6 +2563,10 @@ mod tests {
                     active,
                     environment_locked: locked_env_id == Some(environment.env_id.as_str()),
                     stuck: false,
+                    temporary: false,
+                    unnumbered: record.slot_index >= TEMP_SLOT_START,
+                    owner: None,
+                    empty_for_ms: None,
                     show_environment_label: column_index == 0,
                     row_index: row_count,
                     column_index: column_index as i32,
