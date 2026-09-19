@@ -144,12 +144,51 @@ pub enum Command {
     )]
     Spawn(SpawnArgs),
     #[command(
+        about = "Inspect or change hard-stuck process trees.",
+        long_about = "Inspect or change hard-stuck process trees.\n\nEvery `hyprnav spawn` pins its process tree to the target workspace: later windows from that tree (dialogs, pickers, second windows) open there instead of on the focused workspace, silently. Sticks survive daemon restarts and plugin reloads and end when the tree and all its windows are gone."
+    )]
+    #[command(subcommand)]
+    Stick(StickCommand),
+    #[command(
         about = "Apply many environment/slot/lock mutations in one daemon request.",
         long_about = "Apply many environment/slot/lock mutations in one daemon request.\n\nThe payload is read from JSON via --file or --stdin. Only state mutation operations are supported in this first version."
     )]
     Batch(BatchArgs),
     #[command(name = "spawn-internal", hide = true)]
     SpawnInternal(SpawnInternalArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum StickCommand {
+    #[command(about = "List stuck trees: persisted records and what the plugin currently tracks.")]
+    List,
+    #[command(about = "Forget a stuck tree. Its windows stay where they are.")]
+    Release(StickReleaseArgs),
+    #[command(about = "Pin an already running process tree to a workspace.")]
+    Add(StickAddArgs),
+    #[command(about = "Retarget a stuck tree and move its windows.")]
+    Move(StickMoveArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct StickReleaseArgs {
+    /// Stick ID as shown by `hyprnav stick list`.
+    pub stick_id: String,
+}
+
+#[derive(Debug, Args)]
+pub struct StickAddArgs {
+    /// Physical workspace ID.
+    pub workspace: i32,
+    /// Root PID of the tree to pin.
+    pub pid: u32,
+}
+
+#[derive(Debug, Args)]
+pub struct StickMoveArgs {
+    pub stick_id: String,
+    /// New physical workspace ID.
+    pub workspace: i32,
 }
 
 #[derive(Debug, Args, Clone, Copy)]
@@ -464,6 +503,10 @@ pub struct SpawnArgs {
     /// Keep the current workspace/focus instead of following the spawned window.
     #[arg(long)]
     pub no_focus: bool,
+    /// Stop placing windows once this command exits (old behaviour). By default
+    /// the whole process tree sticks to the workspace for as long as it lives.
+    #[arg(long)]
+    pub no_stick: bool,
     /// Print the resolved physical workspace ID before the child process starts.
     #[arg(long)]
     pub print_workspace_id: bool,

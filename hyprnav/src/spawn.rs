@@ -46,6 +46,8 @@ pub struct SpawnOperation {
     pub root_pid: Option<u32>,
     pub state: SpawnOperationState,
     pub created_at_ms: u64,
+    /// False only for `spawn --no-stick`: placement ends with the CLI.
+    pub stick: bool,
 }
 
 #[derive(Debug, Default)]
@@ -67,6 +69,7 @@ impl SpawnRegistry {
         origin: SpawnOriginSnapshot,
         store: &StateStore,
         live_workspace_ids: &HashSet<i32>,
+        stick: bool,
     ) -> Result<SpawnOperation> {
         let temporary = matches!(target, SpawnTarget::RandomTemporary);
         let workspace_id = match target {
@@ -94,6 +97,7 @@ impl SpawnRegistry {
             root_pid: None,
             state: SpawnOperationState::Prepared,
             created_at_ms: now_ms(),
+            stick,
         };
 
         self.operations.push(operation.clone());

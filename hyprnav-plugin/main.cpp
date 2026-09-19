@@ -7,7 +7,7 @@
 #include <string_view>
 
 #include "globals.hpp"
-#include "SpawnManager.hpp"
+#include "StickManager.hpp"
 
 static std::string pluginClientHash() {
     static const auto stripPatch = [](const char* ver) -> std::string {
@@ -43,11 +43,11 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         throw std::runtime_error(std::format("[he] Version mismatch host={} client={}", HASH, CLIENT_HASH));
     }
 
-    g_pSpawnManager = std::make_unique<CSpawnManager>();
+    g_pStickManager = std::make_unique<CStickManager>();
 
-    return {"hyprnav-plugin", "Spawn placement integration for hyprnav", "Andrii Zahorulko", "0.1"};
+    return {"hyprnav-plugin", "Hard workspace sticking for hyprnav spawn trees", "Andrii Zahorulko", "0.1"};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
-    g_pSpawnManager.reset();
+    g_pStickManager.reset();
 }

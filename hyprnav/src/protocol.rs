@@ -42,6 +42,9 @@ pub struct GridCellSnapshot {
     pub window_count: i32,
     pub active: bool,
     pub environment_locked: bool,
+    /// A spawned process tree is stuck to this workspace.
+    #[serde(default)]
+    pub stuck: bool,
     pub show_environment_label: bool,
     pub row_index: i32,
     pub column_index: i32,
@@ -59,6 +62,8 @@ pub struct GridSnapshot {
 pub struct StatusSnapshot {
     pub locked_environment_id: Option<String>,
     pub current_environment_id: Option<String>,
+    #[serde(default)]
+    pub sticks: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -312,6 +317,22 @@ pub enum Request {
     SpawnPrepare {
         target: String,
         focus_policy: String,
+        /// When true, the placement watch ends with the `hyprnav spawn` process
+        /// (pre-sticking behaviour). Default false: the tree sticks for life.
+        #[serde(default)]
+        no_stick: bool,
+    },
+    StickList,
+    StickRelease {
+        stick_id: String,
+    },
+    StickAdd {
+        workspace_id: i32,
+        pid: u32,
+    },
+    StickMove {
+        stick_id: String,
+        workspace_id: i32,
     },
     SpawnStart {
         operation_id: String,

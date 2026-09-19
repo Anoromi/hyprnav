@@ -78,6 +78,19 @@ pub struct SlotResolutionRecord {
     pub launch_argv: Option<Vec<String>>,
 }
 
+#[derive(Clone, Debug)]
+pub struct StickRecord {
+    pub stick_id: String,
+    pub workspace_id: i32,
+    pub monitor_id: i32,
+    pub root_pid: u32,
+    pub focus_policy: String,
+    pub origin_monitor_id: i32,
+    pub origin_workspace_id: i32,
+    pub origin_window_address: Option<String>,
+    pub created_at: i64,
+}
+
 impl StateStore {
     pub fn new(path: impl Into<PathBuf>) -> Result<Self> {
         let path = path.into();
@@ -143,6 +156,63 @@ impl StateStore {
     pub fn locked_environment(&self) -> Result<Option<String>> {
         let connection = self.open()?;
         self.locked_environment_with_connection(&connection)
+    }
+
+    // ---- sticks: spawned process trees pinned to a workspace
+
+    pub fn insert_stick(&self, record: &StickRecord) -> Result<()> {
+        let connection = self.open()?;
+        connection.execute(
+            "INSERT OR REPLACE INTO sticks (stick_id, workspace_id, monitor_id, root_pid, focus_policy, origin_monitor_id, origin_workspace_id, origin_window_address, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                record.stick_id,
+                record.workspace_id,
+                record.monitor_id,
+                record.root_pid as i64,
+                record.focus_policy,
+                record.origin_monitor_id,
+                record.origin_workspace_id,
+                record.origin_window_address,
+                now_unix(),
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_sticks(&self) -> Result<Vec<StickRecord>> {
+        let connection = self.open()?;
+        let mut statement = connection.prepare(
+            "SELECT stick_id, workspace_id, monitor_id, root_pid, focus_policy, origin_monitor_id, origin_workspace_id, origin_window_address, created_at
+             FROM sticks ORDER BY created_at",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(StickRecord {
+                stick_id: row.get(0)?,
+                workspace_id: row.get(1)?,
+                monitor_id: row.get(2)?,
+                root_pid: row.get::<_, i64>(3)? as u32,
+                focus_policy: row.get(4)?,
+                origin_monitor_id: row.get(5)?,
+                origin_workspace_id: row.get(6)?,
+                origin_window_address: row.get(7)?,
+                created_at: row.get(8)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
+
+    pub fn delete_stick(&self, stick_id: &str) -> Result<bool> {
+        let connection = self.open()?;
+        Ok(connection.execute("DELETE FROM sticks WHERE stick_id = ?1", params![stick_id])? > 0)
+    }
+
+    pub fn set_stick_workspace(&self, stick_id: &str, workspace_id: i32) -> Result<bool> {
+        let connection = self.open()?;
+        Ok(connection.execute(
+            "UPDATE sticks SET workspace_id = ?2 WHERE stick_id = ?1",
+            params![stick_id, workspace_id],
+        )? > 0)
     }
 
     pub fn record_environment_focus(&self, env_id: &str) -> Result<()> {
@@ -405,6 +475,18 @@ impl StateStore {
             CREATE TABLE IF NOT EXISTS global_state (
               key TEXT PRIMARY KEY,
               value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS sticks (
+              stick_id TEXT PRIMARY KEY,
+              workspace_id INTEGER NOT NULL,
+              monitor_id INTEGER NOT NULL,
+              root_pid INTEGER NOT NULL,
+              focus_policy TEXT NOT NULL DEFAULT 'preserve',
+              origin_monitor_id INTEGER NOT NULL DEFAULT -1,
+              origin_workspace_id INTEGER NOT NULL DEFAULT -1,
+              origin_window_address TEXT NULL,
+              created_at INTEGER NOT NULL
             );
             ",
         )?;

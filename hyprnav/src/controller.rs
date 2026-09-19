@@ -1580,6 +1580,7 @@ mod tests {
             binding_kind: "fixed".into(),
             inherited: false,
             environment_locked: false,
+            stuck: false,
             show_environment_label: true,
             row_index: 0,
             column_index: 0,

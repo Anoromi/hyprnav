@@ -242,6 +242,24 @@ fn main() -> anyhow::Result<()> {
             ensure_server_running()?;
             handle_spawn(args)
         }
+        Command::Stick(command) => {
+            use hyprnav::cli::StickCommand;
+            ensure_server_running()?;
+            match command {
+                StickCommand::List => print_json(send::<Value>(Request::StickList)),
+                StickCommand::Release(args) => print_json(send::<Value>(Request::StickRelease {
+                    stick_id: args.stick_id,
+                })),
+                StickCommand::Add(args) => print_json(send::<Value>(Request::StickAdd {
+                    workspace_id: args.workspace,
+                    pid: args.pid,
+                })),
+                StickCommand::Move(args) => print_json(send::<Value>(Request::StickMove {
+                    stick_id: args.stick_id,
+                    workspace_id: args.workspace,
+                })),
+            }
+        }
         Command::Batch(args) => {
             ensure_server_running()?;
             handle_batch(args)
@@ -344,6 +362,7 @@ fn handle_spawn(args: SpawnArgs) -> anyhow::Result<()> {
         } else {
             "follow".to_owned()
         },
+        no_stick: args.no_stick,
     })?;
 
     if args.print_workspace_id {

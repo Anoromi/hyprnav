@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.27)
 
 project(hyprnav-plugin
-    DESCRIPTION "Spawn placement integration for hyprnav"
+    DESCRIPTION "Hard workspace sticking for hyprnav spawn trees"
     VERSION 0.1
 )
 
@@ -9,7 +9,7 @@ set(CMAKE_CXX_STANDARD 23)
 
 add_library(hyprnav-plugin SHARED
     main.cpp
-    SpawnManager.cpp
+    StickManager.cpp
     common.cpp
 )
 

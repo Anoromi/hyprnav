@@ -1,5 +1,6 @@
 use crate::db::{
     environment_chain, environment_has_parent, EnvironmentRecord, SlotBindingRecord, StateStore,
+    StickRecord,
 };
 use crate::protocol::{
     read_request, write_response, BatchMutationOperationResult, BatchMutationRequest,
@@ -87,13 +88,27 @@ struct ServerRuntime {
     store: StateStore,
     spawn_registry: Mutex<SpawnRegistry>,
     pending_launches: Mutex<PendingLaunchRegistry>,
+    /// Plugin instance id that last received a full stick replay.
+    plugin_instance: Mutex<Option<String>>,
 }
 
 #[derive(Debug, Deserialize)]
 struct PluginSpawnResponse {
     ok: bool,
     #[serde(default)]
+    result: Option<serde_json::Value>,
+    #[serde(default)]
     error: Option<PluginSpawnError>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct PluginSyncResult {
+    #[serde(default)]
+    instance: String,
+    #[serde(default)]
+    active: Vec<String>,
+    #[serde(default)]
+    dropped: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -159,8 +174,10 @@ impl PendingLaunchRegistry {
 #[serde(tag = "op", rename_all = "snake_case")]
 enum PluginSpawnRequest<'a> {
     Ping,
-    Watch {
-        operation_id: &'a str,
+    Sync,
+    List,
+    Stick {
+        stick_id: &'a str,
         workspace_id: i32,
         root_pid: u32,
         target_monitor_id: i32,
@@ -169,10 +186,64 @@ enum PluginSpawnRequest<'a> {
         origin_workspace_id: i32,
         #[serde(skip_serializing_if = "Option::is_none")]
         origin_window_address: Option<&'a str>,
+        replay: i32,
     },
-    Unwatch {
-        operation_id: &'a str,
+    Unstick {
+        stick_id: &'a str,
     },
+    Move {
+        stick_id: &'a str,
+        workspace_id: i32,
+    },
+}
+
+fn stick_request<'a>(record: &'a StickRecord, replay: bool) -> PluginSpawnRequest<'a> {
+    PluginSpawnRequest::Stick {
+        stick_id: &record.stick_id,
+        workspace_id: record.workspace_id,
+        root_pid: record.root_pid,
+        target_monitor_id: record.monitor_id,
+        focus_policy: &record.focus_policy,
+        origin_monitor_id: record.origin_monitor_id,
+        origin_workspace_id: record.origin_workspace_id,
+        origin_window_address: record.origin_window_address.as_deref(),
+        replay: if replay { 1 } else { 0 },
+    }
+}
+
+/// Replay every persisted stick into a freshly (re)loaded plugin, then
+/// reconcile: rows the plugin has released are deleted.
+fn sync_sticks_with_plugin(runtime: &Arc<ServerRuntime>) {
+    let result = match send_plugin_spawn_value(&runtime.paths, &PluginSpawnRequest::Sync) {
+        Ok(value) => serde_json::from_value::<PluginSyncResult>(value).unwrap_or_default(),
+        Err(_) => return, // plugin not loaded
+    };
+    let mut known = match runtime.plugin_instance.lock() {
+        Ok(guard) => guard,
+        Err(_) => return,
+    };
+    if known.as_deref() != Some(result.instance.as_str()) {
+        let records = runtime.store.list_sticks().unwrap_or_default();
+        debug!(instance = %result.instance, count = records.len(), "replaying sticks into plugin");
+        for record in &records {
+            if let Err(error) = send_plugin_spawn_request(&runtime.paths, &stick_request(record, true)) {
+                warn!("stick replay failed for {}: {error}", record.stick_id);
+            }
+        }
+        *known = Some(result.instance);
+        return;
+    }
+    for id in &result.dropped {
+        let _ = runtime.store.delete_stick(id);
+    }
+    if let Ok(records) = runtime.store.list_sticks() {
+        let active: HashSet<&str> = result.active.iter().map(String::as_str).collect();
+        for record in records {
+            if !active.contains(record.stick_id.as_str()) && !crate::spawn::pid_exists(record.root_pid) {
+                let _ = runtime.store.delete_stick(&record.stick_id);
+            }
+        }
+    }
 }
 
 pub fn run_server() -> Result<()> {
@@ -182,9 +253,11 @@ pub fn run_server() -> Result<()> {
         paths,
         spawn_registry: Mutex::new(SpawnRegistry::new()),
         pending_launches: Mutex::new(PendingLaunchRegistry::default()),
+        plugin_instance: Mutex::new(None),
     });
     let listener = bind_listener(&runtime.paths.server_socket_path)?;
     start_spawn_cleanup_thread(runtime.clone());
+    start_stick_sync_thread(runtime.clone());
     start_hypr_event_thread(runtime.clone());
 
     loop {
@@ -267,6 +340,13 @@ fn bind_listener(path: &Path) -> Result<UnixListener> {
     UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))
 }
 
+fn start_stick_sync_thread(runtime: Arc<ServerRuntime>) {
+    thread::spawn(move || loop {
+        sync_sticks_with_plugin(&runtime);
+        thread::sleep(Duration::from_millis(2000));
+    });
+}
+
 fn start_spawn_cleanup_thread(runtime: Arc<ServerRuntime>) {
     thread::spawn(move || loop {
         thread::sleep(Duration::from_millis(250));
@@ -299,11 +379,11 @@ fn start_spawn_cleanup_thread(runtime: Arc<ServerRuntime>) {
             };
 
             for operation in removed {
-                if operation.state == SpawnOperationState::Active {
+                if operation.state == SpawnOperationState::Active && !operation.stick {
                     let _ = send_plugin_spawn_request(
                         &runtime.paths,
-                        &PluginSpawnRequest::Unwatch {
-                            operation_id: &operation.operation_id,
+                        &PluginSpawnRequest::Unstick {
+                            stick_id: &operation.operation_id,
                         },
                     );
                 }
@@ -409,6 +489,7 @@ fn try_handle_request(runtime: &Arc<ServerRuntime>, request: Request) -> Result<
                 .map(resolve_environment_from_cwd)
                 .transpose()?
                 .filter(|value| !value.is_empty()),
+            sticks: runtime.store.list_sticks().map(|s| s.len()).unwrap_or(0),
         })?),
         Request::EnvEnsure {
             env,
@@ -662,6 +743,7 @@ fn try_handle_request(runtime: &Arc<ServerRuntime>, request: Request) -> Result<
         Request::SpawnPrepare {
             target,
             focus_policy,
+            no_stick,
         } => {
             let target = parse_spawn_target(&target)?;
             let focus_policy = parse_spawn_focus_policy(&focus_policy)?;
@@ -680,6 +762,7 @@ fn try_handle_request(runtime: &Arc<ServerRuntime>, request: Request) -> Result<
                     origin,
                     &runtime.store,
                     &live_workspace_ids,
+                    !no_stick,
                 )?
             };
             Ok(serde_json::to_value(SpawnPrepared {
@@ -703,27 +786,32 @@ fn try_handle_request(runtime: &Arc<ServerRuntime>, request: Request) -> Result<
                 registry.activate(&operation_id, root_pid)?
             };
 
-            if let Err(error) = send_plugin_spawn_request(
-                &runtime.paths,
-                &PluginSpawnRequest::Watch {
-                    operation_id: &operation.operation_id,
-                    workspace_id: operation.workspace_id,
-                    root_pid,
-                    target_monitor_id: operation.target_monitor_id,
-                    focus_policy: match operation.focus_policy {
-                        SpawnFocusPolicy::Follow => "follow",
-                        SpawnFocusPolicy::Preserve => "preserve",
-                    },
-                    origin_monitor_id: operation.origin_monitor_id,
-                    origin_workspace_id: operation.origin_workspace_id,
-                    origin_window_address: operation.origin_window_address.as_deref(),
+            let record = StickRecord {
+                stick_id: operation.operation_id.clone(),
+                workspace_id: operation.workspace_id,
+                monitor_id: operation.target_monitor_id,
+                root_pid,
+                focus_policy: match operation.focus_policy {
+                    SpawnFocusPolicy::Follow => "follow".to_owned(),
+                    SpawnFocusPolicy::Preserve => "preserve".to_owned(),
                 },
-            ) {
+                origin_monitor_id: operation.origin_monitor_id,
+                origin_workspace_id: operation.origin_workspace_id,
+                origin_window_address: operation.origin_window_address.clone(),
+                created_at: 0,
+            };
+            if operation.stick {
+                runtime.store.insert_stick(&record)?;
+            }
+            if let Err(error) = send_plugin_spawn_request(&runtime.paths, &stick_request(&record, false)) {
                 let mut registry = runtime
                     .spawn_registry
                     .lock()
                     .map_err(|poison| anyhow!("spawn registry poisoned: {poison}"))?;
                 let _ = registry.finish(&operation_id);
+                if operation.stick {
+                    let _ = runtime.store.delete_stick(&record.stick_id);
+                }
                 return Err(error);
             }
 
@@ -740,17 +828,74 @@ fn try_handle_request(runtime: &Arc<ServerRuntime>, request: Request) -> Result<
                 .map_err(|error| anyhow!("spawn registry poisoned: {error}"))?
                 .finish(&operation_id)
             {
-                if operation.state == SpawnOperationState::Active {
+                if operation.state == SpawnOperationState::Active && !operation.stick {
                     let _ = send_plugin_spawn_request(
                         &runtime.paths,
-                        &PluginSpawnRequest::Unwatch {
-                            operation_id: &operation.operation_id,
+                        &PluginSpawnRequest::Unstick {
+                            stick_id: &operation.operation_id,
                         },
                     );
                 }
             }
 
             Ok(json!({"operation_id": operation_id, "finished": true}))
+        }
+        Request::StickList => {
+            let records = runtime.store.list_sticks()?;
+            let live = send_plugin_spawn_value(&runtime.paths, &PluginSpawnRequest::List).ok();
+            Ok(json!({
+                "persisted": records.iter().map(|r| json!({
+                    "stick_id": r.stick_id,
+                    "workspace_id": r.workspace_id,
+                    "root_pid": r.root_pid,
+                    "root_alive": crate::spawn::pid_exists(r.root_pid),
+                    "focus_policy": r.focus_policy,
+                    "created_at": r.created_at,
+                })).collect::<Vec<_>>(),
+                "plugin": live,
+            }))
+        }
+        Request::StickRelease { stick_id } => {
+            let removed = runtime.store.delete_stick(&stick_id)?;
+            let plugin = send_plugin_spawn_request(
+                &runtime.paths,
+                &PluginSpawnRequest::Unstick { stick_id: &stick_id },
+            )
+            .is_ok();
+            Ok(json!({"stick_id": stick_id, "removed": removed, "plugin_notified": plugin}))
+        }
+        Request::StickAdd { workspace_id, pid } => {
+            if workspace_id <= 0 {
+                return Err(anyhow!("workspace id must be positive"));
+            }
+            if !crate::spawn::pid_exists(pid) {
+                return Err(anyhow!("pid {pid} is not running"));
+            }
+            let record = StickRecord {
+                stick_id: format!("manual-{pid}-{}", now_ms()),
+                workspace_id,
+                monitor_id: current_focused_monitor_id(&runtime.paths).unwrap_or(-1),
+                root_pid: pid,
+                focus_policy: "preserve".to_owned(),
+                origin_monitor_id: -1,
+                origin_workspace_id: -1,
+                origin_window_address: None,
+                created_at: 0,
+            };
+            runtime.store.insert_stick(&record)?;
+            send_plugin_spawn_request(&runtime.paths, &stick_request(&record, true))?;
+            Ok(json!({"stick_id": record.stick_id, "workspace_id": workspace_id, "root_pid": pid}))
+        }
+        Request::StickMove { stick_id, workspace_id } => {
+            if workspace_id <= 0 {
+                return Err(anyhow!("workspace id must be positive"));
+            }
+            let updated = runtime.store.set_stick_workspace(&stick_id, workspace_id)?;
+            send_plugin_spawn_request(
+                &runtime.paths,
+                &PluginSpawnRequest::Move { stick_id: &stick_id, workspace_id },
+            )?;
+            Ok(json!({"stick_id": stick_id, "workspace_id": workspace_id, "persisted": updated}))
         }
         Request::UiSnapshotSwitcher { reverse } => {
             let snapshot = build_switcher_snapshot(runtime, reverse)?;
@@ -1597,6 +1742,14 @@ fn build_grid_snapshot(runtime: &ServerRuntime, cwd: Option<&str>) -> Result<Gri
         .map(|binding| ((binding.env_id.as_str(), binding.slot_index), binding))
         .collect::<HashMap<_, _>>();
 
+    let stuck_workspaces = runtime
+        .store
+        .list_sticks()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|stick| stick.workspace_id)
+        .collect::<HashSet<i32>>();
+
     let mut items = Vec::new();
     let mut max_column_count = 0;
     let mut row_count = 0;
@@ -1650,6 +1803,7 @@ fn build_grid_snapshot(runtime: &ServerRuntime, cwd: Option<&str>) -> Result<Gri
                 window_count: card.map(|item| item.window_count).unwrap_or(0),
                 active,
                 environment_locked: locked_env_id.as_deref() == Some(environment.env_id.as_str()),
+                stuck: stuck_workspaces.contains(&workspace_id),
                 show_environment_label: column_index == 0,
                 row_index: row_count,
                 column_index: column_index as i32,
@@ -2076,6 +2230,10 @@ fn ensure_positive_slot(slot: i32) -> Result<()> {
 }
 
 fn send_plugin_spawn_request(paths: &RuntimePaths, request: &PluginSpawnRequest<'_>) -> Result<()> {
+    send_plugin_spawn_value(paths, request).map(|_| ())
+}
+
+fn send_plugin_spawn_value(paths: &RuntimePaths, request: &PluginSpawnRequest<'_>) -> Result<serde_json::Value> {
     let mut stream = UnixStream::connect(&paths.spawn_socket_path)
         .with_context(|| format!("connecting to {}", paths.spawn_socket_path.display()))?;
     let payload = serde_json::to_vec(request).context("encoding plugin spawn request")?;
@@ -2093,7 +2251,7 @@ fn send_plugin_spawn_request(paths: &RuntimePaths, request: &PluginSpawnRequest<
     let response = serde_json::from_str::<PluginSpawnResponse>(&line)
         .context("decoding plugin spawn response")?;
     if response.ok {
-        Ok(())
+        Ok(response.result.unwrap_or(serde_json::Value::Null))
     } else {
         Err(anyhow!(
             "{}",
@@ -2279,6 +2437,7 @@ mod tests {
                     window_count: card.map(|item| item.window_count).unwrap_or(0),
                     active,
                     environment_locked: locked_env_id == Some(environment.env_id.as_str()),
+                    stuck: false,
                     show_environment_label: column_index == 0,
                     row_index: row_count,
                     column_index: column_index as i32,
