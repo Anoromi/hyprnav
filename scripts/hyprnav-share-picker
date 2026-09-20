@@ -17,6 +17,11 @@ h=0xcbf29ce484222325
 for b in sys.stdin.buffer.read(): h=((h^b)*0x100000001b3)&0xffffffffffffffff
 print(f"{h:016x}")')
 req="$runtime/hx/$hash/screencast-request"
+# Diagnostics are off unless HYPRNAV_PICKER_DEBUG is set.
+log="$runtime/hx/$hash/picker.log"
+log() { [ -n "${HYPRNAV_PICKER_DEBUG:-}" ] || return 0; printf '%s\n' "$*" >>"$log" 2>/dev/null || true; }
+log "--- $(date +%T) args=$* req_exists=$([ -f "$req" ] && echo yes || echo no)"
+log "list=$(printf '%s' "${XDPH_WINDOW_SHARING_LIST:-<empty>}" | cut -c1-2000)"
 answer=""
 if [ -f "$req" ]; then
   now=$(date +%s); mtime=$(stat -c %Y "$req" 2>/dev/null || echo 0)
@@ -29,10 +34,16 @@ want=sys.argv[1].lower()
 for entry in sys.stdin.read().split("[HA>]"):
     m=re.match(r"^(\d+)\[HC>\](.*?)\[HT>\](.*?)\[HE>\](.*)$", entry, re.S)
     if not m: continue
-    addr=m.group(4).strip().lower().removeprefix("0x")
-    if addr==want or addr==want.lstrip("0"):
+    raw=m.group(4).strip().lower()
+    try:
+        addr=int(raw,16) if raw.startswith("0x") else int(raw,10)
+    except ValueError:
+        try: addr=int(raw,16)
+        except ValueError: continue
+    if addr==int(want,16):
         print(m.group(1)); break
 ' "$want")
+    log "want=$want handle=${handle:-<none>}"
     if [ -n "$handle" ]; then
       flags=""
       for a in "$@"; do [ "$a" = "--allow-token" ] && flags="r"; done
@@ -41,6 +52,7 @@ for entry in sys.stdin.read().split("[HA>]"):
   fi
   rm -f "$req"
 fi
+log "answer=${answer:-<stock picker>}"
 if [ -n "$answer" ]; then
   printf '%s\n' "$answer"
   exit 0
