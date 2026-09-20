@@ -1,0 +1,167 @@
+# Live window video: efficient design
+
+Status: design, 2026-09-20. Supersedes the JPEG-only description in README "Window frames"
+once implemented. The MJPEG path stays as the fallback format.
+
+## Goal
+
+A gesture-free live view of any Hyprland window (typically an agent's window on a hidden
+workspace) for T3 Code's mini player, the shell, and remote dashboards, at the lowest
+steady-state cost: zero when the window is static, GPU-bound when it moves, one pipeline per
+window no matter how many watchers, and cheap enough on the wire for Tailscale.
+
+Non-goals: replacing the click-to-watch PipeWire portal (that stays the full-size, lowest-latency
+path), audio, recording to disk.
+
+## Measured baseline (current MJPEG path, lab, 2026-09-20)
+
+| case | cost |
+|---|---|
+| hidden countdown, 8 fps, 640 px wide, JPEG q60 | 0.7 % of a core, 60–300 KB/s |
+| static hidden window | 0.2 % of a core (render + pixel compare, no encode), 0 B/s |
+| GPU encoders available (AMD Strix Halo, VA-API) | AV1, HEVC, H.264 all verified working from this user |
+
+## Pipeline
+
+```
+compositor ──toplevel-export (dmabuf, wait-for-damage)──► hyprnav-capture ──fd or raw──► encoder
+   ▲ render_unfocused while watched                         │ VPP scale on GPU              │ AV1 (VA-API)
+   └───────────────── daemon sets/unsets ──────────────────┘                                ▼
+                                                     daemon: GOP cache + fan-out ──frames.sock──► clients
+                                                                                         (T3 route pass-through)
+                                                                                         browser: WebCodecs → canvas
+```
+
+### 1. Capture: damage-driven, GPU buffers
+
+* Protocol: `hyprland-toplevel-export-v1` (keep; `ext-image-copy-capture` never completes for
+  windows on hidden workspaces, verified).
+* `copy(buffer, ignore_damage = 0)`: the compositor queues the frame and completes it on the next
+  output commit after the window is damaged (`ToplevelExport.cpp:198-201, 222`). A static window
+  produces nothing: no render, no copy, no compare. This replaces today's `ignore_damage = 1`
+  polling loop plus identical-pixel dedupe.
+* Keep the app painting while hidden: today's `ignore_damage = 1` render unblocks surface
+  feedback and so wakes the app itself. With wait-for-damage there is no render until damage, so
+  a hidden app that only paints on frame callbacks would deadlock. The daemon already sets
+  `render_unfocused = true` on the window while it has watchers; that delivers frame callbacks at
+  `misc:render_unfocused_fps` (15). Keep it, and make it mandatory in this mode.
+  Experiment E1 below verifies the combination.
+* Buffers: request `linux_dmabuf` buffers (event `linux_dmabuf`, `copyDmabuf` in Hyprland),
+  allocated with GBM on `/dev/dri/renderD128`, 2–3 rotating buffers. The compositor renders the
+  window straight into GPU memory; no shm readback, no CPU copy.
+  Fallback: shm path as today if the compositor refuses dmabuf for this window.
+* Frame pacing: `max_fps` is a ceiling only; damage decides. If damage arrives faster than the
+  ceiling, skip requesting the next frame until the slot; no frames are queued.
+
+### 2. Scale and encode: GPU, zero-copy
+
+* Import the dmabuf into VA-API (`vaCreateSurfaces` with `VASurfaceAttribExternalBuffers` /
+  DRM PRIME 2), scale with the VA-API video-processing pipeline to the requested width (default
+  640, tiers 320/640/960/native), output NV12, encode with `av1_vaapi`-class encoder
+  (VAProfileAV1Profile0, low-delay, CQP ~30 or CBR 400–800 kbps at 640 wide).
+* Codec choice: AV1. Both Firefox (Zen) and Chromium (Electron) decode it; HEVC is out (Firefox);
+  H.264 kept as fallback for encoders/decoders without AV1.
+* GOP: closed GOP with an IDR every 2 s while frames flow, and an IDR on demand when a new
+  watcher joins (force-key-unit). With damage-driven input the GOP is in frames, not time.
+* Implementation tiers, cheapest first, chosen by measurement (E2):
+  * T1 `ffmpeg` child per watched window: `-f rawvideo` on stdin (helper does shm readback and
+    integer downscale as today), `-vf format=nv12,hwupload -c:v av1_vaapi`, raw OBU/IVF on
+    stdout. No dmabuf, one CPU copy + upload per frame, keyframe on demand via `-force_key_frames`
+    expression is not possible: rely on 2 s GOP + GOP cache (below). ~1 day total.
+  * T2 GStreamer in the helper: `appsrc` (dmabuf) → `vapostproc` → `vaav1enc` → `appsink`,
+    force-key-unit events on join. Zero-copy, keyframe on demand. +1–2 days, adds gst dependency.
+  * T3 libva directly in the helper. Zero-copy, smallest footprint, most code (AV1 encode
+    parameter structures). Only if T2's dependency is unacceptable.
+  Recommendation: build T1 first behind the same socket contract, measure, then decide T2.
+
+### 3. Daemon: one pipeline per window, GOP cache, fan-out
+
+* `FrameHub` (exists) gains per-address `Pipeline { capture, encoder, gop_cache, subscribers }`.
+* GOP cache: sequence header + last IDR + following frames. A joining client receives the cache
+  as a burst first, then live frames; it is decodable immediately without waiting for the next IDR.
+  Bounded by GOP length (2 s at ≤15 fps = ≤30 small frames).
+* Fan-out: latest-wins is wrong for video (P-frames depend on predecessors). Per client: bounded
+  queue of whole frames; on overflow drop the client's queue back to the next IDR and mark
+  "resync" (send the cached IDR). Slow clients never stall the pipeline.
+* Static window: no packets flow. Clients keep their last decoded picture; a 10 s keepalive
+  record (empty, `flags = KEEPALIVE`) lets clients tell "static" from "dead".
+* Params change (width tier, fps): restart the encoder for that address; emit a new sequence
+  header; clients reconfigure on `flags = CONFIG`.
+
+### 4. Wire format (frames.sock, unchanged socket, new `format`)
+
+Request line: `{"address":"0x…","format":"av1"|"h264"|"mjpeg","max_width":640,"max_fps":8}`.
+`mjpeg` (default for compatibility) keeps today's multipart body.
+`av1`/`h264`: a byte stream of records:
+
+```
+u32 magic 'HNVF' | u32 len | u32 flags | u64 pts_us | u16 width | u16 height | payload[len]
+flags: 1=KEYFRAME 2=CONFIG(sequence header / SPS+PPS) 4=KEEPALIVE
+```
+One record = one temporal unit (AV1) / one access unit (H.264). T3's route passes bytes through
+with `Content-Type: application/vnd.hyprnav.frames`. `hyprnav frames --format av1 -o out.ivf`
+writes IVF for `ffplay`.
+
+### 5. Client: WebCodecs, MJPEG fallback
+
+* Browser: `fetch()` the route, parse records from a `ReadableStream`, feed `VideoDecoder`
+  (`codec: "av01.0.08M.08"`; H.264 `avc1.42E01E` fallback), paint `VideoFrame`s to a canvas
+  sized to the player. Firefox ≥130 and Chromium support WebCodecs video; hardware decode where
+  available, dav1d software otherwise (sub-millisecond at 640 wide).
+* Why not fMP4 + Media Source Extensions: it needs a muxer, init segments, timestamp
+  continuity, and MSE buffers stall on gaps, which damage-driven streams have constantly.
+  WebCodecs is a decoder and a canvas; static windows simply stop producing frames.
+* Fallback chain: WebCodecs unavailable → `format=mjpeg` `<img>` as today.
+* T3 mini player: the same `DesktopAgentMiniPlayer`, content swaps from `<img>` to canvas.
+
+### 6. Target the right window
+
+Today the stream follows `current_target`, which the MCP moves only when it acts. Two changes,
+both cheap:
+* MCP: beat with the dialog as target when `getDialog` binds one (it is what the agent is
+  looking at).
+* Daemon option `"follow":"target"|"transient"`: with `transient`, if the target has a mapped
+  transient child (dialog) the pipeline captures the child instead, switching on map/unmap.
+
+### 7. Security
+
+frames.sock is a user-private socket. T3's route stays loopback-gated plus the agent-window
+allowlist; for any non-loopback exposure (Tailscale) use the signed-URL pattern from
+`AssetAccess.ts` before opening the route. Nothing here changes the picker/portal path.
+
+## Cost model (expected, 640 wide, to be measured)
+
+| case | capture | scale+encode | daemon | wire |
+|---|---|---|---|---|
+| static hidden window | 0 (no damage) | 0 | 0 | 0 (keepalive 10 s) |
+| ticking countdown, ≤15 fps | GPU render only | GPU (VCN), CPU ≈ upload copy (T1) or 0 (T2/T3) | fan-out of ~2–6 KB records | 20–50 KB/s |
+| 4 windows watched | linear in moving windows only | VCN has headroom for dozens of 640p streams | negligible | linear |
+
+## Experiments before building (each ≤ 1 h, lab only)
+
+* E1 `ignore_damage=0` + `render_unfocused=true` on a hidden countdown: frames per 10 s ≥ 8,
+  0 frames while static, helper CPU ≈ 0. Also without `render_unfocused`, to document the
+  deadlock claim.
+* E2 `ffmpeg -f rawvideo … -c:v av1_vaapi` fed from the helper at 640x360, 8 fps: CPU %, latency
+  glass-to-glass (timestamp overlay in the demo app), bytes/s. Same with `h264_vaapi`.
+* E3 WebCodecs AV1 decode in Zen and in Electron: a static HTML page fed from `hyprnav frames
+  --format av1` via the T3 route; confirm playback, latency, canvas paint cost.
+* E4 dmabuf capture: `linux_dmabuf` event honoured by Hyprland for a hidden window; GBM
+  allocation with the advertised format/modifier works from the helper.
+
+## Phases
+
+* A. Experiments E1–E4 (½ day). Go/no-go on damage-driven mode and on T1 vs T2.
+* B. Daemon + helper: damage-driven capture, encoder T1, GOP cache, record format, CLI
+  (1 day).
+* C. T3: route content-type passthrough, WebCodecs player with MJPEG fallback (½ day).
+* D. Optional: T2 zero-copy (GStreamer) if E2 shows the upload copy matters; `follow=transient`
+  and the MCP dialog beat (½ day).
+
+## Decisions (user, 2026-09-20)
+
+1. Encoder for the first build: T1, ffmpeg child with the upload path. Zero-copy (T2) later,
+   behind the same socket contract, only if E2 shows the copy matters.
+2. Client decode: WebCodecs to canvas. MJPEG `<img>` stays as the fallback.
+3. Width tiers: 640 default; 320/960/native on request.
+4. Dialog follow is in scope now: MCP beats with the bound dialog, daemon `follow=transient`.
