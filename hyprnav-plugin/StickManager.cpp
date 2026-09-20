@@ -14,6 +14,7 @@
 #include <hyprland/src/helpers/time/Time.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
 #include <hyprland/src/managers/EventManager.hpp>
+#include <hyprland/src/render/Renderer.hpp>
 #undef private
 
 #include <algorithm>
@@ -57,6 +58,15 @@ std::optional<int> jsonIntField(const std::string& line, const char* key) {
     } catch (...) { return std::nullopt; }
 }
 
+std::optional<bool> jsonBoolField(const std::string& line, const char* key) {
+    const std::regex pattern(std::format("\"{}\"\\s*:\\s*(true|false|1|0)", key));
+    std::smatch      match;
+    if (!std::regex_search(line, match, pattern) || match.size() < 2)
+        return std::nullopt;
+    const auto value = match[1].str();
+    return value == "true" || value == "1";
+}
+
 std::optional<uintptr_t> jsonAddressField(const std::string& line, const char* key) {
     const auto value = jsonStringField(line, key);
     if (!value.has_value() || value->empty())
@@ -86,9 +96,92 @@ std::string joinQuoted(const auto& items) {
 }
 }
 
+// --------------------------------------------------------------- damage hook
+//
+// Live window video is damage-driven: the daemon must learn that a window
+// repainted without polling it. CHyprRenderer::damageWindow runs inside the
+// compositor for every visual change of every window, which is exactly the
+// signal, so the plugin hooks it. The cost for a window nobody watches is one
+// empty-map test plus, at most, one hash lookup.
+static CFunctionHook* g_damageWindowHook = nullptr;
+typedef void (*origDamageWindow)(void*, PHLWINDOW, bool);
+
+static void hkDamageWindow(void* thisptr, PHLWINDOW window, bool forceFull) {
+    if (g_pStickManager && window)
+        g_pStickManager->onWindowDamaged(window);
+    ((origDamageWindow)g_damageWindowHook->m_original)(thisptr, window, forceFull);
+}
+
+void CStickManager::installDamageHook() {
+    if (g_damageWindowHook)
+        return;
+    const auto matches = HyprlandAPI::findFunctionsByName(PHANDLE, "damageWindow");
+    for (const auto& match : matches) {
+        if (!match.demangled.contains("CHyprRenderer::damageWindow"))
+            continue;
+        g_damageWindowHook = HyprlandAPI::createFunctionHook(PHANDLE, match.address, (void*)&hkDamageWindow);
+        if (g_damageWindowHook && g_damageWindowHook->hook()) {
+            Log::logger->log(Log::INFO, std::format("[hyprnav-plugin] damage hook on {}", match.demangled));
+            return;
+        }
+        g_damageWindowHook = nullptr;
+    }
+    Log::logger->log(Log::ERR, "[hyprnav-plugin] could not hook CHyprRenderer::damageWindow; frames fall back to polling");
+}
+
+void CStickManager::onWindowDamaged(PHLWINDOW window) {
+    // Fast path: nothing is watched, so this is one predictable branch.
+    if (m_frameWatches.empty())
+        return;
+    const auto address = reinterpret_cast<uintptr_t>(window.get());
+    const auto it      = m_frameWatches.find(address);
+    if (it == m_frameWatches.end())
+        return;
+    const auto now = nowMs();
+    if (it->second.lastSentMs != 0 && now - it->second.lastSentMs < it->second.intervalMs)
+        return;
+    it->second.lastSentMs = now;
+    broadcastFramesEvent(std::format("{{\"ev\":\"window_damaged\",\"addr\":\"0x{:x}\"}}\n", address));
+}
+
+void CStickManager::broadcastFramesEvent(const std::string& payload) {
+    for (auto& [fd, client] : m_clients) {
+        if (client.framesSubscriber)
+            sendLine(fd, payload);
+    }
+}
+
+// Tell the daemon when a dialog of a watched window appears or goes away, so
+// `follow=transient` can switch its pipeline without polling hyprctl.
+void CStickManager::noteTransient(PHLWINDOW window, bool mapped) {
+    if (!window)
+        return;
+    const auto address = reinterpret_cast<uintptr_t>(window.get());
+    if (!mapped) {
+        const auto known = m_announcedTransients.find(address);
+        if (known == m_announcedTransients.end())
+            return;
+        m_announcedTransients.erase(known);
+        broadcastFramesEvent(std::format("{{\"ev\":\"transient_unmapped\",\"addr\":\"0x{:x}\"}}\n", address));
+        return;
+    }
+    if (m_frameWatches.empty())
+        return;
+    const PHLWINDOW parent = window->m_isX11 ? window->x11Parent() : window->parent();
+    if (!parent)
+        return;
+    const auto parentAddress = reinterpret_cast<uintptr_t>(parent.get());
+    if (!m_frameWatches.contains(parentAddress))
+        return;
+    m_announcedTransients.insert(address);
+    broadcastFramesEvent(
+        std::format("{{\"ev\":\"transient_mapped\",\"addr\":\"0x{:x}\",\"parent\":\"0x{:x}\"}}\n", address, parentAddress));
+}
+
 CStickManager::CStickManager() : m_instanceID(randomInstanceID()) {
     refreshRuntimePaths();
     registerEventListeners();
+    installDamageHook();
 
     if (g_pEventLoopManager) {
         m_timer = makeShared<CEventLoopTimer>(std::optional<Time::steady_dur>{std::chrono::milliseconds{250}},
@@ -101,6 +194,11 @@ CStickManager::CStickManager() : m_instanceID(randomInstanceID()) {
 
 CStickManager::~CStickManager() {
     m_destroying = true;
+    if (g_damageWindowHook) {
+        g_damageWindowHook->unhook();
+        g_damageWindowHook = nullptr;
+    }
+    m_frameWatches.clear();
     if (m_timer)
         m_timer->cancel();
     if (m_timer && g_pEventLoopManager)
@@ -244,8 +342,17 @@ void CStickManager::disconnectClient(int fd) {
     const auto it = m_clients.find(fd);
     if (it == m_clients.end())
         return;
+    const auto wasSubscriber = it->second.framesSubscriber;
     close(fd);
     m_clients.erase(it);
+    if (!wasSubscriber)
+        return;
+    // The daemon went away: stop paying for damage bookkeeping.
+    const bool anyLeft = std::ranges::any_of(m_clients, [](const auto& entry) { return entry.second.framesSubscriber; });
+    if (!anyLeft) {
+        m_frameWatches.clear();
+        m_announcedTransients.clear();
+    }
 }
 
 bool CStickManager::sendLine(int fd, const std::string& payload) {
@@ -323,6 +430,29 @@ void CStickManager::handleClientLine(int fd, const std::string& line) {
             items += describe(root);
         }
         sendResult(fd, std::format("{{\"instance\":\"{}\",\"sticks\":[{}]}}", m_instanceID, items));
+        return;
+    }
+
+    if (*op == "frames_watch") {
+        const auto address = jsonAddressField(line, "addr");
+        if (!address.has_value()) {
+            sendError(fd, "frames_watch needs addr");
+            return;
+        }
+        // Answering makes this client a damage subscriber for as long as it
+        // stays connected; the daemon keeps exactly one such connection.
+        if (const auto client = m_clients.find(fd); client != m_clients.end())
+            client->second.framesSubscriber = true;
+        const auto on = jsonBoolField(line, "on").value_or(true);
+        if (on) {
+            const auto interval          = jsonIntField(line, "interval_ms").value_or(125);
+            auto&      watch             = m_frameWatches[*address];
+            watch.intervalMs             = interval > 0 ? static_cast<uint64_t>(interval) : 1;
+            watch.lastSentMs             = 0;
+        } else {
+            m_frameWatches.erase(*address);
+        }
+        sendResult(fd, std::format("{{\"watched\":{}}}", m_frameWatches.size()));
         return;
     }
 
@@ -681,7 +811,10 @@ void CStickManager::onWindowOpenEarly(PHLWINDOW window) {
 }
 
 void CStickManager::onWindowOpen(PHLWINDOW window) {
-    if (!window || m_roots.empty())
+    if (!window)
+        return;
+    noteTransient(window, true);
+    if (m_roots.empty())
         return;
     auto* root = attribute(window, true);
     if (!root)
@@ -693,6 +826,7 @@ void CStickManager::onWindowOpen(PHLWINDOW window) {
 void CStickManager::onWindowClose(PHLWINDOW window) {
     if (!window)
         return;
+    noteTransient(window, false);
     const auto address = reinterpret_cast<uintptr_t>(window.get());
     const auto it      = m_windowToStick.find(address);
     if (it == m_windowToStick.end())

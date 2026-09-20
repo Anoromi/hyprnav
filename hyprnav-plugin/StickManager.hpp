@@ -29,7 +29,15 @@
 //   {"op":"move","stick_id":"..","workspace_id":N}  retarget and move its windows
 //   {"op":"sync"}                                  -> {"ok":true,"result":{"instance":"..","active":[..],"dropped":[..]}}
 //   {"op":"list"}                                  -> per-stick detail
+//   {"op":"frames_watch","addr":"0x..","on":true,"interval_ms":125}
 // "watch"/"unwatch" are accepted as aliases of "stick"/"unstick".
+//
+// A client that has sent at least one `frames_watch` also becomes a *damage
+// subscriber*: besides its reply lines it receives unsolicited event lines
+//   {"ev":"window_damaged","addr":"0x.."}
+//   {"ev":"transient_mapped","addr":"0x..","parent":"0x.."}
+//   {"ev":"transient_unmapped","addr":"0x..","parent":"0x.."}
+// Damage events are coalesced per window to at most one per `interval_ms`.
 class CStickManager {
   public:
     CStickManager();
@@ -44,6 +52,14 @@ class CStickManager {
     struct SClientState {
         int         fd = -1;
         std::string readBuffer;
+        // Set by the first frames_watch: this client wants pushed events.
+        bool        framesSubscriber = false;
+    };
+
+    // One watched window: the daemon wants a damage ping, at most this often.
+    struct SFrameWatch {
+        uint64_t intervalMs = 125;
+        uint64_t lastSentMs = 0;
     };
 
     struct SStickRoot {
@@ -73,6 +89,15 @@ class CStickManager {
     bool sendOK(int fd);
     bool sendResult(int fd, const std::string& resultJSON);
     bool sendError(int fd, std::string_view message);
+
+    // frames: damage hook and the watched set
+  public:
+    void onWindowDamaged(PHLWINDOW window);
+
+  private:
+    void installDamageHook();
+    void broadcastFramesEvent(const std::string& payload);
+    void noteTransient(PHLWINDOW window, bool mapped);
 
     // lifecycle
     void wakeTimer(std::chrono::milliseconds timeout = std::chrono::milliseconds{1});
@@ -108,6 +133,9 @@ class CStickManager {
     CHyprSignalListener   m_openListener;
     CHyprSignalListener   m_closeListener;
     uint64_t              m_lastReapMs = 0;
+
+    std::unordered_map<uintptr_t, SFrameWatch>    m_frameWatches;
+    std::unordered_set<uintptr_t>                 m_announcedTransients;
 
     std::unordered_map<int, SClientState>          m_clients;
     std::unordered_map<std::string, SStickRoot>    m_roots;
