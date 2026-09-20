@@ -30,14 +30,35 @@
  *   {"ev":"ready"}
  *   {"ev":"capture_failed","addr":"0x…","reason":"…"}
  *   {"ev":"frame","addr":"0x…","len":N,"w":W,"h":H,"enc_ms":1.23}
+ *   {"ev":"raw","addr":"0x…","len":N,"w":W,"h":H,"real_h":RH,"pix":"bgr24"}
  * A `frame` line is followed immediately by exactly `len` raw JPEG bytes and
  * then the next line; nothing else may be interleaved.
  *
+ * A `raw` line has NO payload on stdout. The pixels go to the separate fd
+ * given by --raw-fd, so stdout stays a clean NDJSON stream. (The scratch
+ * experiment wrote raw pixels to stdout interleaved with the JSON, which
+ * desynchronises any reader that is also parsing lines; hence the second fd.)
+ * The daemon creates one pipe per video pipeline and hands its write end to
+ * the helper at spawn time as fd 3, so there is no fd passing at runtime and
+ * the pixels flow straight from the helper to the encoder's feeder.
+ *
+ * `h` is the height of the buffer that is written, padded up to a multiple of
+ * 16 because the VAAPI encoders demand it; `real_h` is how many of those rows
+ * are picture. Clients crop, or simply size their canvas from the decoded
+ * frame.
+ *
  * stdin, one JSON object per line:
- *   {"op":"start","addr":"0x…","max_width":640,"quality":60,"max_fps":8}
+ *   {"op":"start","addr":"0x…","max_width":640,"quality":60,"max_fps":8,
+ *    "mode":"mjpeg"|"raw","paced":0|1}
+ *   {"op":"capture","addr":"0x…"}   render exactly one frame now
  *   {"op":"stop","addr":"0x…"}
  * A second `start` for a running address just updates its parameters; the
  * caller does the refcounting.
+ *
+ * `paced` (the default, and the only mode a plain Hyprland without the hyprnav
+ * plugin can use) re-arms a capture every 1000/max_fps ms. With the plugin
+ * loaded the daemon starts the capture unpaced and issues one `capture` per
+ * damage event it is told about, so a still window costs literally nothing.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -79,6 +100,8 @@ enum backend { BACKEND_TOPLEVEL_EXPORT, BACKEND_COPY_CAPTURE };
 #define DEFAULT_MAX_WIDTH 640
 #define DEFAULT_QUALITY 60
 #define DEFAULT_MAX_FPS 8
+/* VAAPI encoders pad to 16 rows; do it here so the size is predictable. */
+#define HEIGHT_ALIGN 16
 /* Unexplained capture failures in a row before the address is given up on. */
 #define FAILURES_BEFORE_GIVING_UP 3
 
@@ -116,7 +139,13 @@ struct capture {
 	size_t previous_size;
 
 	int max_width, quality, max_fps;
+	/* Raw packed pixels to the --raw-fd pipe instead of JPEG on stdout. */
+	bool raw_mode;
+	/* Re-arm a capture on a timer (no plugin) instead of on demand. */
+	bool paced;
 	bool frame_in_flight;
+	/* An on-demand `capture` that the rate limit has not let through yet. */
+	bool pending_request;
 	uint32_t failures;
 	/* Earliest ms at which the next capture may be requested. */
 	uint64_t next_capture_ms;
@@ -156,6 +185,8 @@ static unsigned char *jpeg_buffer;
 static size_t jpeg_buffer_size;
 static uint8_t *scale_buffer;
 static size_t scale_buffer_size;
+/* Where raw pixels go, when asked for. Inherited from the daemon at spawn. */
+static int raw_out_fd = -1;
 
 /* Pending start commands whose window has not appeared yet are simply
  * rejected; the daemon re-issues them when it sees the `add`. */
@@ -258,6 +289,31 @@ static void emit_frame(uint64_t raw_address, const unsigned char *data, size_t l
 	       address, length, width, height, encode_ms);
 	fwrite(data, 1, length, stdout);
 	fflush(stdout);
+}
+
+/* Raw pixels: the header line on stdout, the bytes on the separate fd. The
+ * header goes first so the daemon can size the encoder before the pixels
+ * arrive; the pipe is what applies back pressure. */
+static void emit_raw(uint64_t raw_address, const uint8_t *data, size_t length, uint32_t width,
+                     uint32_t height, uint32_t real_height, const char *pix) {
+	char address[32];
+	format_address(address, sizeof(address), raw_address);
+	printf("{\"ev\":\"raw\",\"addr\":\"%s\",\"len\":%zu,\"w\":%u,\"h\":%u,\"real_h\":%u,"
+	       "\"pix\":\"%s\"}\n",
+	       address, length, width, height, real_height, pix);
+	fflush(stdout);
+	size_t written = 0;
+	while (written < length) {
+		ssize_t got = write(raw_out_fd, data + written, length - written);
+		if (got < 0) {
+			if (errno == EINTR) {
+				continue;
+			}
+			stop_requested = 1;
+			return;
+		}
+		written += (size_t)got;
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -536,6 +592,28 @@ static void encode_and_emit(struct capture *capture) {
 		}
 	}
 
+	if (capture->raw_mode) {
+		/* nv12 wants an even width, the VAAPI encoders want the height a
+		 * multiple of 16. Scale to the true aspect, then pad the bottom with
+		 * black and report how many rows are picture. */
+		if (target_width < 2) {
+			target_width = 2;
+		}
+		target_width &= ~1u;
+		uint32_t real_height = target_height ? target_height : 1;
+		uint32_t padded_height = (real_height + (HEIGHT_ALIGN - 1)) & ~(uint32_t)(HEIGHT_ALIGN - 1);
+		size_t row = (size_t)target_width * 3;
+		uint8_t *scaled = ensure_scale_buffer(row * padded_height);
+		box_downscale(capture->pixels, capture->buffer_stride, source_width, source_height,
+		              capture->export_flip, scaled, target_width, real_height);
+		if (padded_height > real_height) {
+			memset(scaled + row * real_height, 0, row * (padded_height - real_height));
+		}
+		emit_raw(capture->owner->address, scaled, row * padded_height, target_width, padded_height,
+		         real_height, capture->pixel_format_3 == TJPF_BGR ? "bgr24" : "rgb24");
+		return;
+	}
+
 	const unsigned char *pixels;
 	int pixel_format;
 	int pitch;
@@ -680,7 +758,12 @@ static void export_handle_ready(void *data, struct hyprland_toplevel_export_fram
 	}
 	uint64_t interval = capture->max_fps > 0 ? 1000u / (uint64_t)capture->max_fps : 0;
 	capture->next_capture_ms = now_ms() + interval;
-	capture_request_frame(capture);
+	/* Unpaced: the next frame comes from a `capture` command, i.e. from a
+	 * compositor damage event. Asking again here is what would make a still
+	 * window cost a render per tick. */
+	if (capture->paced) {
+		capture_request_frame(capture);
+	}
 }
 
 static void export_handle_failed(void *data, struct hyprland_toplevel_export_frame_v1 *frame) {
@@ -819,6 +902,7 @@ static void capture_request_frame(struct capture *capture) {
 	if (now_ms() < capture->next_capture_ms) {
 		return; /* the poll timeout brings us back */
 	}
+	capture->pending_request = false;
 	if (run_backend == BACKEND_TOPLEVEL_EXPORT) {
 		export_request_frame(capture);
 		return;
@@ -945,13 +1029,17 @@ static void capture_stop(struct toplevel *entry, const char *reason) {
 	}
 }
 
-static void capture_start(struct toplevel *entry, int max_width, int quality, int max_fps) {
+static void capture_start(struct toplevel *entry, int max_width, int quality, int max_fps,
+                          bool raw_mode, bool paced) {
 	if (entry->capture) {
 		struct capture *capture = entry->capture;
-		bool changed = capture->max_width != max_width || capture->quality != quality;
+		bool changed = capture->max_width != max_width || capture->quality != quality ||
+		               capture->raw_mode != raw_mode;
 		capture->max_width = max_width;
 		capture->quality = quality;
 		capture->max_fps = max_fps;
+		capture->raw_mode = raw_mode;
+		capture->paced = paced;
 		if (changed) {
 			/* New geometry or quality: the cached comparison no longer
 			 * describes what the caller would get, so re-emit. */
@@ -968,11 +1056,17 @@ static void capture_start(struct toplevel *entry, int max_width, int quality, in
 		emit_capture_failed(entry->address, "unsupported");
 		return;
 	}
+	if (raw_mode && raw_out_fd < 0) {
+		emit_capture_failed(entry->address, "no_raw_fd");
+		return;
+	}
 	struct capture *capture = xalloc(sizeof(*capture));
 	capture->owner = entry;
 	capture->max_width = max_width;
 	capture->quality = quality;
 	capture->max_fps = max_fps;
+	capture->raw_mode = raw_mode;
+	capture->paced = paced;
 	if (run_backend == BACKEND_TOPLEVEL_EXPORT) {
 		entry->capture = capture;
 		capture_request_frame(capture);
@@ -1184,6 +1278,16 @@ static void run_command(const char *line) {
 		}
 		return;
 	}
+	if (strcmp(op, "capture") == 0) {
+		/* One frame, now: the compositor told the daemon this window changed. */
+		struct toplevel *entry = find_by_address(address);
+		if (!entry || !entry->capture) {
+			return;
+		}
+		entry->capture->pending_request = true;
+		capture_request_frame(entry->capture);
+		return;
+	}
 	if (strcmp(op, "start") != 0) {
 		return;
 	}
@@ -1193,6 +1297,10 @@ static void run_command(const char *line) {
 	json_int_field(line, "max_width", &max_width);
 	json_int_field(line, "quality", &quality);
 	json_int_field(line, "max_fps", &max_fps);
+	char mode[16] = "mjpeg";
+	json_string_field(line, "mode", mode, sizeof(mode));
+	long paced = 1;
+	json_int_field(line, "paced", &paced);
 	if (max_width < 16) {
 		max_width = 16;
 	}
@@ -1213,7 +1321,8 @@ static void run_command(const char *line) {
 		emit_capture_failed(address, "unknown_window");
 		return;
 	}
-	capture_start(entry, (int)max_width, (int)quality, (int)max_fps);
+	capture_start(entry, (int)max_width, (int)quality, (int)max_fps, strcmp(mode, "raw") == 0,
+	              paced != 0);
 }
 
 /* Read whatever stdin has and run every complete line. Returns false on EOF. */
@@ -1249,7 +1358,8 @@ static bool drain_stdin(void) {
 
 static int usage(FILE *out, int code) {
 	fputs("usage: hyprnav-capture [--list | --once | --resolve 0xADDRESS]\n"
-	      "                       [--backend toplevel-export|copy-capture]\n",
+	      "                       [--backend toplevel-export|copy-capture]\n"
+	      "                       [--raw-fd N]\n",
 	      out);
 	return code;
 }
@@ -1266,6 +1376,9 @@ static int poll_timeout_ms(void) {
 		if (run_backend == BACKEND_COPY_CAPTURE && !capture->configured) {
 			continue;
 		}
+		if (!capture->paced && !capture->pending_request) {
+			continue; /* waiting for a damage-driven `capture` command */
+		}
 		if (capture->next_capture_ms <= now) {
 			return 0;
 		}
@@ -1279,7 +1392,7 @@ static int poll_timeout_ms(void) {
 
 static void service_rate_limited_captures(void) {
 	for (struct toplevel *entry = toplevels; entry; entry = entry->next) {
-		if (entry->capture) {
+		if (entry->capture && (entry->capture->paced || entry->capture->pending_request)) {
 			capture_request_frame(entry->capture);
 		}
 	}
@@ -1305,6 +1418,14 @@ int main(int argc, char **argv) {
 				fprintf(stderr, "hyprnav-capture: unknown backend %s\n", name);
 				return 2;
 			}
+		} else if (strcmp(argv[i], "--raw-fd") == 0 && i + 1 < argc) {
+			char *end = NULL;
+			long value = strtol(argv[++i], &end, 10);
+			if (!end || *end != '\0' || value < 0) {
+				fprintf(stderr, "hyprnav-capture: bad --raw-fd %s\n", argv[i]);
+				return 2;
+			}
+			raw_out_fd = (int)value;
 		} else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
 			return usage(stdout, 0);
 		} else {

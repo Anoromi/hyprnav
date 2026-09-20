@@ -100,8 +100,13 @@ rustPlatform.buildRustPackage {
     # ext-foreign-toplevel identifiers and streams JPEG frames of single
     # windows. Its protocol glue is generated here; nothing generated is in
     # the tree. It is also installed under its identification-only name.
+    make -C tools/capture clean \
+      WAYLAND_SCANNER=wayland-scanner \
+      WAYLAND_PROTOCOLS_DIR=${wayland-protocols}/share/wayland-protocols \
+      HYPRLAND_PROTOCOLS_DIR=${hyprland-protocols}/share/hyprland-protocols \
+      WLR_PROTOCOLS_DIR=${wlr-protocols}/share/wlr-protocols
     make -C tools/capture \
-      WAYLAND_SCANNER=${wayland-scanner}/bin/wayland-scanner \
+      WAYLAND_SCANNER=wayland-scanner \
       WAYLAND_PROTOCOLS_DIR=${wayland-protocols}/share/wayland-protocols \
       HYPRLAND_PROTOCOLS_DIR=${hyprland-protocols}/share/hyprland-protocols \
       WLR_PROTOCOLS_DIR=${wlr-protocols}/share/wlr-protocols
