@@ -59,8 +59,23 @@ compositor ──toplevel-export (dmabuf, wait-for-damage)──► hyprnav-capt
   DRM PRIME 2), scale with the VA-API video-processing pipeline to the requested width (default
   640, tiers 320/640/960/native), output NV12, encode with `av1_vaapi`-class encoder
   (VAProfileAV1Profile0, low-delay, CQP ~30 or CBR 400–800 kbps at 640 wide).
-* Codec choice: AV1. Both Firefox (Zen) and Chromium (Electron) decode it; HEVC is out (Firefox);
-  H.264 kept as fallback for encoders/decoders without AV1.
+* Codec is configurable, never hard-wired:
+  * Daemon config (`~/.config/hyprnav/config.toml`, section `[frames]`): `encoder = "vaapi" |
+    "software" | "nvenc" | "auto"`, `vaapi_device`, `codecs = ["av1","h264","hevc","vp9"]` (the
+    allow-list in preference order), `default_width`, `max_pipelines`, and per-codec overrides
+    (`[frames.codec.av1] qp = 30`, `bitrate`, `gop`, `low_power`). `auto` probes the ffmpeg
+    encoder list once at startup and keeps what actually initialises on this GPU.
+  * Client negotiation: the request line carries `"codecs": ["av1","h264","mjpeg"]` in the
+    client's preference order (the browser fills it from `VideoDecoder.isConfigSupported`); the
+    daemon picks the first one it is configured and able to encode and reports it in the first
+    record (`flags = CONFIG`, codec string in the payload header). `format` stays as a single-value
+    shorthand for CLI use.
+  * Pipelines are keyed by `(address, codec, width)`; two clients that agree share one encoder,
+    two that disagree get two. `max_pipelines` bounds the total; beyond it the daemon answers
+    with the nearest existing pipeline's codec if the client accepts it, else `busy`.
+  * Defaults on this machine: AV1 first (Firefox and Chromium both decode it, VCN encodes it
+    fastest of the three), H.264 second (universal decode), HEVC only when a client asks (Firefox
+    cannot decode it), MJPEG last as the no-WebCodecs fallback.
 * GOP: closed GOP with an IDR every 2 s while frames flow, and an IDR on demand when a new
   watcher joins (force-key-unit). With damage-driven input the GOP is in frames, not time.
 * Implementation tiers, cheapest first, chosen by measurement (E2):
@@ -90,7 +105,8 @@ compositor ──toplevel-export (dmabuf, wait-for-damage)──► hyprnav-capt
 
 ### 4. Wire format (frames.sock, unchanged socket, new `format`)
 
-Request line: `{"address":"0x…","format":"av1"|"h264"|"mjpeg","max_width":640,"max_fps":8}`.
+Request line: `{"address":"0x…","codecs":["av1","h264","mjpeg"],"max_width":640,"max_fps":8}`
+(`"format":"av1"` accepted as shorthand for a one-element list).
 `mjpeg` (default for compatibility) keeps today's multipart body.
 `av1`/`h264`: a byte stream of records:
 
@@ -98,14 +114,18 @@ Request line: `{"address":"0x…","format":"av1"|"h264"|"mjpeg","max_width":640,
 u32 magic 'HNVF' | u32 len | u32 flags | u64 pts_us | u16 width | u16 height | payload[len]
 flags: 1=KEYFRAME 2=CONFIG(sequence header / SPS+PPS) 4=KEEPALIVE
 ```
-One record = one temporal unit (AV1) / one access unit (H.264). T3's route passes bytes through
+One record = one temporal unit (AV1) / one access unit (H.264/HEVC) / one frame (VP9). The
+CONFIG record's payload starts with a NUL-terminated codec string (`av01.0.08M.08`,
+`avc1.42E01E`, …) so the client can construct its decoder without guessing, followed by the
+codec's out-of-band config if any (SPS/PPS for H.264). T3's route passes bytes through
 with `Content-Type: application/vnd.hyprnav.frames`. `hyprnav frames --format av1 -o out.ivf`
 writes IVF for `ffplay`.
 
 ### 5. Client: WebCodecs, MJPEG fallback
 
-* Browser: `fetch()` the route, parse records from a `ReadableStream`, feed `VideoDecoder`
-  (`codec: "av01.0.08M.08"`; H.264 `avc1.42E01E` fallback), paint `VideoFrame`s to a canvas
+* Browser: probe `VideoDecoder.isConfigSupported` for the codecs it knows, send that list as
+  `codecs`, `fetch()` the route, parse records from a `ReadableStream`, configure `VideoDecoder`
+  from the CONFIG record's codec string, paint `VideoFrame`s to a canvas
   sized to the player. Firefox ≥130 and Chromium support WebCodecs video; hardware decode where
   available, dav1d software otherwise (sub-millisecond at 640 wide).
 * Why not fMP4 + Media Source Extensions: it needs a muxer, init segments, timestamp
