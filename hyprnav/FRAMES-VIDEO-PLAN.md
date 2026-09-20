@@ -32,26 +32,40 @@ compositor ──toplevel-export (dmabuf, wait-for-damage)──► hyprnav-capt
                                                                                          browser: WebCodecs → canvas
 ```
 
-### 1. Capture: damage-driven, GPU buffers
+### 1. Capture: change-driven via the plugin, shm first
 
-* Protocol: `hyprland-toplevel-export-v1` (keep; `ext-image-copy-capture` never completes for
-  windows on hidden workspaces, verified).
-* `copy(buffer, ignore_damage = 0)`: the compositor queues the frame and completes it on the next
-  output commit after the window is damaged (`ToplevelExport.cpp:198-201, 222`). A static window
-  produces nothing: no render, no copy, no compare. This replaces today's `ignore_damage = 1`
-  polling loop plus identical-pixel dedupe.
-* Keep the app painting while hidden: today's `ignore_damage = 1` render unblocks surface
-  feedback and so wakes the app itself. With wait-for-damage there is no render until damage, so
-  a hidden app that only paints on frame callbacks would deadlock. The daemon already sets
-  `render_unfocused = true` on the window while it has watchers; that delivers frame callbacks at
-  `misc:render_unfocused_fps` (15). Keep it, and make it mandatory in this mode.
-  Experiment E1 below verifies the combination.
-* Buffers: request `linux_dmabuf` buffers (event `linux_dmabuf`, `copyDmabuf` in Hyprland),
-  allocated with GBM on `/dev/dri/renderD128`, 2–3 rotating buffers. The compositor renders the
-  window straight into GPU memory; no shm readback, no CPU copy.
-  Fallback: shm path as today if the compositor refuses dmabuf for this window.
-* Frame pacing: `max_fps` is a ceiling only; damage decides. If damage arrives faster than the
-  ceiling, skip requesting the next frame until the slot; no frames are queued.
+Experiment E1 (2026-09-20) killed the original premise: `copy(buffer, ignore_damage = 0)` is
+released by the next **monitor commit**, not by the window's damage (`ToplevelExport.cpp`
+`onOutputCommit` has no per-window check). A hidden window therefore starves on a quiet screen
+and gets captured on every unrelated repaint on a busy one. `render_unfocused` keeps the app
+painting but does not influence delivery. So:
+
+* Protocol stays `hyprland-toplevel-export-v1` with `ignore_damage = 1` (synchronous standalone
+  render; proven for hidden windows).
+* Change detection moves into the hyprnav **plugin**, which runs inside the compositor: hook
+  `CHyprRenderer::damageWindow(PHLWINDOW, …)` (CFunctionHook, as the existing StickManager hooks
+  do), and for windows the daemon has marked "watched" post a `window_damaged {address}` event to
+  the daemon over the existing plugin↔daemon channel, coalesced to at most one per
+  `1000/max_fps` ms per window. Only watched windows generate traffic; unwatched cost one map
+  lookup per damage call.
+* Daemon: on `window_damaged` for a watched address, tell the helper to capture that window once
+  (`{"op":"capture","addr":…}`). No polling loop. A static window: zero renders, zero copies,
+  zero encodes. The helper's identical-pixel dedupe stays as a safety net (damage without visual
+  change, e.g. cursor blink in a terminal) but is no longer the primary mechanism.
+* Keep the app painting while hidden: hidden clients only repaint on frame callbacks. The
+  standalone render sends them (surface feedback unblocked when the window is not visible), so
+  a moving window sustains itself once capture starts; to bootstrap and to survive quiet spells
+  the daemon sets `render_unfocused = true` on watched windows (frame callbacks at
+  `misc:render_unfocused_fps`, 15) and unsets it when the last watcher leaves. Verified harmless.
+* Fallback when the plugin is not loaded (plain Hyprland): today's paced loop at `max_fps` with
+  dedupe (0.6 % of a core per moving window, measured).
+* Visible windows: `ignore_damage = 0` is strictly better there (11 renders for 11 changes vs
+  79 in E1); optional optimisation, not required.
+* Buffers: shm readback + integer box downscale as today (2 % of a core per window at 640 wide,
+  E2). dmabuf capture is verified feasible (E4: `AR24`, linear modifier, GBM on renderD128, hidden
+  windows render) and is the T2 upgrade when several windows are watched at once.
+* Scaled height aligned to 16 (VAAPI encoders pad `640x365 → 640x368`); clients size the canvas
+  from the decoded frame, not the record header.
 
 ### 2. Scale and encode: GPU, zero-copy
 
@@ -76,8 +90,10 @@ compositor ──toplevel-export (dmabuf, wait-for-damage)──► hyprnav-capt
   * Defaults on this machine: AV1 first (Firefox and Chromium both decode it, VCN encodes it
     fastest of the three), H.264 second (universal decode), HEVC only when a client asks (Firefox
     cannot decode it), MJPEG last as the no-WebCodecs fallback.
-* GOP: closed GOP with an IDR every 2 s while frames flow, and an IDR on demand when a new
-  watcher joins (force-key-unit). With damage-driven input the GOP is in frames, not time.
+* GOP: `-g 16 -bf 0 -async_depth 1` are mandatory (E2: `-async_depth 1` cuts encoder latency
+  from 136 ms to 2 ms; `-bf 0` alone does not). Quality via `-q:v` (`-qp` is ignored by the VAAPI
+  encoders). `-low_power` has no AV1 entrypoint on this GPU. IDR on demand when a watcher joins
+  is not available through ffmpeg; the GOP cache covers joins instead.
 * Implementation tiers, cheapest first, chosen by measurement (E2):
   * T1 `ffmpeg` child per watched window: `-f rawvideo` on stdin (helper does shm readback and
     integer downscale as today), `-vf format=nv12,hwupload -c:v av1_vaapi`, raw OBU/IVF on
@@ -154,8 +170,16 @@ allowlist; for any non-loopback exposure (Tailscale) use the signed-URL pattern 
 | case | capture | scale+encode | daemon | wire |
 |---|---|---|---|---|
 | static hidden window | 0 (no damage) | 0 | 0 | 0 (keepalive 10 s) |
-| ticking countdown, ≤15 fps | GPU render only | GPU (VCN), CPU ≈ upload copy (T1) or 0 (T2/T3) | fan-out of ~2–6 KB records | 20–50 KB/s |
+| ticking countdown, 8 fps | one standalone render per change | 2 % helper + 2 % ffmpeg (E2, T1) | ~150 records/20 s | **~3 KB/s AV1, ~2 KB/s H.264** (E2) |
 | 4 windows watched | linear in moving windows only | VCN has headroom for dozens of 640p streams | negligible | linear |
+
+## Experiment results (2026-09-20)
+
+* E1 no-go for `ignore_damage=0` on hidden windows (monitor-commit driven); §1 redesigned around
+  a plugin damage hook. E2 go: av1_vaapi/h264_vaapi with `-async_depth 1`, 2 ms, ~3 KB/s.
+  E3 go: WebCodecs in Firefox 155 and Chromium 152 decode the record stream, 1–4 ms to paint,
+  10 s gaps fine; HEVC unsupported in both; H.264 must be Annex-B without `description`.
+  E4 go: dmabuf capture works for hidden windows (deferred to T2).
 
 ## Experiments before building (each ≤ 1 h, lab only)
 
