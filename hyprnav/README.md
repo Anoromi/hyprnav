@@ -578,10 +578,9 @@ daemon would otherwise need Wayland and JPEG crates for:
 - follows `ext-foreign-toplevel-list-v1` for the per-window `identifier`
 - asks `hyprland-toplevel-mapping-v1` for each toplevel's window address, so
   the two can be paired with what `hyprctl clients` prints
-- runs an `ext-image-copy-capture-v1` session per watched window, over an
-  `ext_foreign_toplevel_image_capture_source_manager_v1` source, into a
-  reused `wl_shm` buffer; scales with an integer box filter and encodes with
-  libjpeg-turbo
+- renders each watched window on demand with `hyprland-toplevel-export-v1`
+  into a reused `wl_shm` buffer, scaling with an integer box filter and
+  encoding with libjpeg-turbo
 
 Standalone modes:
 
@@ -589,6 +588,7 @@ Standalone modes:
 hyprnav-capture --list             # one `add` line per window, then exit
 hyprnav-capture --resolve 0x…      # print the bare identifier, exit 3 if unknown
 hyprnav-toplevel-map               # the same binary under its identification name
+hyprnav-capture --backend copy-capture   # the other backend, see below
 ```
 
 With no arguments it speaks NDJSON on stdout and takes NDJSON commands on
@@ -616,21 +616,42 @@ leading zeros. stdin:
 A second `start` for a running address only updates its parameters; the
 daemon does the refcounting.
 
+### Why toplevel-export and not ext-image-copy-capture
+
+`--backend copy-capture` is the standard `ext-image-copy-capture-v1` path and
+is the better protocol on paper: it is damage-driven, so an idle window
+wakes nobody. It is unusable here. Hyprland only completes those frames
+while the window is being rendered for a monitor, so a window on a workspace
+that is not on screen — which is where an agent's windows live — freezes at
+whatever it last showed. A ticking countdown on a hidden workspace yields 2
+frames in 10 s; the window property `render_unfocused` does not change that.
+
+`hyprland-toplevel-export-v1` renders the requested window standalone into
+our buffer when we ask, whatever its visibility, so the same countdown
+yields 12. That is why it is the default. `copy-capture` stays selectable
+for the day the other implementation catches up.
+
+Rendering on demand also means the helper, not the compositor, decides how
+often, so it paces itself at `max_fps` and compares the raw buffer before
+encoding. A window that renders but does not change costs one buffer compare
+and no encode; a window that changes costs one encode.
+
 ### What frame streaming costs
 
-`ext-image-copy-capture` completes a frame only when the compositor repaints
-the window, and the helper compares the raw buffer before encoding and skips
-identical pixels. So a window that is not changing — including any window on
-a workspace that is not on screen — produces its first frame and then
-nothing at all: no encode, no wakeup, no traffic.
-
-Measured in the lab (Hyprland 0.56.2, 1920x1080, `max_width` 640):
+Measured in the lab (Hyprland 0.56.2, 1920x1080, `max_width` 640, `--fps 8`):
 
 | Watched window | Frames | Helper CPU |
 |---|---|---|
-| terminal scrolling on the visible workspace, two clients | 15 / 10 s | 40 ms / 10 s |
-| GTK window on a workspace that is not on screen | 1 / 20 s | 10 ms / 20 s |
+| GTK countdown ticking on a workspace that is not on screen | 11 / 10 s | 70 ms / 10 s |
+| the same window, two clients sharing the capture | 11 / 10 s each | one capture |
+| still window on a workspace that is not on screen | 1 / 20 s | 50 ms / 20 s |
 
 Downscale plus JPEG encode of a 1920x1080 window to 640 px wide costs 2.3 to
 5 ms, logged per frame at `debug` level (`encode_ms`). A start that produces
 no frame within two seconds is reported at `warn` level.
+
+While an address has subscribers the daemon also sets `render_unfocused` on
+that window and clears it when the last one leaves, so a client that only
+repaints on a frame callback keeps going. Rendering the window standalone
+already delivers those callbacks, so this is not what makes the countdown
+tick — it is insurance for clients that behave differently.

@@ -17,6 +17,7 @@ FTL_XML = $(STAGING)/ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1.xml
 SRC_XML = $(STAGING)/ext-image-capture-source/ext-image-capture-source-v1.xml
 CAP_XML = $(STAGING)/ext-image-copy-capture/ext-image-copy-capture-v1.xml
 MAP_XML = $(HYPRLAND_PROTOCOLS_DIR)/protocols/hyprland-toplevel-mapping-v1.xml
+EXPORT_XML = $(HYPRLAND_PROTOCOLS_DIR)/protocols/hyprland-toplevel-export-v1.xml
 # hyprland-toplevel-mapping-v1 also accepts zwlr toplevel handles, so its
 # interface table references wlr-foreign-toplevel-management even though only
 # the ext- path is used here; the generated code still has to be linked in.
@@ -27,6 +28,7 @@ PROTOCOLS = \
 	ext-image-capture-source-v1 \
 	ext-image-copy-capture-v1 \
 	hyprland-toplevel-mapping-v1 \
+	hyprland-toplevel-export-v1 \
 	wlr-foreign-toplevel-management-unstable-v1
 
 HEADERS = $(PROTOCOLS:%=%-client-protocol.h)
@@ -54,6 +56,10 @@ ext-image-copy-capture-v1-protocol.c: $(CAP_XML)
 hyprland-toplevel-mapping-v1-client-protocol.h: $(MAP_XML)
 	$(WAYLAND_SCANNER) client-header $< $@
 hyprland-toplevel-mapping-v1-protocol.c: $(MAP_XML)
+	$(WAYLAND_SCANNER) private-code $< $@
+hyprland-toplevel-export-v1-client-protocol.h: $(EXPORT_XML)
+	$(WAYLAND_SCANNER) client-header $< $@
+hyprland-toplevel-export-v1-protocol.c: $(EXPORT_XML)
 	$(WAYLAND_SCANNER) private-code $< $@
 wlr-foreign-toplevel-management-unstable-v1-client-protocol.h: $(WLR_XML)
 	$(WAYLAND_SCANNER) client-header $< $@

@@ -60,8 +60,21 @@
 #include "hyprland-toplevel-mapping-v1-client-protocol.h"
 #include "ext-image-capture-source-v1-client-protocol.h"
 #include "ext-image-copy-capture-v1-client-protocol.h"
+#include "hyprland-toplevel-export-v1-client-protocol.h"
 
 enum mode { MODE_STREAM, MODE_LIST, MODE_RESOLVE };
+
+/* How pixels are pulled out of the compositor.
+ *
+ * TOPLEVEL_EXPORT renders the window standalone into our buffer on demand, so
+ * it works for windows that are not on screen -- which is the whole point
+ * here, since an agent's window normally sits on a workspace nobody is
+ * looking at. COPY_CAPTURE is the standard ext-image-copy-capture-v1 path:
+ * it is damage-driven and costs nothing when a window is still, but Hyprland
+ * only completes its frames while the window is actually being rendered, so
+ * a hidden window freezes. It stays available behind --backend for the day
+ * that changes. */
+enum backend { BACKEND_TOPLEVEL_EXPORT, BACKEND_COPY_CAPTURE };
 
 #define DEFAULT_MAX_WIDTH 640
 #define DEFAULT_QUALITY 60
@@ -74,6 +87,12 @@ struct toplevel;
 /* Everything needed to keep one window's capture running. */
 struct capture {
 	struct toplevel *owner;
+	/* toplevel-export: one single-use frame object per captured image. */
+	struct hyprland_toplevel_export_frame_v1 *export_frame;
+	uint32_t export_format, export_width, export_height, export_stride;
+	bool export_has_buffer_info;
+	bool export_flip;
+	/* copy-capture: */
 	struct ext_image_capture_source_v1 *source;
 	struct ext_image_copy_capture_session_v1 *session;
 	struct ext_image_copy_capture_frame_v1 *frame;
@@ -90,6 +109,8 @@ struct capture {
 	uint8_t *pixels;
 	size_t pixels_size;
 	uint32_t buffer_width, buffer_height, buffer_stride, buffer_format;
+	/* TJPF_* for the 4-byte source and for the 3-byte downscaled copy. */
+	int pixel_format_4, pixel_format_3;
 	/* Copy of the last captured pixels, to skip re-encoding a still image. */
 	uint8_t *previous;
 	size_t previous_size;
@@ -121,6 +142,9 @@ static struct ext_foreign_toplevel_list_v1 *toplevel_list;
 static struct hyprland_toplevel_mapping_manager_v1 *mapping_manager;
 static struct ext_foreign_toplevel_image_capture_source_manager_v1 *source_manager;
 static struct ext_image_copy_capture_manager_v1 *copy_manager;
+static struct hyprland_toplevel_export_manager_v1 *export_manager;
+static uint32_t export_manager_version;
+static enum backend run_backend = BACKEND_TOPLEVEL_EXPORT;
 
 static struct toplevel *toplevels;
 static enum mode run_mode = MODE_STREAM;
@@ -325,6 +349,25 @@ static struct toplevel *find_by_address(uint64_t address) {
 // shm buffers
 // ---------------------------------------------------------------------------
 
+/* Map a wl_shm format onto the turbojpeg pixel formats for the 4-byte source
+ * and the 3-byte downscaled copy. False when we cannot encode it. */
+static bool pixel_formats_for(uint32_t shm_format, int *four, int *three) {
+	switch (shm_format) {
+	case WL_SHM_FORMAT_XRGB8888:
+	case WL_SHM_FORMAT_ARGB8888:
+		*four = TJPF_BGRX;
+		*three = TJPF_BGR;
+		return true;
+	case WL_SHM_FORMAT_XBGR8888:
+	case WL_SHM_FORMAT_ABGR8888:
+		*four = TJPF_RGBX;
+		*three = TJPF_RGB;
+		return true;
+	default:
+		return false;
+	}
+}
+
 static void capture_release_buffer(struct capture *capture) {
 	if (capture->buffer) {
 		wl_buffer_destroy(capture->buffer);
@@ -341,16 +384,21 @@ static void capture_release_buffer(struct capture *capture) {
 	capture->buffer_width = capture->buffer_height = 0;
 }
 
-/* (Re)create the shm buffer the compositor copies into. */
-static bool capture_ensure_buffer(struct capture *capture) {
-	if (capture->buffer && capture->buffer_width == capture->width &&
-	    capture->buffer_height == capture->height && capture->buffer_format == capture->format) {
+/* (Re)create the shm buffer the compositor copies into. The stride is
+ * dictated by the compositor for toplevel-export, which rejects anything
+ * else, so it is passed in rather than assumed. */
+static bool capture_make_buffer(struct capture *capture, uint32_t width, uint32_t height,
+                                uint32_t stride, uint32_t format) {
+	if (capture->buffer && capture->buffer_width == width && capture->buffer_height == height &&
+	    capture->buffer_stride == stride && capture->buffer_format == format) {
 		return true;
+	}
+	if (!pixel_formats_for(format, &capture->pixel_format_4, &capture->pixel_format_3)) {
+		return false;
 	}
 	capture_release_buffer(capture);
 
-	uint32_t stride = capture->width * 4;
-	size_t size = (size_t)stride * capture->height;
+	size_t size = (size_t)stride * height;
 	if (size == 0) {
 		return false;
 	}
@@ -373,9 +421,8 @@ static bool capture_ensure_buffer(struct capture *capture) {
 		munmap(pixels, size);
 		return false;
 	}
-	capture->buffer = wl_shm_pool_create_buffer(pool, 0, (int32_t)capture->width,
-	                                            (int32_t)capture->height, (int32_t)stride,
-	                                            capture->format);
+	capture->buffer = wl_shm_pool_create_buffer(pool, 0, (int32_t)width, (int32_t)height,
+	                                            (int32_t)stride, format);
 	wl_shm_pool_destroy(pool);
 	if (!capture->buffer) {
 		munmap(pixels, size);
@@ -383,21 +430,28 @@ static bool capture_ensure_buffer(struct capture *capture) {
 	}
 	capture->pixels = pixels;
 	capture->pixels_size = size;
-	capture->buffer_width = capture->width;
-	capture->buffer_height = capture->height;
+	capture->buffer_width = width;
+	capture->buffer_height = height;
 	capture->buffer_stride = stride;
-	capture->buffer_format = capture->format;
+	capture->buffer_format = format;
 	return true;
+}
+
+static bool capture_ensure_buffer(struct capture *capture) {
+	return capture_make_buffer(capture, capture->width, capture->height, capture->width * 4,
+	                           capture->format);
 }
 
 // ---------------------------------------------------------------------------
 // downscale + encode
 // ---------------------------------------------------------------------------
 
-/* Box-average `src` (BGRx, `stride` bytes per row) into packed BGR of
- * `dst_width` x `dst_height`. Integer maths only; no floats, no libraries. */
+/* Box-average `src` (4 bytes per pixel, `stride` bytes per row) into a packed
+ * 3-byte image of `dst_width` x `dst_height`. The first three channels are
+ * copied in source order, so the caller's turbojpeg format carries the
+ * meaning. `flip` reads rows bottom-up. Integer maths only. */
 static void box_downscale(const uint8_t *src, uint32_t stride, uint32_t src_width,
-                          uint32_t src_height, uint8_t *dst, uint32_t dst_width,
+                          uint32_t src_height, bool flip, uint8_t *dst, uint32_t dst_width,
                           uint32_t dst_height) {
 	for (uint32_t y = 0; y < dst_height; y++) {
 		uint32_t y0 = (uint32_t)((uint64_t)y * src_height / dst_height);
@@ -411,21 +465,22 @@ static void box_downscale(const uint8_t *src, uint32_t stride, uint32_t src_widt
 			if (x1 <= x0) {
 				x1 = x0 + 1;
 			}
-			uint32_t blue = 0, green = 0, red = 0, count = 0;
+			uint32_t c0 = 0, c1 = 0, c2 = 0, count = 0;
 			for (uint32_t sy = y0; sy < y1; sy++) {
-				const uint8_t *row = src + (size_t)sy * stride + (size_t)x0 * 4;
+				uint32_t source_y = flip ? src_height - 1 - sy : sy;
+				const uint8_t *row = src + (size_t)source_y * stride + (size_t)x0 * 4;
 				for (uint32_t sx = x0; sx < x1; sx++) {
-					blue += row[0];
-					green += row[1];
-					red += row[2];
+					c0 += row[0];
+					c1 += row[1];
+					c2 += row[2];
 					row += 4;
 					count++;
 				}
 			}
 			uint8_t *out = dst + ((size_t)y * dst_width + x) * 3;
-			out[0] = (uint8_t)(blue / count);
-			out[1] = (uint8_t)(green / count);
-			out[2] = (uint8_t)(red / count);
+			out[0] = (uint8_t)(c0 / count);
+			out[1] = (uint8_t)(c1 / count);
+			out[2] = (uint8_t)(c2 / count);
 		}
 	}
 }
@@ -485,15 +540,21 @@ static void encode_and_emit(struct capture *capture) {
 	int pixel_format;
 	int pitch;
 	if (target_width == source_width && target_height == source_height) {
-		pixels = capture->pixels;
-		pixel_format = TJPF_BGRX;
+		/* No scaling: hand turbojpeg the shm buffer directly. A y-inverted
+		 * frame is fed bottom-up with a negative pitch. */
+		pixel_format = capture->pixel_format_4;
 		pitch = (int)capture->buffer_stride;
+		pixels = capture->pixels;
+		if (capture->export_flip) {
+			pixels = capture->pixels + (size_t)(source_height - 1) * capture->buffer_stride;
+			pitch = -pitch;
+		}
 	} else {
 		uint8_t *scaled = ensure_scale_buffer((size_t)target_width * target_height * 3);
 		box_downscale(capture->pixels, capture->buffer_stride, source_width, source_height,
-		              scaled, target_width, target_height);
+		              capture->export_flip, scaled, target_width, target_height);
 		pixels = scaled;
-		pixel_format = TJPF_BGR;
+		pixel_format = capture->pixel_format_3;
 		pitch = (int)target_width * 3;
 	}
 
@@ -523,6 +584,150 @@ static void encode_and_emit(struct capture *capture) {
 
 static void capture_stop(struct toplevel *entry, const char *reason);
 static void capture_request_frame(struct capture *capture);
+static bool capture_is_unchanged(struct capture *capture);
+static void encode_and_emit(struct capture *capture);
+
+// ---------------------------------------------------------------------------
+// hyprland-toplevel-export-v1: render one window on demand
+// ---------------------------------------------------------------------------
+
+static void export_finish(struct capture *capture) {
+	if (capture->export_frame) {
+		hyprland_toplevel_export_frame_v1_destroy(capture->export_frame);
+		capture->export_frame = NULL;
+	}
+	capture->export_has_buffer_info = false;
+	capture->frame_in_flight = false;
+}
+
+static void export_handle_buffer(void *data, struct hyprland_toplevel_export_frame_v1 *frame,
+                                 uint32_t format, uint32_t width, uint32_t height,
+                                 uint32_t stride) {
+	(void)frame;
+	struct capture *capture = data;
+	capture->export_format = format;
+	capture->export_width = width;
+	capture->export_height = height;
+	capture->export_stride = stride;
+	capture->export_has_buffer_info = true;
+	capture->export_flip = false;
+}
+
+static void export_handle_linux_dmabuf(void *data,
+                                       struct hyprland_toplevel_export_frame_v1 *frame,
+                                       uint32_t format, uint32_t width, uint32_t height) {
+	(void)data;
+	(void)frame;
+	(void)format;
+	(void)width;
+	(void)height;
+	/* shm only: a dmabuf would need a GPU import we have no use for. */
+}
+
+/* The compositor has told us what it will hand over; give it a buffer.
+ * `ignore_damage` is 1 so the window is rendered right now instead of when it
+ * next happens to be damaged on screen. */
+static void export_submit(struct capture *capture) {
+	if (!capture->export_frame || !capture->export_has_buffer_info) {
+		return;
+	}
+	if (!capture_make_buffer(capture, capture->export_width, capture->export_height,
+	                         capture->export_stride, capture->export_format)) {
+		struct toplevel *owner = capture->owner;
+		export_finish(capture);
+		capture_stop(owner, "unsupported_format");
+		return;
+	}
+	hyprland_toplevel_export_frame_v1_copy(capture->export_frame, capture->buffer, 1);
+}
+
+static void export_handle_buffer_done(void *data,
+                                      struct hyprland_toplevel_export_frame_v1 *frame) {
+	(void)frame;
+	export_submit(data);
+}
+
+static void export_handle_flags(void *data, struct hyprland_toplevel_export_frame_v1 *frame,
+                                uint32_t flags) {
+	(void)frame;
+	struct capture *capture = data;
+	capture->export_flip = (flags & HYPRLAND_TOPLEVEL_EXPORT_FRAME_V1_FLAGS_Y_INVERT) != 0;
+}
+
+static void export_handle_damage(void *data, struct hyprland_toplevel_export_frame_v1 *frame,
+                                 uint32_t x, uint32_t y, uint32_t width, uint32_t height) {
+	(void)data;
+	(void)frame;
+	(void)x;
+	(void)y;
+	(void)width;
+	(void)height;
+}
+
+static void export_handle_ready(void *data, struct hyprland_toplevel_export_frame_v1 *frame,
+                                uint32_t tv_sec_hi, uint32_t tv_sec_lo, uint32_t tv_nsec) {
+	(void)frame;
+	(void)tv_sec_hi;
+	(void)tv_sec_lo;
+	(void)tv_nsec;
+	struct capture *capture = data;
+	capture->failures = 0;
+	export_finish(capture);
+	/* Comparing the raw buffer costs a fraction of a JPEG encode, so a window
+	 * that is merely being re-rendered unchanged stays nearly free. */
+	if (!capture_is_unchanged(capture)) {
+		encode_and_emit(capture);
+	}
+	uint64_t interval = capture->max_fps > 0 ? 1000u / (uint64_t)capture->max_fps : 0;
+	capture->next_capture_ms = now_ms() + interval;
+	capture_request_frame(capture);
+}
+
+static void export_handle_failed(void *data, struct hyprland_toplevel_export_frame_v1 *frame) {
+	(void)frame;
+	struct capture *capture = data;
+	struct toplevel *owner = capture->owner;
+	export_finish(capture);
+	capture->failures++;
+	if (capture->failures >= FAILURES_BEFORE_GIVING_UP) {
+		capture_stop(owner, "capture_failed");
+		return;
+	}
+	capture->next_capture_ms = now_ms() + 200;
+}
+
+static const struct hyprland_toplevel_export_frame_v1_listener export_listener = {
+	.buffer = export_handle_buffer,
+	.damage = export_handle_damage,
+	.flags = export_handle_flags,
+	.ready = export_handle_ready,
+	.failed = export_handle_failed,
+	.linux_dmabuf = export_handle_linux_dmabuf,
+	.buffer_done = export_handle_buffer_done,
+};
+
+/* Hyprland identifies a window by the low 32 bits of its address, which is
+ * exactly what `hyprctl clients` prints (see CCompositor::getWindowFromHandle). */
+static void export_request_frame(struct capture *capture) {
+	capture->export_frame = hyprland_toplevel_export_manager_v1_capture_toplevel(
+		export_manager, 0, (uint32_t)(capture->owner->address & 0xffffffffu));
+	if (!capture->export_frame) {
+		capture_stop(capture->owner, "frame_failed");
+		return;
+	}
+	hyprland_toplevel_export_frame_v1_add_listener(capture->export_frame, &export_listener,
+	                                               capture);
+	capture->frame_in_flight = true;
+	/* Version 1 has no buffer_done; the single buffer event is all we get. */
+	if (export_manager_version < 2) {
+		wl_display_roundtrip(display);
+		export_submit(capture);
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ext-image-copy-capture-v1
+// ---------------------------------------------------------------------------
 
 static void frame_handle_transform(void *data, struct ext_image_copy_capture_frame_v1 *frame,
                                    uint32_t transform) {
@@ -606,13 +811,20 @@ static const struct ext_image_copy_capture_frame_v1_listener frame_listener = {
 	.failed = frame_handle_failed,
 };
 
-/* Start one capture if the session is configured and the rate limit allows. */
+/* Start one capture if the backend is ready and the rate limit allows. */
 static void capture_request_frame(struct capture *capture) {
-	if (!capture->session || capture->frame_in_flight || !capture->configured) {
+	if (capture->frame_in_flight) {
 		return;
 	}
 	if (now_ms() < capture->next_capture_ms) {
 		return; /* the poll timeout brings us back */
+	}
+	if (run_backend == BACKEND_TOPLEVEL_EXPORT) {
+		export_request_frame(capture);
+		return;
+	}
+	if (!capture->session || !capture->configured) {
+		return;
 	}
 	if (!capture_ensure_buffer(capture)) {
 		capture_stop(capture->owner, "buffer_failed");
@@ -713,6 +925,9 @@ static void capture_stop(struct toplevel *entry, const char *reason) {
 		return;
 	}
 	entry->capture = NULL;
+	if (capture->export_frame) {
+		hyprland_toplevel_export_frame_v1_destroy(capture->export_frame);
+	}
 	if (capture->frame) {
 		ext_image_copy_capture_frame_v1_destroy(capture->frame);
 	}
@@ -746,7 +961,10 @@ static void capture_start(struct toplevel *entry, int max_width, int quality, in
 		}
 		return;
 	}
-	if (!source_manager || !copy_manager || !shm) {
+	bool have_backend = run_backend == BACKEND_TOPLEVEL_EXPORT
+		? (export_manager != NULL && shm != NULL)
+		: (source_manager != NULL && copy_manager != NULL && shm != NULL);
+	if (!have_backend) {
 		emit_capture_failed(entry->address, "unsupported");
 		return;
 	}
@@ -755,6 +973,11 @@ static void capture_start(struct toplevel *entry, int max_width, int quality, in
 	capture->max_width = max_width;
 	capture->quality = quality;
 	capture->max_fps = max_fps;
+	if (run_backend == BACKEND_TOPLEVEL_EXPORT) {
+		entry->capture = capture;
+		capture_request_frame(capture);
+		return;
+	}
 	capture->source = ext_foreign_toplevel_image_capture_source_manager_v1_create_source(
 		source_manager, entry->handle);
 	if (!capture->source) {
@@ -916,6 +1139,11 @@ static void handle_global(void *data, struct wl_registry *registry, uint32_t nam
 	} else if (strcmp(interface, ext_image_copy_capture_manager_v1_interface.name) == 0) {
 		copy_manager = wl_registry_bind(registry, name,
 		                                &ext_image_copy_capture_manager_v1_interface, 1);
+	} else if (strcmp(interface, hyprland_toplevel_export_manager_v1_interface.name) == 0) {
+		export_manager_version = version < 2 ? version : 2;
+		export_manager = wl_registry_bind(registry, name,
+		                                  &hyprland_toplevel_export_manager_v1_interface,
+		                                  export_manager_version);
 	} else if (strcmp(interface, wl_shm_interface.name) == 0) {
 		shm = wl_registry_bind(registry, name, &wl_shm_interface, 1);
 	}
@@ -1020,7 +1248,9 @@ static bool drain_stdin(void) {
 // ---------------------------------------------------------------------------
 
 static int usage(FILE *out, int code) {
-	fputs("usage: hyprnav-capture [--list | --once | --resolve 0xADDRESS]\n", out);
+	fputs("usage: hyprnav-capture [--list | --once | --resolve 0xADDRESS]\n"
+	      "                       [--backend toplevel-export|copy-capture]\n",
+	      out);
 	return code;
 }
 
@@ -1030,7 +1260,10 @@ static int poll_timeout_ms(void) {
 	uint64_t now = now_ms();
 	for (struct toplevel *entry = toplevels; entry; entry = entry->next) {
 		struct capture *capture = entry->capture;
-		if (!capture || capture->frame_in_flight || !capture->configured) {
+		if (!capture || capture->frame_in_flight) {
+			continue;
+		}
+		if (run_backend == BACKEND_COPY_CAPTURE && !capture->configured) {
 			continue;
 		}
 		if (capture->next_capture_ms <= now) {
@@ -1053,16 +1286,26 @@ static void service_rate_limited_captures(void) {
 }
 
 int main(int argc, char **argv) {
-	if (argc > 1) {
-		if ((strcmp(argv[1], "--once") == 0 || strcmp(argv[1], "--list") == 0) && argc == 2) {
+	for (int i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "--once") == 0 || strcmp(argv[i], "--list") == 0) {
 			run_mode = MODE_LIST;
-		} else if (strcmp(argv[1], "--resolve") == 0 && argc == 3) {
+		} else if (strcmp(argv[i], "--resolve") == 0 && i + 1 < argc) {
 			run_mode = MODE_RESOLVE;
-			if (!parse_address(argv[2], &wanted_address)) {
-				fprintf(stderr, "hyprnav-capture: bad address %s\n", argv[2]);
+			if (!parse_address(argv[++i], &wanted_address)) {
+				fprintf(stderr, "hyprnav-capture: bad address %s\n", argv[i]);
 				return 2;
 			}
-		} else if (strcmp(argv[1], "--help") == 0 || strcmp(argv[1], "-h") == 0) {
+		} else if (strcmp(argv[i], "--backend") == 0 && i + 1 < argc) {
+			const char *name = argv[++i];
+			if (strcmp(name, "toplevel-export") == 0) {
+				run_backend = BACKEND_TOPLEVEL_EXPORT;
+			} else if (strcmp(name, "copy-capture") == 0) {
+				run_backend = BACKEND_COPY_CAPTURE;
+			} else {
+				fprintf(stderr, "hyprnav-capture: unknown backend %s\n", name);
+				return 2;
+			}
+		} else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
 			return usage(stdout, 0);
 		} else {
 			return usage(stderr, 2);
@@ -1094,8 +1337,14 @@ int main(int argc, char **argv) {
 		                "hyprland_toplevel_mapping_manager_v1\n");
 		return 2;
 	}
-	if (run_mode == MODE_STREAM && (!source_manager || !copy_manager || !shm)) {
+	if (run_mode == MODE_STREAM && run_backend == BACKEND_TOPLEVEL_EXPORT &&
+	    (!export_manager || !shm)) {
 		/* Identification still works; only capture is unavailable. */
+		fprintf(stderr, "hyprnav-capture: compositor does not offer "
+		                "hyprland-toplevel-export-v1; frames are unavailable\n");
+	}
+	if (run_mode == MODE_STREAM && run_backend == BACKEND_COPY_CAPTURE &&
+	    (!source_manager || !copy_manager || !shm)) {
 		fprintf(stderr, "hyprnav-capture: compositor does not offer "
 		                "ext-image-copy-capture-v1; frames are unavailable\n");
 	}

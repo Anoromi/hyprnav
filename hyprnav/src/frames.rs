@@ -452,6 +452,8 @@ pub struct FrameHub {
     commands: Arc<dyn CommandSink>,
     streams: Mutex<HashMap<String, Stream>>,
     next_client_id: AtomicU64,
+    /// Hyprland instance to drive `render_unfocused` on; `None` in tests.
+    instance: Option<String>,
 }
 
 impl FrameHub {
@@ -460,7 +462,51 @@ impl FrameHub {
             commands,
             streams: Mutex::new(HashMap::new()),
             next_client_id: AtomicU64::new(0),
+            instance: None,
         })
+    }
+
+    pub fn with_instance(commands: Arc<dyn CommandSink>, instance: String) -> Arc<Self> {
+        Arc::new(Self {
+            commands,
+            streams: Mutex::new(HashMap::new()),
+            next_client_id: AtomicU64::new(0),
+            instance: Some(instance),
+        })
+    }
+
+    /// Ask Hyprland to keep repainting a window nobody is looking at, for as
+    /// long as somebody is watching its stream.
+    ///
+    /// With the toplevel-export backend this is belt and braces: rendering a
+    /// window standalone already hands it frame callbacks, so the lab's
+    /// countdown ticks without it. It is cheap, it costs two `hyprctl` runs
+    /// per stream, and it keeps clients that only repaint on a vblank honest.
+    fn set_render_unfocused(&self, address: &str, on: bool) {
+        let Some(instance) = self.instance.clone() else { return };
+        let address = address.to_owned();
+        thread::Builder::new()
+            .name("hyprnav-frames-prop".to_owned())
+            .spawn(move || {
+                let value = if on { "1" } else { "0" };
+                let dispatch = format!(
+                    "hl.dsp.window.set_prop({{window=\"address:{address}\", \
+                     prop=\"render_unfocused\", value=\"{value}\"}})"
+                );
+                let result = Command::new("hyprctl")
+                    .env("HYPRLAND_INSTANCE_SIGNATURE", instance)
+                    .arg("dispatch")
+                    .arg(&dispatch)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+                if let Ok(status) = result {
+                    if !status.success() {
+                        debug!(address = %address, on, "render_unfocused dispatch failed");
+                    }
+                }
+            })
+            .ok();
     }
 
     pub fn active_streams(&self) -> usize {
@@ -479,10 +525,12 @@ impl FrameHub {
             slot: Mutex::new(Slot::default()),
             ready: Condvar::new(),
         });
+        let first;
         let (command, latest) = {
             let mut streams = self.streams.lock().ok()?;
             let stream = streams.entry(address.to_owned()).or_default();
             stream.clients.push(client.clone());
+            first = stream.clients.len() == 1;
             let wanted = stream.wanted();
             // Only talk to the helper when the aggregate actually moved.
             let command = if wanted != stream.params {
@@ -498,6 +546,9 @@ impl FrameHub {
             client.offer(frame);
         }
         if let Some(params) = command {
+            if first {
+                self.set_render_unfocused(address, true);
+            }
             self.commands.start(address, params);
             self.warn_if_no_frame_arrives(address);
         }
@@ -523,7 +574,10 @@ impl FrameHub {
             }
         };
         match action {
-            Some(None) => self.commands.stop(address),
+            Some(None) => {
+                self.commands.stop(address);
+                self.set_render_unfocused(address, false);
+            }
             Some(Some(params)) => self.commands.start(address, params),
             _ => {}
         }
@@ -561,6 +615,7 @@ impl FrameHub {
                 None => return,
             }
         };
+        self.set_render_unfocused(address, false);
         for client in clients {
             client.close();
         }
@@ -671,9 +726,9 @@ pub fn start_frame_server(hub: Arc<FrameHub>, listener: UnixListener) {
 }
 
 /// Spawn the helper and the accept loop; returns the hub for the daemon.
-pub fn start(listener: UnixListener) -> Arc<FrameHub> {
+pub fn start(listener: UnixListener, instance: String) -> Arc<FrameHub> {
     let helper = CaptureHelper::new(CaptureHelper::default_program());
-    let hub = FrameHub::new(helper.clone());
+    let hub = FrameHub::with_instance(helper.clone(), instance);
     helper.spawn(hub.clone());
     start_frame_server(hub.clone(), listener);
     hub
