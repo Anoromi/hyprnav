@@ -250,6 +250,60 @@ fn main() -> anyhow::Result<()> {
             ensure_server_running()?;
             handle_spawn(args)
         }
+        Command::Agents => {
+            ensure_server_running()?;
+            print_json(send::<Value>(Request::AgentsList))
+        }
+        Command::Agent(command) => {
+            use hyprnav::cli::AgentCommand;
+            ensure_server_running()?;
+            match command {
+                AgentCommand::Register(args) => print_json(send::<Value>(Request::AgentRegister {
+                    agent_id: args.id,
+                    label: args.label,
+                    client: args.client,
+                    pid: args.pid.unwrap_or_else(|| unsafe { libc::getppid() } as u32),
+                    cwd: args.cwd.or_else(|| std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned())),
+                    env: args.env,
+                })),
+                AgentCommand::Beat(args) => print_json(send::<Value>(Request::AgentBeat {
+                    agent_id: args.id,
+                    state: args.state,
+                    target: args.target,
+                    action: args.action,
+                })),
+                AgentCommand::Label(args) => print_json(send::<Value>(Request::AgentLabel {
+                    agent_id: args.id,
+                    label: args.label,
+                })),
+                AgentCommand::Finish(args) => print_json(send::<Value>(Request::AgentFinish {
+                    agent_id: args.id,
+                })),
+            }
+        }
+        Command::Screencast(command) => {
+            use hyprnav::cli::ScreencastCommand;
+            use hyprnav::runtime_paths::{runtime_root, screencast_request_path};
+            let signature = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").unwrap_or_default();
+            let path = screencast_request_path(&runtime_root(), &signature);
+            match command {
+                ScreencastCommand::Request(args) => {
+                    let address = args.address.trim().trim_start_matches("address:").to_owned();
+                    if !address.starts_with("0x") {
+                        return Err(anyhow::anyhow!("address must look like 0x1234"));
+                    }
+                    if let Some(parent) = path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(&path, format!("{address}\n"))?;
+                    print_json(Ok(serde_json::json!({"path": path, "address": address})))
+                }
+                ScreencastCommand::Clear => {
+                    let existed = std::fs::remove_file(&path).is_ok();
+                    print_json(Ok(serde_json::json!({"path": path, "removed": existed})))
+                }
+            }
+        }
         Command::Stick(command) => {
             use hyprnav::cli::StickCommand;
             ensure_server_running()?;

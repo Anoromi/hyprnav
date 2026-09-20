@@ -144,6 +144,20 @@ pub enum Command {
     )]
     Spawn(SpawnArgs),
     #[command(
+        about = "List live agents (MCP processes) with their slot, state and last action.",
+        long_about = "List live agents (MCP processes) with their slot, state and last action.\n\nAgents register themselves through the cua MCP; each one owns a temporary slot in the environment of its working directory. This prints the daemon's in-memory registry as JSON."
+    )]
+    Agents,
+    #[command(about = "Register, label, beat or finish an agent. Used by MCP servers and scripts.")]
+    #[command(subcommand)]
+    Agent(AgentCommand),
+    #[command(
+        about = "Screencast helpers for a dialog-free window share.",
+        long_about = "Screencast helpers for a dialog-free window share.\n\n`screencast request <address>` records which Hyprland window the next screen-share request should pick. `hyprnav-share-picker`, configured as xdg-desktop-portal-hyprland's custom picker, answers the next portal request with that window instead of opening a dialog, then falls back to the stock picker."
+    )]
+    #[command(subcommand)]
+    Screencast(ScreencastCommand),
+    #[command(
         about = "Inspect or change hard-stuck process trees.",
         long_about = "Inspect or change hard-stuck process trees.\n\nEvery `hyprnav spawn` pins its process tree to the target workspace: later windows from that tree (dialogs, pickers, second windows) open there instead of on the focused workspace, silently. Sticks survive daemon restarts and plugin reloads and end when the tree and all its windows are gone."
     )]
@@ -156,6 +170,75 @@ pub enum Command {
     Batch(BatchArgs),
     #[command(name = "spawn-internal", hide = true)]
     SpawnInternal(SpawnInternalArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ScreencastCommand {
+    #[command(about = "Pre-answer the next screen-share picker with this window (address:0x… or 0x…).")]
+    Request(ScreencastRequestArgs),
+    #[command(about = "Forget a pending pre-answer.")]
+    Clear,
+}
+
+#[derive(Debug, Args)]
+pub struct ScreencastRequestArgs {
+    pub address: String,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AgentCommand {
+    #[command(about = "Announce an agent and allocate its slot.")]
+    Register(AgentRegisterArgs),
+    #[command(about = "Heartbeat: state, target window, action.")]
+    Beat(AgentBeatArgs),
+    #[command(about = "Set the agent label (also names its slot).")]
+    Label(AgentLabelArgs),
+    #[command(about = "Mark an agent finished.")]
+    Finish(AgentIdArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct AgentRegisterArgs {
+    #[arg(long)]
+    pub id: String,
+    #[arg(long)]
+    pub label: Option<String>,
+    #[arg(long)]
+    pub client: Option<String>,
+    /// Process id of the agent; defaults to this process's parent.
+    #[arg(long)]
+    pub pid: Option<u32>,
+    #[arg(long)]
+    pub cwd: Option<String>,
+    #[arg(long)]
+    pub env: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct AgentBeatArgs {
+    #[arg(long)]
+    pub id: String,
+    /// working | waiting_for_user | idle | finished
+    #[arg(long)]
+    pub state: Option<String>,
+    /// Hyprland window address (0x...) the agent acted on.
+    #[arg(long)]
+    pub target: Option<String>,
+    #[arg(long)]
+    pub action: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct AgentLabelArgs {
+    #[arg(long)]
+    pub id: String,
+    pub label: String,
+}
+
+#[derive(Debug, Args)]
+pub struct AgentIdArgs {
+    #[arg(long)]
+    pub id: String,
 }
 
 #[derive(Debug, Subcommand)]

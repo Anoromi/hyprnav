@@ -24,6 +24,28 @@ pub struct SwitcherSnapshot {
     pub initial_index: i32,
 }
 
+/// Live view of one agent (one MCP process).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct AgentSnapshot {
+    pub agent_id: String,
+    pub label: String,
+    pub client: String,
+    pub pid: u32,
+    pub environment_id: String,
+    pub slot_index: i32,
+    pub workspace_id: i32,
+    /// working | waiting_for_user | idle | finished
+    pub state: String,
+    pub last_beat_ms: u64,
+    pub action_count: u64,
+    pub last_action: Option<String>,
+    /// Hyprland window address (0x…) the agent last acted on.
+    pub current_target: Option<String>,
+    /// Every window address the agent has acted on.
+    pub attached_windows: Vec<String>,
+    pub created_at_ms: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct GridCellSnapshot {
     pub environment_id: String,
@@ -56,6 +78,9 @@ pub struct GridCellSnapshot {
     /// How long the temporary slot's workspace has been empty, if it is.
     #[serde(default)]
     pub empty_for_ms: Option<u64>,
+    /// The agent whose slot this is, if any.
+    #[serde(default)]
+    pub agent: Option<AgentSnapshot>,
     pub show_environment_label: bool,
     pub row_index: i32,
     pub column_index: i32,
@@ -333,6 +358,30 @@ pub enum Request {
         #[serde(default)]
         no_stick: bool,
     },
+    /// An agent (one MCP process) announces itself and gets a temporary slot.
+    AgentRegister {
+        agent_id: String,
+        label: Option<String>,
+        client: Option<String>,
+        pid: u32,
+        cwd: Option<String>,
+        env: Option<String>,
+    },
+    /// Heartbeat after an action; `target` is a Hyprland window address.
+    AgentBeat {
+        agent_id: String,
+        state: Option<String>,
+        target: Option<String>,
+        action: Option<String>,
+    },
+    AgentLabel {
+        agent_id: String,
+        label: String,
+    },
+    AgentFinish {
+        agent_id: String,
+    },
+    AgentsList,
     /// Create an unnumbered temporary slot in an environment.
     SlotTempCreate {
         env: Option<String>,

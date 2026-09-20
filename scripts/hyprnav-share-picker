@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Custom picker for xdg-desktop-portal-hyprland.
+#
+# If hyprnav pre-answered the next request (`hyprnav screencast request
+# <address>`, written less than 15 s ago), answer with that window and no
+# dialog. Otherwise behave exactly like the stock picker.
+#
+# xdph passes XDPH_WINDOW_SHARING_LIST:
+#   <handle>[HC>]<class>[HT>]<title>[HE>]<hyprland address>[HA>]...
+# and expects on stdout:  [SELECTION]<flags>/window:<handle>
+set -u
+runtime="${XDG_RUNTIME_DIR:-/tmp}"
+sig="${HYPRLAND_INSTANCE_SIGNATURE:-default}"
+hash=$(printf '%s' "$sig" | python3 -c '
+import sys
+h=0xcbf29ce484222325
+for b in sys.stdin.buffer.read(): h=((h^b)*0x100000001b3)&0xffffffffffffffff
+print(f"{h:016x}")')
+req="$runtime/hx/$hash/screencast-request"
+answer=""
+if [ -f "$req" ]; then
+  now=$(date +%s); mtime=$(stat -c %Y "$req" 2>/dev/null || echo 0)
+  if [ $((now - mtime)) -le 15 ]; then
+    want=$(head -n1 "$req" | tr -d '[:space:]')
+    want="${want#0x}"
+    handle=$(printf '%s' "${XDPH_WINDOW_SHARING_LIST:-}" | python3 -c '
+import sys,re
+want=sys.argv[1].lower()
+for entry in sys.stdin.read().split("[HA>]"):
+    m=re.match(r"^(\d+)\[HC>\](.*?)\[HT>\](.*?)\[HE>\](.*)$", entry, re.S)
+    if not m: continue
+    addr=m.group(4).strip().lower().removeprefix("0x")
+    if addr==want or addr==want.lstrip("0"):
+        print(m.group(1)); break
+' "$want")
+    if [ -n "$handle" ]; then
+      flags=""
+      for a in "$@"; do [ "$a" = "--allow-token" ] && flags="r"; done
+      answer="[SELECTION]$flags/window:$handle"
+    fi
+  fi
+  rm -f "$req"
+fi
+if [ -n "$answer" ]; then
+  printf '%s\n' "$answer"
+  exit 0
+fi
+exec hyprland-share-picker "$@"

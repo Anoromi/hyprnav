@@ -6,7 +6,7 @@ use crate::db::{
 /// A temporary slot whose workspace has been empty this long is released.
 const TEMP_SLOT_GRACE_SECS: i64 = 30;
 use crate::protocol::{
-    read_request, write_response, BatchMutationOperationResult, BatchMutationRequest,
+    read_request, write_response, AgentSnapshot, BatchMutationOperationResult, BatchMutationRequest,
     BatchMutationResponse, GridCellSnapshot, GridSnapshot, NavigationLaunchResult,
     NavigationLaunchSkippedReason, Request, Response, SlotAssignmentMode, SlotResolution,
     SpawnPrepared, SpawnStarted, StatusSnapshot, SwitcherSnapshot, WorkspaceCardSnapshot,
@@ -93,6 +93,28 @@ struct ServerRuntime {
     pending_launches: Mutex<PendingLaunchRegistry>,
     /// Plugin instance id that last received a full stick replay.
     plugin_instance: Mutex<Option<String>>,
+    /// Live agents, by agent id. In memory only; their slots persist.
+    agents: Mutex<HashMap<String, AgentSnapshot>>,
+}
+
+/// Finished agents are forgotten after this long.
+const AGENT_FINISHED_TTL_MS: u64 = 60_000;
+
+fn agent_state_valid(state: &str) -> bool {
+    matches!(state, "working" | "waiting_for_user" | "idle" | "finished")
+}
+
+/// Mark agents whose process is gone as finished, forget old finished ones.
+fn reap_agents(runtime: &ServerRuntime) {
+    let Ok(mut agents) = runtime.agents.lock() else { return };
+    let now = now_ms();
+    agents.retain(|_, agent| {
+        if agent.state != "finished" && !crate::spawn::pid_exists(agent.pid) {
+            agent.state = "finished".to_owned();
+            agent.last_beat_ms = now;
+        }
+        !(agent.state == "finished" && now.saturating_sub(agent.last_beat_ms) > AGENT_FINISHED_TTL_MS)
+    });
 }
 
 #[derive(Debug, Deserialize)]
@@ -257,6 +279,7 @@ pub fn run_server() -> Result<()> {
         spawn_registry: Mutex::new(SpawnRegistry::new()),
         pending_launches: Mutex::new(PendingLaunchRegistry::default()),
         plugin_instance: Mutex::new(None),
+        agents: Mutex::new(HashMap::new()),
     });
     let listener = bind_listener(&runtime.paths.server_socket_path)?;
     start_spawn_cleanup_thread(runtime.clone());
@@ -402,6 +425,7 @@ fn start_spawn_cleanup_thread(runtime: Arc<ServerRuntime>) {
         tick = tick.wrapping_add(1);
         if tick % 8 == 0 {
             reap_temp_slots(&runtime);
+            reap_agents(&runtime);
         }
 
         let expired = {
@@ -892,6 +916,136 @@ fn try_handle_request(runtime: &Arc<ServerRuntime>, request: Request) -> Result<
             }
 
             Ok(json!({"operation_id": operation_id, "finished": true}))
+        }
+        Request::AgentRegister {
+            agent_id,
+            label,
+            client,
+            pid,
+            cwd,
+            env,
+        } => {
+            if agent_id.trim().is_empty() {
+                return Err(anyhow!("agent_id is required"));
+            }
+            let label = label
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| format!("agent {pid}"));
+            let client = client.unwrap_or_else(|| "cua".to_owned());
+            // Re-registration (same id) keeps the slot.
+            if let Ok(agents) = runtime.agents.lock() {
+                if let Some(existing) = agents.get(&agent_id) {
+                    return Ok(serde_json::to_value(existing)?);
+                }
+            }
+            // Parent environment: explicit, else derived from cwd, else "agents".
+            let resolved_env = match env {
+                Some(env) if !env.is_empty() => env,
+                _ => match cwd.as_deref().map(resolve_environment_from_cwd).transpose()? {
+                    Some(value) if !value.is_empty() => value,
+                    _ => "agents".to_owned(),
+                },
+            };
+            let display_id = default_display_id(None, &resolved_env);
+            runtime.store.ensure_environment(
+                &resolved_env,
+                &display_id,
+                cwd.as_deref(),
+                Some(&client),
+                if resolved_env == "agents" { Some("Agents") } else { None },
+            )?;
+            let live = live_workspace_ids(&runtime.paths)?;
+            let slot = runtime.store.create_temp_slot(
+                &resolved_env,
+                &display_id,
+                cwd.as_deref(),
+                Some(&client),
+                &live,
+                Some(&label),
+                Some(&agent_id),
+                None,
+            )?;
+            let record = runtime
+                .store
+                .resolve_slot_effective(&resolved_env, slot)?
+                .ok_or_else(|| anyhow!("agent slot did not resolve"))?;
+            let snapshot = AgentSnapshot {
+                agent_id: agent_id.clone(),
+                label,
+                client,
+                pid,
+                environment_id: resolved_env,
+                slot_index: slot,
+                workspace_id: record.workspace_id,
+                state: "idle".to_owned(),
+                last_beat_ms: now_ms(),
+                action_count: 0,
+                last_action: None,
+                current_target: None,
+                attached_windows: Vec::new(),
+                created_at_ms: now_ms(),
+            };
+            runtime
+                .agents
+                .lock()
+                .map_err(|e| anyhow!("agents poisoned: {e}"))?
+                .insert(agent_id, snapshot.clone());
+            Ok(serde_json::to_value(snapshot)?)
+        }
+        Request::AgentBeat {
+            agent_id,
+            state,
+            target,
+            action,
+        } => {
+            let mut agents = runtime.agents.lock().map_err(|e| anyhow!("agents poisoned: {e}"))?;
+            let agent = agents
+                .get_mut(&agent_id)
+                .ok_or_else(|| anyhow!("unknown agent {agent_id}"))?;
+            if let Some(state) = state {
+                if !agent_state_valid(&state) {
+                    return Err(anyhow!("invalid agent state {state}"));
+                }
+                agent.state = state;
+            }
+            if let Some(target) = target.filter(|t| !t.is_empty()) {
+                if !agent.attached_windows.contains(&target) {
+                    agent.attached_windows.push(target.clone());
+                }
+                agent.current_target = Some(target);
+            }
+            if let Some(action) = action {
+                agent.action_count += 1;
+                agent.last_action = Some(action);
+            }
+            agent.last_beat_ms = now_ms();
+            Ok(serde_json::to_value(&*agent)?)
+        }
+        Request::AgentLabel { agent_id, label } => {
+            let (env, slot) = {
+                let mut agents = runtime.agents.lock().map_err(|e| anyhow!("agents poisoned: {e}"))?;
+                let agent = agents
+                    .get_mut(&agent_id)
+                    .ok_or_else(|| anyhow!("unknown agent {agent_id}"))?;
+                agent.label = label.clone();
+                (agent.environment_id.clone(), agent.slot_index)
+            };
+            runtime.store.set_slot_display_name(&env, slot, &label)?;
+            Ok(json!({"agent_id": agent_id, "label": label}))
+        }
+        Request::AgentFinish { agent_id } => {
+            let mut agents = runtime.agents.lock().map_err(|e| anyhow!("agents poisoned: {e}"))?;
+            if let Some(agent) = agents.get_mut(&agent_id) {
+                agent.state = "finished".to_owned();
+                agent.last_beat_ms = now_ms();
+            }
+            Ok(json!({"agent_id": agent_id, "finished": true}))
+        }
+        Request::AgentsList => {
+            let agents = runtime.agents.lock().map_err(|e| anyhow!("agents poisoned: {e}"))?;
+            let mut list: Vec<&AgentSnapshot> = agents.values().collect();
+            list.sort_by_key(|a| a.created_at_ms);
+            Ok(serde_json::to_value(list)?)
         }
         Request::SlotTempCreate {
             env,
@@ -1865,6 +2019,16 @@ fn build_grid_snapshot(runtime: &ServerRuntime, cwd: Option<&str>) -> Result<Gri
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
+    let agents_by_workspace = runtime
+        .agents
+        .lock()
+        .map(|agents| {
+            agents
+                .values()
+                .map(|agent| (agent.workspace_id, agent.clone()))
+                .collect::<HashMap<i32, AgentSnapshot>>()
+        })
+        .unwrap_or_default();
 
     let mut items = Vec::new();
     let mut max_column_count = 0;
@@ -1929,6 +2093,7 @@ fn build_grid_snapshot(runtime: &ServerRuntime, cwd: Option<&str>) -> Result<Gri
                     .get(&(record.binding_environment_id.clone(), record.slot_index))
                     .and_then(|meta| meta.empty_since)
                     .map(|since| ((now_unix - since).max(0) as u64) * 1000),
+                agent: agents_by_workspace.get(&workspace_id).cloned(),
                 show_environment_label: column_index == 0,
                 row_index: row_count,
                 column_index: column_index as i32,
@@ -2567,6 +2732,7 @@ mod tests {
                     unnumbered: record.slot_index >= TEMP_SLOT_START,
                     owner: None,
                     empty_for_ms: None,
+                    agent: None,
                     show_environment_label: column_index == 0,
                     row_index: row_count,
                     column_index: column_index as i32,

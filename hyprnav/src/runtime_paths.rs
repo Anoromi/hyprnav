@@ -58,6 +58,11 @@ pub fn spawn_socket_path(runtime_dir: &Path, instance_signature: &str) -> PathBu
     runtime_directory(runtime_dir, instance_signature).join("spawn.sock")
 }
 
+/// File holding the window address the next screencast picker should answer with.
+pub fn screencast_request_path(runtime_dir: &Path, instance_signature: &str) -> PathBuf {
+    runtime_directory(runtime_dir, instance_signature).join("screencast-request")
+}
+
 pub fn server_socket_path(runtime_dir: &Path, instance_signature: &str) -> PathBuf {
     runtime_directory(runtime_dir, instance_signature).join("hyprnav.sock")
 }
