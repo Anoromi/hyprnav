@@ -12,6 +12,7 @@ use crate::protocol::{
     SpawnPrepared, SpawnStarted, StatusSnapshot, SwitcherSnapshot, WorkspaceCardSnapshot,
     WorkspaceNavigationResult,
 };
+use crate::events::{start_event_server, EventBus};
 use crate::runtime_paths::{
     append_switch_log, ensure_parent_dir, resolve_runtime_paths, RuntimePaths,
 };
@@ -95,6 +96,20 @@ struct ServerRuntime {
     plugin_instance: Mutex<Option<String>>,
     /// Live agents, by agent id. In memory only; their slots persist.
     agents: Mutex<HashMap<String, AgentSnapshot>>,
+    /// Push notifications for agent and slot state.
+    events: EventBus,
+}
+
+impl ServerRuntime {
+    /// The `agents` event payload: the same JSON `agents_list` returns.
+    fn agents_snapshot(&self) -> serde_json::Value {
+        let Ok(agents) = self.agents.lock() else {
+            return json!([]);
+        };
+        let mut list: Vec<&AgentSnapshot> = agents.values().collect();
+        list.sort_by_key(|agent| agent.created_at_ms);
+        serde_json::to_value(list).unwrap_or_else(|_| json!([]))
+    }
 }
 
 /// Finished agents are forgotten after this long.
@@ -106,15 +121,26 @@ fn agent_state_valid(state: &str) -> bool {
 
 /// Mark agents whose process is gone as finished, forget old finished ones.
 fn reap_agents(runtime: &ServerRuntime) {
-    let Ok(mut agents) = runtime.agents.lock() else { return };
-    let now = now_ms();
-    agents.retain(|_, agent| {
-        if agent.state != "finished" && !crate::spawn::pid_exists(agent.pid) {
-            agent.state = "finished".to_owned();
-            agent.last_beat_ms = now;
-        }
-        !(agent.state == "finished" && now.saturating_sub(agent.last_beat_ms) > AGENT_FINISHED_TTL_MS)
-    });
+    let changed = {
+        let Ok(mut agents) = runtime.agents.lock() else { return };
+        let now = now_ms();
+        let mut changed = false;
+        agents.retain(|_, agent| {
+            if agent.state != "finished" && !crate::spawn::pid_exists(agent.pid) {
+                agent.state = "finished".to_owned();
+                agent.last_beat_ms = now;
+                changed = true;
+            }
+            let keep = !(agent.state == "finished"
+                && now.saturating_sub(agent.last_beat_ms) > AGENT_FINISHED_TTL_MS);
+            changed |= !keep;
+            keep
+        });
+        changed
+    };
+    if changed {
+        runtime.events.agents_changed();
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -280,8 +306,16 @@ pub fn run_server() -> Result<()> {
         pending_launches: Mutex::new(PendingLaunchRegistry::default()),
         plugin_instance: Mutex::new(None),
         agents: Mutex::new(HashMap::new()),
+        events: EventBus::new(),
     });
     let listener = bind_listener(&runtime.paths.server_socket_path)?;
+    let events_listener = bind_listener(&runtime.paths.events_socket_path)?;
+    {
+        let snapshot_runtime = runtime.clone();
+        start_event_server(runtime.events.clone(), events_listener, move || {
+            snapshot_runtime.agents_snapshot()
+        });
+    }
     start_spawn_cleanup_thread(runtime.clone());
     start_stick_sync_thread(runtime.clone());
     start_hypr_event_thread(runtime.clone());
@@ -331,13 +365,15 @@ fn start_hypr_event_thread(runtime: Arc<ServerRuntime>) {
                                             next_workspace_id,
                                         )
                                     {
-                                        if let Err(error) =
-                                            runtime.store.record_environment_focus(&environment_id)
+                                        match runtime.store.record_environment_focus(&environment_id)
                                         {
-                                            warn!(
+                                            // Row order in the grid follows
+                                            // focus, so this is a slot change.
+                                            Ok(()) => runtime.events.slots_changed(),
+                                            Err(error) => warn!(
                                                 "failed to record environment focus for {}: {error}",
                                                 environment_id
-                                            );
+                                            ),
                                         }
                                     }
                                 }
@@ -408,8 +444,9 @@ fn reap_temp_slots(runtime: &ServerRuntime) {
             }
             (false, Some(since)) if now - since >= TEMP_SLOT_GRACE_SECS => {
                 debug!(env = %temp.env_id, slot = temp.slot_index, "releasing temporary slot");
-                if let Err(error) = runtime.store.clear_slot(&temp.env_id, temp.slot_index) {
-                    warn!("temp slot reaper: clear failed: {error}");
+                match runtime.store.clear_slot(&temp.env_id, temp.slot_index) {
+                    Ok(_) => runtime.events.slots_changed(),
+                    Err(error) => warn!("temp slot reaper: clear failed: {error}"),
                 }
             }
             _ => {}
@@ -550,9 +587,81 @@ fn handle_stream(stream: UnixStream, runtime: Arc<ServerRuntime>) {
 }
 
 fn handle_request(runtime: &Arc<ServerRuntime>, request: Request) -> Response<serde_json::Value> {
+    // Classify before the request is consumed: every mutating op announces
+    // itself on the event bus once it succeeded, so subscribers never poll.
+    let effects = request_effects(&request);
     match try_handle_request(runtime, request) {
-        Ok(value) => Response::ok(value),
+        Ok(value) => {
+            match effects {
+                RequestEffects { agents: true, slots: true } => runtime.events.both_changed(),
+                RequestEffects { agents: true, slots: false } => runtime.events.agents_changed(),
+                RequestEffects { agents: false, slots: true } => runtime.events.slots_changed(),
+                _ => {}
+            }
+            Response::ok(value)
+        }
         Err(error) => Response::error("request_failed", error.to_string()),
+    }
+}
+
+/// Which event streams a request touches when it succeeds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RequestEffects {
+    agents: bool,
+    slots: bool,
+}
+
+impl RequestEffects {
+    const NONE: Self = Self { agents: false, slots: false };
+    const SLOTS: Self = Self { agents: false, slots: true };
+    const AGENTS: Self = Self { agents: true, slots: false };
+    const BOTH: Self = Self { agents: true, slots: true };
+}
+
+fn request_effects(request: &Request) -> RequestEffects {
+    match request {
+        // Agent registry only.
+        Request::AgentBeat { .. } | Request::AgentFinish { .. } => RequestEffects::AGENTS,
+        // Registering an agent also carves out its temporary slot; labelling
+        // one renames that slot.
+        Request::AgentRegister { .. } | Request::AgentLabel { .. } => RequestEffects::BOTH,
+        // Anything that can change `ui_snapshot_grid` output.
+        Request::EnvEnsure { .. }
+        | Request::EnvDelete { .. }
+        | Request::EnvTitleSet { .. }
+        | Request::EnvTitleClear { .. }
+        | Request::ClientEnsure { .. }
+        | Request::SlotAssign { .. }
+        | Request::SlotClear { .. }
+        | Request::SlotCommandSet { .. }
+        | Request::SlotCommandClear { .. }
+        | Request::SlotNameSet { .. }
+        | Request::SlotNameClear { .. }
+        | Request::SlotTempCreate { .. }
+        | Request::SlotRemove { .. }
+        | Request::LockSet { .. }
+        | Request::LockClear
+        | Request::BrowserSlotSet { .. }
+        | Request::BrowserSlotClear { .. }
+        | Request::WorkspaceGoto { .. }
+        | Request::WorkspaceGotoPhysical { .. }
+        | Request::SpawnStart { .. }
+        | Request::SpawnFinish { .. }
+        | Request::StickAdd { .. }
+        | Request::StickRelease { .. }
+        | Request::StickMove { .. }
+        | Request::BatchMutate { .. } => RequestEffects::SLOTS,
+        // Reads, and spawn preparation, which only reserves an id in memory.
+        Request::Ping
+        | Request::StatusGet { .. }
+        | Request::SlotResolve { .. }
+        | Request::SlotTempList
+        | Request::StickList
+        | Request::AgentsList
+        | Request::SpawnPrepare { .. }
+        | Request::WorkspaceRun { .. }
+        | Request::UiSnapshotSwitcher { .. }
+        | Request::UiSnapshotGrid { .. } => RequestEffects::NONE,
     }
 }
 
@@ -2627,7 +2736,8 @@ mod tests {
                 switcher_socket_path: runtime_dir.join("switcher.sock"),
                 grid_socket_path: runtime_dir.join("grid.sock"),
                 server_socket_path: runtime_dir.join("hyprnav.sock"),
-                hypr_event_socket_path: runtime_dir.join("events.sock"),
+                events_socket_path: runtime_dir.join("events.sock"),
+                hypr_event_socket_path: runtime_dir.join("hypr-events.sock"),
                 switch_log_path: runtime_dir.join("switch.log"),
                 state_root: root.clone(),
                 state_db_path: db_path.clone(),
@@ -2635,6 +2745,9 @@ mod tests {
             store: StateStore::new(&db_path).unwrap(),
             spawn_registry: Mutex::new(SpawnRegistry::new()),
             pending_launches: Mutex::new(PendingLaunchRegistry::default()),
+            plugin_instance: Mutex::new(None),
+            agents: Mutex::new(HashMap::new()),
+            events: EventBus::new(),
         });
 
         (runtime, db_path)

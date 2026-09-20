@@ -152,6 +152,11 @@ pub enum Command {
     #[command(subcommand)]
     Agent(AgentCommand),
     #[command(
+        about = "Stream agent and slot change events as JSON lines.",
+        long_about = "Stream agent and slot change events as JSON lines.\n\nThe daemon pushes one JSON object per line on a dedicated socket beside the request socket. On connect it sends `hello`, a full `agents` list and a `slots` marker, then an `agents` event whenever any agent changes and a `slots` event whenever anything that would change `ui_snapshot_grid` changes. Bursts are coalesced to roughly one event per 50 ms. Clients re-request the grid snapshot when they see `slots`."
+    )]
+    Events(EventsArgs),
+    #[command(
         about = "Screencast helpers for a dialog-free window share.",
         long_about = "Screencast helpers for a dialog-free window share.\n\n`screencast request <address>` records which Hyprland window the next screen-share request should pick. `hyprnav-share-picker`, configured as xdg-desktop-portal-hyprland's custom picker, answers the next portal request with that window instead of opening a dialog, then falls back to the stock picker."
     )]
@@ -195,6 +200,13 @@ pub enum AgentCommand {
     Label(AgentLabelArgs),
     #[command(about = "Mark an agent finished.")]
     Finish(AgentIdArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct EventsArgs {
+    /// Print the connect burst (hello, agents, slots) and exit.
+    #[arg(long)]
+    pub once: bool,
 }
 
 #[derive(Debug, Args)]

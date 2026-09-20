@@ -254,6 +254,10 @@ fn main() -> anyhow::Result<()> {
             ensure_server_running()?;
             print_json(send::<Value>(Request::AgentsList))
         }
+        Command::Events(args) => {
+            ensure_server_running()?;
+            stream_events(args.once)
+        }
         Command::Agent(command) => {
             use hyprnav::cli::AgentCommand;
             ensure_server_running()?;
@@ -525,6 +529,38 @@ fn read_batch_payload(args: BatchArgs) -> anyhow::Result<BatchMutationPayload> {
                 .map_err(|error| anyhow::anyhow!("decoding batch payload from stdin: {error}"))
         }
     }
+}
+
+/// Print the daemon's event stream, one JSON object per line.
+///
+/// `--once` stops after the connect burst (hello, agents, slots); otherwise it
+/// runs until the daemon goes away or the terminal interrupts it.
+fn stream_events(once: bool) -> anyhow::Result<()> {
+    use std::io::BufRead;
+    let paths = resolve_runtime_paths();
+    let stream = std::os::unix::net::UnixStream::connect(&paths.events_socket_path)
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "connecting to {}: {error}",
+                paths.events_socket_path.display()
+            )
+        })?;
+    let reader = std::io::BufReader::new(stream);
+    let mut stdout = io::stdout();
+    let mut seen = 0usize;
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        writeln!(stdout, "{line}")?;
+        stdout.flush()?;
+        seen += 1;
+        if once && seen >= 3 {
+            break;
+        }
+    }
+    Ok(())
 }
 
 fn print_json(result: anyhow::Result<Value>) -> anyhow::Result<()> {

@@ -456,3 +456,51 @@ windows from that tree (dialogs, pickers, second windows) open there,
 silently, for as long as the tree or any of its windows lives. `spawn
 --no-stick` restores the old behaviour. `hyprnav stick list|release|add|move`
 inspects and changes sticks. Requires hyprnav-plugin.
+
+## Events
+
+The daemon pushes state changes instead of making clients poll. Beside the
+request socket it opens a second Unix socket:
+
+```
+$XDG_RUNTIME_DIR/hx/<fnv1a64(HYPRLAND_INSTANCE_SIGNATURE)>/events.sock
+```
+
+Unlike the request socket it accepts many concurrent subscribers, and it is
+write-only: the daemon never reads from it and ignores anything a client
+sends. Every event is one JSON object per line terminated by `\n`, and every
+event carries `"event": <string>` and `"ts_ms": <u64 unix ms>`.
+
+On connect the daemon immediately sends the current state:
+
+```json
+{"event":"hello","ts_ms":1789874943432,"version":1}
+{"event":"agents","ts_ms":1789874943432,"agents":[]}
+{"event":"slots","ts_ms":1789874943432}
+```
+
+- `agents` carries the full current list, serialised exactly like the
+  `agents_list` reply. It is sent whenever any agent changes: register, beat
+  (including `current_target`, `last_action` and `action_count` changes),
+  label, state transitions (`working`, `idle`, `waiting_for_user`,
+  `finished`), finish, and when the registry prunes a dead agent.
+- `slots` has no payload. It is sent whenever slot, environment, stick or
+  temporary-slot state changes: temporary slot created or removed, the reaper
+  releasing an empty one, environment switch, workspace goto, lock and pin
+  changes, stick add, release or move — anything that would change
+  `ui_snapshot_grid` output. Clients re-request the grid snapshot when they
+  see it.
+
+Bursts are coalesced: at most one `agents` and one `slots` event per ~50 ms,
+last state wins, so a chatty MCP cannot flood subscribers. A subscriber that
+stops draining its socket is dropped rather than allowed to stall the daemon
+or the other subscribers.
+
+### `events`
+
+```bash
+hyprnav events           # stream until interrupted
+hyprnav events --once    # print hello + agents + slots, then exit
+```
+
+Prints the stream to stdout, one line per event.

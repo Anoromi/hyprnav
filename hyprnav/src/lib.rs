@@ -2,6 +2,7 @@ pub mod browser;
 pub mod cli;
 pub mod controller;
 pub mod db;
+pub mod events;
 pub mod protocol;
 pub mod runtime_paths;
 pub mod server;

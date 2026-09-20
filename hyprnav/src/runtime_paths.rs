@@ -19,6 +19,7 @@ pub struct RuntimePaths {
     pub switcher_socket_path: PathBuf,
     pub grid_socket_path: PathBuf,
     pub server_socket_path: PathBuf,
+    pub events_socket_path: PathBuf,
     pub hypr_event_socket_path: PathBuf,
     pub switch_log_path: PathBuf,
     pub state_root: PathBuf,
@@ -65,6 +66,12 @@ pub fn screencast_request_path(runtime_dir: &Path, instance_signature: &str) -> 
 
 pub fn server_socket_path(runtime_dir: &Path, instance_signature: &str) -> PathBuf {
     runtime_directory(runtime_dir, instance_signature).join("hyprnav.sock")
+}
+
+/// Push-event socket: subscribers read `agents` and `slots` events from it.
+/// Sits beside the request socket so clients derive both from one directory.
+pub fn events_socket_path(runtime_dir: &Path, instance_signature: &str) -> PathBuf {
+    runtime_directory(runtime_dir, instance_signature).join("events.sock")
 }
 
 pub fn switch_log_path(runtime_dir: &Path, instance_signature: &str) -> PathBuf {
@@ -138,6 +145,7 @@ pub fn resolve_runtime_paths() -> RuntimePaths {
         switcher_socket_path: switcher_socket_path(&runtime_root, &instance_signature),
         grid_socket_path: grid_socket_path(&runtime_root, &instance_signature),
         server_socket_path: server_socket_path(&runtime_root, &instance_signature),
+        events_socket_path: events_socket_path(&runtime_root, &instance_signature),
         hypr_event_socket_path: hyprland_event_socket_path(&runtime_root, &instance_signature),
         switch_log_path: switch_log_path(&runtime_root, &instance_signature),
         runtime_dir: runtime_directory(&runtime_root, &instance_signature),
@@ -248,6 +256,15 @@ impl Hasher for Fnv1a64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn events_socket_sits_beside_the_request_socket() {
+        let root = Path::new("/run/user/1000");
+        let events = events_socket_path(root, "sig");
+        let server = server_socket_path(root, "sig");
+        assert_eq!(events.parent(), server.parent());
+        assert_eq!(events.file_name().unwrap(), "events.sock");
+    }
 
     #[test]
     fn log_fragment_sanitization_removes_line_breaks_and_controls() {
