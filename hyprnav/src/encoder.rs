@@ -106,6 +106,10 @@ pub fn ffmpeg_args(
         settings.gop.to_string(),
         "-bf".into(),
         "0".into(),
+        // Without this the muxer sits on up to 32 KB of output, which at the
+        // 3 KB/s this path produces is ten seconds of latency.
+        "-flush_packets".into(),
+        "1".into(),
         "-f".into(),
         container(choice.codec).into(),
         "pipe:1".into(),
@@ -212,6 +216,7 @@ mod tests {
         assert!(line.contains("-async_depth 1"), "E2: 136 ms -> 2 ms");
         assert!(line.contains("-g 16"));
         assert!(line.contains("-bf 0"));
+        assert!(line.contains("-flush_packets 1"), "or the muxer hoards 32 KB");
         assert!(line.contains("-q:v 30"), "VAAPI ignores -qp");
         assert!(line.ends_with("-f ivf pipe:1"));
     }

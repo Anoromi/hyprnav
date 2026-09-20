@@ -6,6 +6,9 @@
 #include <hyprland/src/managers/eventLoop/EventLoopTimer.hpp>
 #include <hyprland/src/desktop/DesktopTypes.hpp>
 #include <hyprland/src/helpers/signal/Signal.hpp>
+#include <hyprland/src/helpers/memory/Memory.hpp>
+
+class CWLSurfaceResource;
 
 #include <chrono>
 #include <cstdint>
@@ -93,9 +96,13 @@ class CStickManager {
     // frames: damage hook and the watched set
   public:
     void onWindowDamaged(PHLWINDOW window);
+    void onSurfaceDamaged(const SP<CWLSurfaceResource>& surface);
+    void onSurfaceCommitted(const void* resource);
 
   private:
-    void installDamageHook();
+    void installDamageHooks();
+    void notifyDamage(uintptr_t address);
+    void rememberWatchedSurface(uintptr_t address);
     void broadcastFramesEvent(const std::string& payload);
     void noteTransient(PHLWINDOW window, bool mapped);
 
@@ -135,6 +142,15 @@ class CStickManager {
     uint64_t              m_lastReapMs = 0;
 
     std::unordered_map<uintptr_t, SFrameWatch>    m_frameWatches;
+    // Diagnostics, reported by `ping`: without them "no frames" cannot be
+    // told apart from "the hook never fired".
+    uint64_t                                      m_damageCalls        = 0;
+    uint64_t                                      m_surfaceDamageCalls = 0;
+    uint64_t                                      m_commitCalls        = 0;
+    // Surface resource -> watched window. A hidden window never reaches the
+    // renderer's damage path, but it still commits buffers.
+    std::unordered_map<const void*, uintptr_t>    m_watchedSurfaces;
+    uint64_t                                      m_damageMatched      = 0;
     std::unordered_set<uintptr_t>                 m_announcedTransients;
 
     std::unordered_map<int, SClientState>          m_clients;

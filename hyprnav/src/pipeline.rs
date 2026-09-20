@@ -41,6 +41,18 @@ use tracing::{debug, warn};
 const CLIENT_QUEUE: usize = 48;
 /// The GOP is 16 frames; twice that bounds a misbehaving encoder.
 const GOP_CACHE_LIMIT: usize = 32;
+/// How many captures in a row may be taken without a damage report.
+///
+/// A hidden client only paints when it is handed a frame callback, and the
+/// standalone capture render is what hands it one -- but a toolkit needs more
+/// than a single callback to turn "this label changed" into a committed
+/// buffer, so one capture is not enough to start the loop. Measured in the
+/// lab: a GTK4 window produces its first commit on the second or third render.
+/// `render_unfocused` covers this on a real session, where the monitor is
+/// repainting anyway; on an idle headless output nothing renders at all, so
+/// the priming burst is what gets the first picture out. It is bounded, and a
+/// window that really is still stops producing after it.
+const PRIME_BURST: u32 = 3;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct PipelineKey {
@@ -122,6 +134,9 @@ struct Inner {
     /// `follow=transient` and one is mapped.
     source: String,
     last_record: Instant,
+    last_capture: Instant,
+    /// Captures still allowed without a damage report; see PRIME_BURST.
+    primes_left: u32,
 }
 
 pub struct Pipeline {
@@ -157,7 +172,7 @@ impl Pipeline {
             .arg("3")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+            .stderr(Stdio::inherit());
         unsafe {
             command.pre_exec(move || {
                 if libc::dup2(write_end, 3) < 0 {
@@ -199,6 +214,8 @@ impl Pipeline {
                 children: vec![helper],
                 source: key.address.clone(),
                 last_record: Instant::now(),
+                last_capture: Instant::now(),
+                primes_left: PRIME_BURST,
             }),
         });
 
@@ -216,6 +233,12 @@ impl Pipeline {
             let pipeline = pipeline.clone();
             move || pipeline.keepalive()
         });
+        if !paced {
+            spawn_named("hyprnav-frames-prime", {
+                let pipeline = pipeline.clone();
+                move || pipeline.prime()
+            });
+        }
 
         pipeline.command(json!({
             "op": "start",
@@ -290,7 +313,43 @@ impl Pipeline {
         if self.paced || self.source() != address {
             return;
         }
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.primes_left = PRIME_BURST;
+        }
+        self.capture(address);
+    }
+
+    fn capture(&self, address: &str) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.last_capture = Instant::now();
+        }
         self.command(json!({"op": "capture", "addr": address}));
+    }
+
+    /// Hand the client enough frame callbacks to start painting, then stop.
+    fn prime(self: Arc<Self>) {
+        let interval = Duration::from_millis((1000 / self.fps.max(1)).max(16) as u64);
+        loop {
+            thread::sleep(interval);
+            if self.is_stopping() {
+                return;
+            }
+            let due = match self.inner.lock() {
+                Ok(mut inner) => {
+                    if inner.primes_left > 0 && inner.last_capture.elapsed() >= interval * 2 {
+                        inner.primes_left -= 1;
+                        true
+                    } else {
+                        false
+                    }
+                }
+                Err(_) => return,
+            };
+            if due {
+                let source = self.source();
+                self.capture(&source);
+            }
+        }
     }
 
     /// Point the capture at `address`. The encoder is left alone; if the new
@@ -303,6 +362,9 @@ impl Pipeline {
             }
             std::mem::replace(&mut inner.source, address.to_owned())
         };
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.primes_left = PRIME_BURST;
+        }
         self.command(json!({"op": "stop", "addr": previous}));
         self.command(json!({
             "op": "start",
@@ -339,7 +401,14 @@ impl Pipeline {
             let number = |key: &str| value.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
             match value.get("ev").and_then(|v| v.as_str()).unwrap_or_default() {
                 "raw" => {
-                    self.captures.fetch_add(1, Ordering::Relaxed);
+                    let count = self.captures.fetch_add(1, Ordering::Relaxed) + 1;
+                    debug!(
+                        count,
+                        bytes = number("len"),
+                        width = number("w"),
+                        height = number("h"),
+                        "captured a raw frame"
+                    );
                     let header = RawHeader {
                         len: number("len") as usize,
                         width: number("w") as u32,
@@ -369,10 +438,35 @@ impl Pipeline {
     }
 
     /// Read raw frames off the pipe and keep an ffmpeg fed with them.
+    ///
+    /// ffmpeg holds a picture until the next one arrives: measured, one raw
+    /// frame in produces zero bytes out, two produce both. A damage-driven
+    /// stream would therefore always be one change behind, and a window that
+    /// changes once and then sits still would show nothing at all. So when no
+    /// new frame turns up promptly, the last one is written a second time to
+    /// push it through. The duplicate costs one encode and codes to a handful
+    /// of bytes, and it only happens when the window has gone quiet.
     fn pump(self: Arc<Self>, mut raw: std::fs::File, headers: std::sync::mpsc::Receiver<RawHeader>) {
         let mut encoder: Option<RunningEncoder> = None;
         let mut buffer = Vec::new();
-        while let Ok(header) = headers.recv() {
+        let grace = Duration::from_millis(((1000 / self.fps.max(1)).max(150)) as u64);
+        let mut unflushed = false;
+        loop {
+            let header = match headers.recv_timeout(grace) {
+                Ok(header) => header,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if unflushed && !self.is_stopping() {
+                        if let Some(running) = encoder.as_mut() {
+                            if running.write(&buffer).is_err() {
+                                encoder = None;
+                            }
+                        }
+                        unflushed = false;
+                    }
+                    continue;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            };
             if self.is_stopping() {
                 break;
             }
@@ -396,6 +490,7 @@ impl Pipeline {
             if running.write(&buffer).is_err() {
                 encoder = None;
             }
+            unflushed = true;
         }
         if let Some(running) = encoder.take() {
             running.stop();
@@ -417,7 +512,9 @@ impl Pipeline {
             .args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            // ffmpeg's complaints are the only diagnosis when a pipeline goes
+            // quiet, and at -loglevel error there are none when it is happy.
+            .stderr(Stdio::inherit())
             .spawn()?;
         let stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
@@ -510,6 +607,7 @@ impl Pipeline {
             self.fan_out(record);
         }
         let flags = if keyframe { FLAG_KEYFRAME } else { 0 };
+        debug!(bytes = unit.len(), keyframe, "encoded a record");
         let record = video::encode_record(flags, pts_us, width, height, unit);
         if let Ok(mut inner) = self.inner.lock() {
             inner.gop.push(record.clone(), keyframe);

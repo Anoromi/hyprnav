@@ -118,12 +118,33 @@ impl RecordHeader {
 }
 
 /// The CONFIG record's payload: codec string, NUL, then any out-of-band data.
+///
+/// For H.264 the codec string is read out of the SPS rather than assumed: the
+/// VAAPI encoder here produces High profile, and a browser handed
+/// `avc1.42E01E` for a High-profile stream is entitled to refuse it.
 pub fn config_payload(codec: Codec, extra: &[u8]) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(codec.codec_string().len() + 1 + extra.len());
-    payload.extend_from_slice(codec.codec_string().as_bytes());
+    let codec_string = match codec {
+        Codec::H264 => h264_codec_string(extra)
+            .unwrap_or_else(|| codec.codec_string().to_owned()),
+        other => other.codec_string().to_owned(),
+    };
+    let mut payload = Vec::with_capacity(codec_string.len() + 1 + extra.len());
+    payload.extend_from_slice(codec_string.as_bytes());
     payload.push(0);
     payload.extend_from_slice(extra);
     payload
+}
+
+/// `avc1.PPCCLL` from the three bytes that follow the SPS NAL header.
+pub fn h264_codec_string(annex_b: &[u8]) -> Option<String> {
+    for (_, payload_at) in nal_starts(annex_b) {
+        let nal = &annex_b[payload_at..];
+        if nal.first().map(|byte| byte & 0x1f) != Some(7) || nal.len() < 4 {
+            continue;
+        }
+        return Some(format!("avc1.{:02X}{:02X}{:02X}", nal[1], nal[2], nal[3]));
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
@@ -527,10 +548,19 @@ mod tests {
         let nul = payload.iter().position(|byte| *byte == 0).unwrap();
         assert_eq!(&payload[..nul], b"av01.0.08M.08");
         assert_eq!(&payload[nul + 1..], &[9, 9]);
-        assert_eq!(
-            config_payload(Codec::H264, &[]),
-            b"avc1.42E01E\0".to_vec()
-        );
+        // Nothing to read a profile out of: fall back to the documented one.
+        assert_eq!(config_payload(Codec::H264, &[]), b"avc1.42E01E\0".to_vec());
+    }
+
+    /// h264_vaapi on this machine emits High profile, and a client told
+    /// "constrained baseline" may refuse to decode it.
+    #[test]
+    fn the_h264_codec_string_comes_from_the_sps() {
+        let sets = nal(7, &[0x64, 0x0c, 0x16, 0xac]);
+        assert_eq!(h264_codec_string(&sets).as_deref(), Some("avc1.640C16"));
+        let payload = config_payload(Codec::H264, &sets);
+        assert_eq!(&payload[..payload.iter().position(|b| *b == 0).unwrap()], b"avc1.640C16");
+        assert!(h264_codec_string(&nal(1, &[1, 2, 3])).is_none());
     }
 
     #[test]

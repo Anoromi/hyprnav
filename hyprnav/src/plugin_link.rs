@@ -129,7 +129,7 @@ impl PluginLink {
                 }
                 Err(error) => {
                     self.available.store(false, Ordering::Relaxed);
-                    debug!("plugin damage channel unavailable: {error}");
+                    debug!(path = %self.path.display(), "plugin damage channel unavailable: {error}");
                 }
             }
             thread::sleep(backoff);

@@ -807,6 +807,13 @@ impl FrameHub {
         .map_err(|_| "capture_failed")?;
         pipelines.insert(key.clone(), pipeline.clone());
         drop(pipelines);
+        debug!(
+            address = %request.address,
+            codec = choice.codec.name(),
+            width = key.width,
+            paced,
+            "frames pipeline started"
+        );
         self.set_render_unfocused(&request.address, true);
         if !paced {
             // 1000/max_fps is the coalescing window the plugin applies.

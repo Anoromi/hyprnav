@@ -15,9 +15,13 @@
 #include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
 #include <hyprland/src/managers/EventManager.hpp>
 #include <hyprland/src/render/Renderer.hpp>
+#include <hyprland/src/desktop/view/WLSurface.hpp>
+#include <hyprland/src/desktop/view/View.hpp>
+#include <hyprland/src/protocols/core/Compositor.hpp>
 #undef private
 
 #include <algorithm>
+#include <ranges>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -99,12 +103,18 @@ std::string joinQuoted(const auto& items) {
 // --------------------------------------------------------------- damage hook
 //
 // Live window video is damage-driven: the daemon must learn that a window
-// repainted without polling it. CHyprRenderer::damageWindow runs inside the
+// repainted without polling it. The renderer's damageWindow runs inside the
 // compositor for every visual change of every window, which is exactly the
 // signal, so the plugin hooks it. The cost for a window nobody watches is one
 // empty-map test plus, at most, one hash lookup.
-static CFunctionHook* g_damageWindowHook = nullptr;
+//
+// The class is `Render::IHyprRenderer` in 0.56 and was `CHyprRenderer` before,
+// so the match is on the method name and either owner rather than on one
+// spelling that a point release can invalidate silently.
+static CFunctionHook* g_damageWindowHook  = nullptr;
+static CFunctionHook* g_damageSurfaceHook = nullptr;
 typedef void (*origDamageWindow)(void*, PHLWINDOW, bool);
+typedef void (*origDamageSurface)(void*, SP<CWLSurfaceResource>, double, double, double);
 
 static void hkDamageWindow(void* thisptr, PHLWINDOW window, bool forceFull) {
     if (g_pStickManager && window)
@@ -112,36 +122,109 @@ static void hkDamageWindow(void* thisptr, PHLWINDOW window, bool forceFull) {
     ((origDamageWindow)g_damageWindowHook->m_original)(thisptr, window, forceFull);
 }
 
-void CStickManager::installDamageHook() {
-    if (g_damageWindowHook)
-        return;
-    const auto matches = HyprlandAPI::findFunctionsByName(PHANDLE, "damageWindow");
-    for (const auto& match : matches) {
-        if (!match.demangled.contains("CHyprRenderer::damageWindow"))
-            continue;
-        g_damageWindowHook = HyprlandAPI::createFunctionHook(PHANDLE, match.address, (void*)&hkDamageWindow);
-        if (g_damageWindowHook && g_damageWindowHook->hook()) {
-            Log::logger->log(Log::INFO, std::format("[hyprnav-plugin] damage hook on {}", match.demangled));
-            return;
-        }
-        g_damageWindowHook = nullptr;
-    }
-    Log::logger->log(Log::ERR, "[hyprnav-plugin] could not hook CHyprRenderer::damageWindow; frames fall back to polling");
+static CFunctionHook* g_commitStateHook = nullptr;
+typedef void (*origCommitState)(void*, void*);
+
+// A client that paints commits, whether or not anyone can see the result. The
+// renderer's damage paths are gated on visibility -- measured: zero
+// damageSurface calls for a window on a hidden workspace, ten in as many
+// seconds once it is on screen -- so this is the only signal that survives the
+// case the whole feature exists for.
+static void hkCommitState(void* thisptr, void* state) {
+    if (g_pStickManager)
+        g_pStickManager->onSurfaceCommitted(thisptr);
+    ((origCommitState)g_commitStateHook->m_original)(thisptr, state);
 }
 
-void CStickManager::onWindowDamaged(PHLWINDOW window) {
-    // Fast path: nothing is watched, so this is one predictable branch.
-    if (m_frameWatches.empty())
+static void hkDamageSurface(void* thisptr, SP<CWLSurfaceResource> surface, double x, double y, double scale) {
+    if (g_pStickManager && surface)
+        g_pStickManager->onSurfaceDamaged(surface);
+    ((origDamageSurface)g_damageSurfaceHook->m_original)(thisptr, surface, x, y, scale);
+}
+
+static CFunctionHook* installHook(const char* name, const char* owner, void* destination) {
+    for (const auto& match : HyprlandAPI::findFunctionsByName(PHANDLE, name)) {
+        if (!match.demangled.contains(owner))
+            continue;
+        auto* hook = HyprlandAPI::createFunctionHook(PHANDLE, match.address, destination);
+        if (hook && hook->hook()) {
+            Log::logger->log(Log::INFO, std::format("[hyprnav-plugin] hooked {}", match.demangled));
+            return hook;
+        }
+    }
+    Log::logger->log(Log::ERR, std::format("[hyprnav-plugin] could not hook {}; frames fall back to polling", name));
+    return nullptr;
+}
+
+void CStickManager::installDamageHooks() {
+    // damageWindow catches window-level changes (move, resize, fullscreen);
+    // damageSurface is the one that fires when a client paints, which is the
+    // only signal a window on a workspace nobody is looking at ever produces.
+    if (!g_damageWindowHook)
+        g_damageWindowHook = installHook("damageWindow", "HyprRenderer::damageWindow", (void*)&hkDamageWindow);
+    if (!g_damageSurfaceHook)
+        g_damageSurfaceHook = installHook("damageSurface", "HyprRenderer::damageSurface", (void*)&hkDamageSurface);
+    if (!g_commitStateHook)
+        g_commitStateHook = installHook("commitState", "CWLSurfaceResource::commitState", (void*)&hkCommitState);
+}
+
+void CStickManager::onSurfaceCommitted(const void* resource) {
+    if (m_watchedSurfaces.empty())
         return;
-    const auto address = reinterpret_cast<uintptr_t>(window.get());
-    const auto it      = m_frameWatches.find(address);
+    m_commitCalls++;
+    const auto it = m_watchedSurfaces.find(resource);
+    if (it == m_watchedSurfaces.end())
+        return;
+    notifyDamage(it->second);
+}
+
+// Remember which wl_surface belongs to a watched window, so the commit hook is
+// a hash lookup rather than a walk of every window.
+void CStickManager::rememberWatchedSurface(uintptr_t address) {
+    const auto window = findWindowByAddress(address);
+    if (!window) {
+        Log::logger->log(Log::ERR, std::format("[hyprnav-plugin] frames_watch: no window 0x{:x}", address));
+        return;
+    }
+    const auto surface = window->wlSurface();
+    if (!surface || !surface->resource()) {
+        Log::logger->log(Log::ERR, std::format("[hyprnav-plugin] frames_watch: 0x{:x} has no surface", address));
+        return;
+    }
+    m_watchedSurfaces[surface->resource().get()] = address;
+}
+
+void CStickManager::notifyDamage(uintptr_t address) {
+    const auto it = m_frameWatches.find(address);
     if (it == m_frameWatches.end())
         return;
     const auto now = nowMs();
     if (it->second.lastSentMs != 0 && now - it->second.lastSentMs < it->second.intervalMs)
         return;
     it->second.lastSentMs = now;
+    m_damageMatched++;
     broadcastFramesEvent(std::format("{{\"ev\":\"window_damaged\",\"addr\":\"0x{:x}\"}}\n", address));
+}
+
+void CStickManager::onWindowDamaged(PHLWINDOW window) {
+    m_damageCalls++;
+    // Fast path: nothing is watched, so this is one predictable branch.
+    if (m_frameWatches.empty())
+        return;
+    notifyDamage(reinterpret_cast<uintptr_t>(window.get()));
+}
+
+void CStickManager::onSurfaceDamaged(const SP<CWLSurfaceResource>& surface) {
+    if (m_frameWatches.empty())
+        return;
+    m_surfaceDamageCalls++;
+    const auto wlSurface = Desktop::View::CWLSurface::fromResource(surface);
+    if (!wlSurface)
+        return;
+    const auto view = wlSurface->view();
+    if (!view)
+        return;
+    notifyDamage(reinterpret_cast<uintptr_t>(view.get()));
 }
 
 void CStickManager::broadcastFramesEvent(const std::string& payload) {
@@ -181,7 +264,7 @@ void CStickManager::noteTransient(PHLWINDOW window, bool mapped) {
 CStickManager::CStickManager() : m_instanceID(randomInstanceID()) {
     refreshRuntimePaths();
     registerEventListeners();
-    installDamageHook();
+    installDamageHooks();
 
     if (g_pEventLoopManager) {
         m_timer = makeShared<CEventLoopTimer>(std::optional<Time::steady_dur>{std::chrono::milliseconds{250}},
@@ -197,6 +280,14 @@ CStickManager::~CStickManager() {
     if (g_damageWindowHook) {
         g_damageWindowHook->unhook();
         g_damageWindowHook = nullptr;
+    }
+    if (g_damageSurfaceHook) {
+        g_damageSurfaceHook->unhook();
+        g_damageSurfaceHook = nullptr;
+    }
+    if (g_commitStateHook) {
+        g_commitStateHook->unhook();
+        g_commitStateHook = nullptr;
     }
     m_frameWatches.clear();
     if (m_timer)
@@ -351,6 +442,7 @@ void CStickManager::disconnectClient(int fd) {
     const bool anyLeft = std::ranges::any_of(m_clients, [](const auto& entry) { return entry.second.framesSubscriber; });
     if (!anyLeft) {
         m_frameWatches.clear();
+        m_watchedSurfaces.clear();
         m_announcedTransients.clear();
     }
 }
@@ -408,7 +500,13 @@ void CStickManager::handleClientLine(int fd, const std::string& line) {
     }
 
     if (*op == "ping") {
-        sendResult(fd, std::format("{{\"instance\":\"{}\",\"sticks\":{}}}", m_instanceID, m_roots.size()));
+        sendResult(fd,
+                   std::format("{{\"instance\":\"{}\",\"sticks\":{},\"damage_hook\":{},\"surface_hook\":{},"
+                               "\"commit_hook\":{},\"damage_calls\":{},\"surface_damage_calls\":{},\"commit_calls\":{},"
+                               "\"damage_matched\":{},\"frames_watched\":{},\"watched_surfaces\":{}}}",
+                               m_instanceID, m_roots.size(), g_damageWindowHook ? "true" : "false",
+                               g_damageSurfaceHook ? "true" : "false", g_commitStateHook ? "true" : "false", m_damageCalls,
+                               m_surfaceDamageCalls, m_commitCalls, m_damageMatched, m_frameWatches.size(), m_watchedSurfaces.size()));
         return;
     }
 
@@ -449,8 +547,10 @@ void CStickManager::handleClientLine(int fd, const std::string& line) {
             auto&      watch             = m_frameWatches[*address];
             watch.intervalMs             = interval > 0 ? static_cast<uint64_t>(interval) : 1;
             watch.lastSentMs             = 0;
+            rememberWatchedSurface(*address);
         } else {
             m_frameWatches.erase(*address);
+            std::erase_if(m_watchedSurfaces, [&](const auto& entry) { return entry.second == *address; });
         }
         sendResult(fd, std::format("{{\"watched\":{}}}", m_frameWatches.size()));
         if (on) {
