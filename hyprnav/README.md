@@ -540,47 +540,194 @@ $XDG_RUNTIME_DIR/hx/<fnv1a64(HYPRLAND_INSTANCE_SIGNATURE)>/frames.sock
 A client sends exactly one JSON line and then only reads:
 
 ```json
-{"address":"0x55ea1ad9c6d0","fps":8,"quality":60,"max_width":640}
+{"address":"0x55ea1ad9c6d0","codecs":["av1","h264","mjpeg"],"max_width":640,"max_fps":8,"follow":"transient"}
 ```
 
-`fps` is clamped to 1..15 (default 8), `quality` to 30..90 (default 60) and
-`max_width` to 64..3840 (default 640); all three may be omitted. The reply is
-a `multipart/x-mixed-replace` byte stream with the fixed boundary `frame`:
+| field | meaning |
+|---|---|
+| `address` | `0x…` or `address:0x…`, as `hyprctl clients` prints it |
+| `codecs` | what the client can decode, best first. `"format":"av1"` is shorthand for a one-element list. Absent means `mjpeg`, which is what every client written before this path sends |
+| `max_width` | 64..3840, default 640. The capture is scaled down to it |
+| `max_fps` | 1..15, default 8. Also the coalescing window the compositor applies to damage, `1000/max_fps` ms. `fps` is accepted as an alias |
+| `quality` | 30..90, default 60. MJPEG only |
+| `follow` | `transient` captures the target's dialog while one is mapped, `target` (the default) always captures the target |
+
+The daemon picks the first codec the client listed that it is configured for
+and this machine can actually encode. An address that does not name a live
+window gets one line, `{"error":"unknown_window"}`, and nothing else; a
+request no configured encoder can satisfy gets `{"error":"no_codec"}`, and
+one that would exceed `max_pipelines` with no shareable pipeline gets
+`{"error":"busy"}`.
+
+### The record stream (`av1`, `h264`)
+
+A byte stream of records, big-endian, which is what `DataView.getUint32(o)`
+reads by default:
+
+```
+u32 magic 'HNVF' | u32 len | u32 flags | u64 pts_us | u16 width | u16 height | payload[len]
+flags: 1 = KEYFRAME, 2 = CONFIG, 4 = KEEPALIVE
+```
+
+One record is one temporal unit (AV1) or one access unit (H.264). `width`
+and `height` are the picture, not the padded buffer the encoder was given:
+VAAPI wants the height a multiple of 16, so a 1902x1062 window at
+`max_width` 640 is encoded 640x368 and reported 640x357. Clients should size
+their canvas from the decoded frame and use the header only as a hint.
+
+The **first record a client receives is always CONFIG**. Its payload is a
+NUL-terminated codec string followed by the codec's out-of-band
+configuration, if it has any:
+
+```
+av01.0.08M.08\0                       AV1: nothing more
+avc1.640C16\0<SPS><PPS in Annex-B>    H.264: the parameter sets, no `description`
+```
+
+The H.264 string is read out of the SPS rather than assumed, because
+`h264_vaapi` here emits High profile and a decoder told "constrained
+baseline" may refuse the stream. H.264 is Annex-B and must be configured
+without a `description`.
+
+After CONFIG comes the **GOP cache**: the last keyframe and every record
+since. A client joining a stream that has been running for a while decodes
+its first picture immediately instead of waiting up to two seconds for the
+next keyframe. Verified by writing a late joiner's stream to IVF: its first
+frame is a keyframe.
+
+Every record with KEYFRAME set is independently decodable. A record with
+KEEPALIVE set has an empty payload and arrives after ten seconds of silence;
+it is how a client tells "this window is static" from "the daemon died".
+Static windows simply stop producing records — there is no other heartbeat.
+
+Params that change the encoder (a different window size, because
+`follow=transient` switched to a dialog) restart it and emit a fresh CONFIG
+record. Clients reconfigure their decoder whenever they see one.
+
+### The MJPEG stream (`mjpeg`)
+
+Unchanged, and still the default: a `multipart/x-mixed-replace` byte stream
+with the fixed boundary `frame`.
 
 ```
 --frame\r\nContent-Type: image/jpeg\r\nContent-Length: <n>\r\n\r\n<n bytes>\r\n
 ```
 
-The daemon closes the connection when the window closes or unmaps. An
-address that does not name a live window gets one line,
-`{"error":"unknown_window"}`, and nothing else.
+Each MJPEG client holds a single latest-frame slot, so a slow reader drops
+frames rather than queueing them, and a client joining a still window is
+handed the most recent frame immediately.
 
-Every client watching the same address shares one capture, running at the
-loosest settings any of them asked for. Each client holds a single
-latest-frame slot: a reader that falls behind drops frames rather than
-queueing them or delaying anyone else. A client joining a window that is
-already being captured is handed the most recent frame immediately, so it
-sees something even if the window never changes again.
+### Fan-out
+
+Pipelines are keyed by `(address, codec, width)`. Two clients that agree on
+all three share one capture, one encoder and one GOP cache; two that
+disagree get two pipelines. `max_pipelines` bounds the total — beyond it the
+daemon offers an existing pipeline for the same window if the client listed
+its codec, and answers `busy` otherwise.
+
+Latest-wins is wrong for video, because P-frames need their predecessors. So
+each client gets a bounded queue of whole records; when it overflows, the
+backlog is thrown away and replaced with the GOP cache and the client
+resyncs from the keyframe. A slow client never stalls the pipeline and never
+sees a hole.
+
+### `[frames]` configuration
+
+`~/.config/hyprnav/config.toml`, all optional:
+
+```toml
+[frames]
+encoder = "auto"                    # auto | vaapi | software
+vaapi_device = "/dev/dri/renderD128"
+codecs = ["av1", "h264", "mjpeg"]   # allow-list, in preference order
+default_width = 640
+max_pipelines = 4
+force_fallback = false              # ignore the plugin and pace captures on a timer
+
+[frames.codec.av1]
+q = 30                              # -q:v; VAAPI ignores -qp
+bitrate = 0                         # kbit/s; 0 keeps constant quality
+gop = 16
+```
+
+`encoder = "auto"` does not trust `ffmpeg -encoders`: a name in that list
+means the build has the encoder, not that this GPU will start it. Each
+candidate gets a quarter-second null encode once at startup and only what
+survives is offered to clients. On this machine that leaves
+`av1/vaapi, h264/vaapi`, logged at `debug` level.
 
 ### `frames`
 
 ```bash
-hyprnav frames 0x55ea1ad9c6d0 > out.mjpeg
-hyprnav frames 0x55ea1ad9c6d0 --fps 12 --quality 70 --max-width 960 | ffplay -f mpjpeg -
+hyprnav frames 0x55ea1ad9c6d0 --codec av1 --ivf -o /tmp/w.ivf   # ffprobe/ffplay
+hyprnav frames 0x55ea1ad9c6d0 --codec h264 -o /tmp/w.hnvf       # raw records
+hyprnav frames 0x55ea1ad9c6d0 --codec av1 --follow transient -o /tmp/w.hnvf
+hyprnav frames 0x55ea1ad9c6d0 --codec mjpeg --fps 12 | ffplay -f mpjpeg -
 ```
+
+`--ivf` unwraps the records into an IVF file (CONFIG and KEEPALIVE records
+dropped, geometry and frame count patched into the header at the end), which
+needs a seekable output and therefore `-o`.
+
+### How a frame happens
+
+```
+plugin: commitState hook ──window_damaged──► daemon ──{"op":"capture"}──► hyprnav-capture
+                                               │                              │ toplevel-export, ignore_damage=1
+                                               │                              │ box downscale to max_width
+                                               │                              ▼ raw bgr24 on fd 3
+                                               └── HNVF records ◄── ffmpeg ◄───┘
+```
+
+Nothing polls. The daemon tells the plugin which windows to watch
+(`{"op":"frames_watch","addr":"0x…","on":true,"interval_ms":125}` on the
+existing spawn socket) and the plugin pushes one `window_damaged` line per
+window per `interval_ms` down the same connection. A window nobody watches
+costs an empty-map test and at most one hash lookup per commit.
+
+Three details are not obvious and each of them is load-bearing:
+
+- **The hook is on `CWLSurfaceResource::commitState`, not on the renderer.**
+  The renderer's damage paths are gated on visibility: measured in the lab,
+  zero `damageSurface` calls in ten seconds for a window on a hidden
+  workspace and ten in as many seconds once it is on screen. A client
+  painting commits either way. The renderer hooks are kept for window-level
+  changes like a move or a resize.
+- **A hidden client only paints when it is handed a frame callback**, and the
+  standalone capture render is what hands it one — but a toolkit needs more
+  than one callback to turn a changed label into a committed buffer. The
+  daemon therefore allows a burst of at most three unprompted captures, reset
+  by every damage report. `render_unfocused`, which the daemon still sets on
+  watched windows, covers this on a real session where the monitor repaints
+  anyway; on an idle headless output nothing renders at all.
+- **ffmpeg holds a picture until the next one arrives.** One raw frame in
+  produces zero bytes out; two produce both. Without help a damage-driven
+  stream would always be one change behind and a window that changed once
+  would show nothing. When no new frame turns up within `1000/max_fps` ms
+  (at least 150) the last one is written again to push it through: one
+  encode, a handful of bytes, and only while the window is quiet.
+
+`follow=transient` uses the same channel: the plugin reports
+`transient_mapped` / `transient_unmapped` for a dialog whose parent is
+watched, including one that was already open when the watch began, and the
+pipeline retargets without restarting anything it does not have to.
+
+When the plugin is not loaded — plain Hyprland, or `force_fallback = true` —
+the helper falls back to its old paced loop at `max_fps` with the
+identical-pixel dedupe. Everything above the helper is unchanged.
 
 ### `hyprnav-capture`
 
-The pixels come from a C helper the daemon spawns once and restarts with
-backoff. It holds a single Wayland connection and does three things the
-daemon would otherwise need Wayland and JPEG crates for:
+The pixels come from a C helper. One long-lived instance does window
+identification and MJPEG for the whole daemon; each video pipeline gets its
+own, because raw pixels need a private fd.
 
 - follows `ext-foreign-toplevel-list-v1` for the per-window `identifier`
 - asks `hyprland-toplevel-mapping-v1` for each toplevel's window address, so
   the two can be paired with what `hyprctl clients` prints
 - renders each watched window on demand with `hyprland-toplevel-export-v1`
-  into a reused `wl_shm` buffer, scaling with an integer box filter and
-  encoding with libjpeg-turbo
+  into a reused `wl_shm` buffer, scaling with an integer box filter, then
+  either encoding with libjpeg-turbo or writing packed 3-byte rows
 
 Standalone modes:
 
@@ -589,6 +736,7 @@ hyprnav-capture --list             # one `add` line per window, then exit
 hyprnav-capture --resolve 0x…      # print the bare identifier, exit 3 if unknown
 hyprnav-toplevel-map               # the same binary under its identification name
 hyprnav-capture --backend copy-capture   # the other backend, see below
+hyprnav-capture --raw-fd 3         # raw pixels to fd 3, JSON headers on stdout
 ```
 
 With no arguments it speaks NDJSON on stdout and takes NDJSON commands on
@@ -601,20 +749,29 @@ stdin. stdout:
 {"ev":"ready"}
 {"ev":"capture_failed","addr":"0x…","reason":"stopped"}
 {"ev":"frame","addr":"0x…","len":7897,"w":640,"h":365,"enc_ms":2.34}
+{"ev":"raw","addr":"0x…","len":706560,"w":640,"h":368,"real_h":357,"pix":"bgr24"}
 ```
 
 Every existing window is announced with `add` before `ready`. A `frame` line
 is followed immediately by exactly `len` raw JPEG bytes and then the next
-line; nothing is interleaved. Addresses are lowercase `0x` + hex without
-leading zeros. stdin:
+line. A `raw` line has **no** payload on stdout: the pixels go to the fd
+given by `--raw-fd`, which the daemon creates as a pipe per pipeline and
+leaks into the helper at spawn time. That split is deliberate — the scratch
+experiment wrote raw pixels to stdout between JSON lines, which
+desynchronises any reader parsing both. `h` is the buffer height, padded up
+to a multiple of 16 for the encoder; `real_h` is how many of those rows are
+picture. Addresses are lowercase `0x` + hex without leading zeros. stdin:
 
 ```json
-{"op":"start","addr":"0x…","max_width":640,"quality":60,"max_fps":8}
+{"op":"start","addr":"0x…","max_width":640,"quality":60,"max_fps":8,"mode":"raw","paced":0}
+{"op":"capture","addr":"0x…"}
 {"op":"stop","addr":"0x…"}
 ```
 
-A second `start` for a running address only updates its parameters; the
-daemon does the refcounting.
+`capture` renders exactly one frame. With `paced` set the helper re-arms
+itself every `1000/max_fps` ms instead, which is the no-plugin fallback. A
+second `start` for a running address only updates its parameters; the daemon
+does the refcounting.
 
 ### Why toplevel-export and not ext-image-copy-capture
 
@@ -631,27 +788,23 @@ our buffer when we ask, whatever its visibility, so the same countdown
 yields 12. That is why it is the default. `copy-capture` stays selectable
 for the day the other implementation catches up.
 
-Rendering on demand also means the helper, not the compositor, decides how
-often, so it paces itself at `max_fps` and compares the raw buffer before
-encoding. A window that renders but does not change costs one buffer compare
-and no encode; a window that changes costs one encode.
-
 ### What frame streaming costs
 
-Measured in the lab (Hyprland 0.56.2, 1920x1080, `max_width` 640, `--fps 8`):
+Measured in the lab (Hyprland 0.56.2, headless 1920x1080, a 1902x1062 GTK4
+window on a workspace that is not on screen, `max_width` 640, `max_fps` 8,
+AV1 on VAAPI at `q 30`). CPU is helper plus ffmpeg, as a share of one core.
 
-| Watched window | Frames | Helper CPU |
-|---|---|---|
-| GTK countdown ticking on a workspace that is not on screen | 11 / 10 s | 70 ms / 10 s |
-| the same window, two clients sharing the capture | 11 / 10 s each | one capture |
-| still window on a workspace that is not on screen | 1 / 20 s | 50 ms / 20 s |
+| case | captures | CPU | wire |
+|---|---|---|---|
+| countdown ticking once a second | 60 / 28 s | 3.7 % | 31 KB / 28 s ≈ 1.1 KB/s |
+| the same, two clients | one pipeline, one ffmpeg | as above | as above |
+| still window, after it settles | 0 / 20 s | 0.05 % | 0 B/s + a keepalive every 10 s |
+| H.264 instead of AV1 | as above | as above | 6.4 KB / 12 s ≈ 530 B/s |
+| MJPEG, `--fps 8`, `quality 60` | — | 0.7 % | 60–300 KB/s |
 
-Downscale plus JPEG encode of a 1920x1080 window to 640 px wide costs 2.3 to
-5 ms, logged per frame at `debug` level (`encode_ms`). A start that produces
-no frame within two seconds is reported at `warn` level.
+A ten-second AV1 capture of the ticking window is 13 frames and 9.2 KB, and
+`ffprobe` decodes it. The still-window row is the whole point: two captures
+when the client joins, then nothing at all until the window changes.
 
 While an address has subscribers the daemon also sets `render_unfocused` on
-that window and clears it when the last one leaves, so a client that only
-repaints on a frame callback keeps going. Rendering the window standalone
-already delivers those callbacks, so this is not what makes the countdown
-tick — it is insurance for clients that behave differently.
+that window and clears it when the last one leaves.

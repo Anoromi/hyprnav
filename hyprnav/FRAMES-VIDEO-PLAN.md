@@ -1,7 +1,27 @@
 # Live window video: efficient design
 
-Status: design, 2026-09-20. Supersedes the JPEG-only description in README "Window frames"
-once implemented. The MJPEG path stays as the fallback format.
+Status: Phase B built and verified in the lab, 2026-09-20. README "Window frames" now
+describes what exists; this document is the design behind it and the record of what the
+experiments settled. Phase C (T3 WebCodecs player) and Phase D (T2 zero-copy) are open.
+The MJPEG path stays as the fallback format.
+
+Two things §1 got wrong, found in the lab and fixed in the build:
+
+* The damage hook has to be on `CWLSurfaceResource::commitState`, not on
+  `CHyprRenderer::damageWindow`. The renderer's damage paths are gated on visibility --
+  zero `damageSurface` calls in ten seconds for a window on a hidden workspace, ten in as
+  many seconds once it is on screen -- so they never fire for the case the feature exists
+  for. A client painting commits either way. (The class is `Render::IHyprRenderer` in
+  0.56, not `CHyprRenderer`.)
+* `render_unfocused` is not enough to bootstrap. A toolkit needs more than one frame
+  callback to turn a changed label into a committed buffer, and on an idle headless output
+  nothing renders at all, so `render_unfocused` produces no callbacks either. The daemon
+  allows a bounded burst of at most three unprompted captures, reset by every damage
+  report; a window that is really still settles to zero.
+
+A third detail §2 did not anticipate: ffmpeg holds a picture until the next one arrives
+(one raw frame in, zero bytes out; two in, both out), so the pump writes the last frame
+again when the window goes quiet.
 
 ## Goal
 
