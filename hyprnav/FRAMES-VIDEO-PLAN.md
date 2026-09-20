@@ -149,6 +149,7 @@ Request line: `{"address":"0x…","codecs":["av1","h264","mjpeg"],"max_width":64
 ```
 u32 magic 'HNVF' | u32 len | u32 flags | u64 pts_us | u16 width | u16 height | payload[len]
 flags: 1=KEYFRAME 2=CONFIG(sequence header / SPS+PPS) 4=KEEPALIVE
+All integers big-endian (network order). Magic bytes are the ASCII 'H','N','V','F'.
 ```
 One record = one temporal unit (AV1) / one access unit (H.264/HEVC) / one frame (VP9). The
 CONFIG record's payload starts with a NUL-terminated codec string (`av01.0.08M.08`,
