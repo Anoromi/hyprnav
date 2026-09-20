@@ -504,3 +504,133 @@ hyprnav events --once    # print hello + agents + slots, then exit
 ```
 
 Prints the stream to stdout, one line per event.
+
+## Agents
+
+An MCP process announces itself with `agent_register` and gets an unnumbered
+temporary slot of its own. Its snapshot carries, besides the slot and the
+live state, two optional strings that the host app supplies:
+
+- `thread_id` — the conversation the agent is acting for
+- `thread_environment_id` — the host's own environment for that thread
+
+Both are opaque to hyprnav: it stores, serialises and reports them, never
+interprets them. They are `null` when the host did not supply them. They
+appear in `agents_list`, in the `agents` event and in `hyprnav agents`, so a
+dashboard can group frames by thread. The cua MCP bridge fills them from
+`T3CODE_THREAD_ID` and `T3CODE_ENVIRONMENT_ID`.
+
+Re-registering the same `agent_id` keeps the slot and refreshes whichever of
+the two the caller passed.
+
+```bash
+hyprnav agent register --id a1 --label "planner" \
+  --thread-id T1 --thread-environment-id E1
+hyprnav agents
+```
+
+## Window frames
+
+Beside the request socket the daemon opens a third Unix socket:
+
+```
+$XDG_RUNTIME_DIR/hx/<fnv1a64(HYPRLAND_INSTANCE_SIGNATURE)>/frames.sock
+```
+
+A client sends exactly one JSON line and then only reads:
+
+```json
+{"address":"0x55ea1ad9c6d0","fps":8,"quality":60,"max_width":640}
+```
+
+`fps` is clamped to 1..15 (default 8), `quality` to 30..90 (default 60) and
+`max_width` to 64..3840 (default 640); all three may be omitted. The reply is
+a `multipart/x-mixed-replace` byte stream with the fixed boundary `frame`:
+
+```
+--frame\r\nContent-Type: image/jpeg\r\nContent-Length: <n>\r\n\r\n<n bytes>\r\n
+```
+
+The daemon closes the connection when the window closes or unmaps. An
+address that does not name a live window gets one line,
+`{"error":"unknown_window"}`, and nothing else.
+
+Every client watching the same address shares one capture, running at the
+loosest settings any of them asked for. Each client holds a single
+latest-frame slot: a reader that falls behind drops frames rather than
+queueing them or delaying anyone else. A client joining a window that is
+already being captured is handed the most recent frame immediately, so it
+sees something even if the window never changes again.
+
+### `frames`
+
+```bash
+hyprnav frames 0x55ea1ad9c6d0 > out.mjpeg
+hyprnav frames 0x55ea1ad9c6d0 --fps 12 --quality 70 --max-width 960 | ffplay -f mpjpeg -
+```
+
+### `hyprnav-capture`
+
+The pixels come from a C helper the daemon spawns once and restarts with
+backoff. It holds a single Wayland connection and does three things the
+daemon would otherwise need Wayland and JPEG crates for:
+
+- follows `ext-foreign-toplevel-list-v1` for the per-window `identifier`
+- asks `hyprland-toplevel-mapping-v1` for each toplevel's window address, so
+  the two can be paired with what `hyprctl clients` prints
+- runs an `ext-image-copy-capture-v1` session per watched window, over an
+  `ext_foreign_toplevel_image_capture_source_manager_v1` source, into a
+  reused `wl_shm` buffer; scales with an integer box filter and encodes with
+  libjpeg-turbo
+
+Standalone modes:
+
+```bash
+hyprnav-capture --list             # one `add` line per window, then exit
+hyprnav-capture --resolve 0x…      # print the bare identifier, exit 3 if unknown
+hyprnav-toplevel-map               # the same binary under its identification name
+```
+
+With no arguments it speaks NDJSON on stdout and takes NDJSON commands on
+stdin. stdout:
+
+```json
+{"ev":"add","addr":"0x55ea1ad9c6d0","id":"18000004","app":"org.telegram.desktop","title":"…"}
+{"ev":"title","addr":"0x…","title":"…"}
+{"ev":"close","addr":"0x…"}
+{"ev":"ready"}
+{"ev":"capture_failed","addr":"0x…","reason":"stopped"}
+{"ev":"frame","addr":"0x…","len":7897,"w":640,"h":365,"enc_ms":2.34}
+```
+
+Every existing window is announced with `add` before `ready`. A `frame` line
+is followed immediately by exactly `len` raw JPEG bytes and then the next
+line; nothing is interleaved. Addresses are lowercase `0x` + hex without
+leading zeros. stdin:
+
+```json
+{"op":"start","addr":"0x…","max_width":640,"quality":60,"max_fps":8}
+{"op":"stop","addr":"0x…"}
+```
+
+A second `start` for a running address only updates its parameters; the
+daemon does the refcounting.
+
+### What frame streaming costs
+
+`ext-image-copy-capture` completes a frame only when the compositor repaints
+the window, and the helper compares the raw buffer before encoding and skips
+identical pixels. So a window that is not changing — including any window on
+a workspace that is not on screen — produces its first frame and then
+nothing at all: no encode, no wakeup, no traffic.
+
+Measured in the lab (Hyprland 0.56.2, 1920x1080, `max_width` 640):
+
+| Watched window | Frames | Helper CPU |
+|---|---|---|
+| terminal scrolling on the visible workspace, two clients | 15 / 10 s | 40 ms / 10 s |
+| GTK window on a workspace that is not on screen | 1 / 20 s | 10 ms / 20 s |
+
+Downscale plus JPEG encode of a 1920x1080 window to 640 px wide costs 2.3 to
+5 ms, logged per frame at `debug` level (`encode_ms`). A start that produces
+no frame within two seconds is reported at `warn` level.

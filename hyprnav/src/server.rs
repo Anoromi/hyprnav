@@ -13,6 +13,7 @@ use crate::protocol::{
     WorkspaceNavigationResult,
 };
 use crate::events::{start_event_server, EventBus};
+
 use crate::runtime_paths::{
     append_switch_log, ensure_parent_dir, resolve_runtime_paths, RuntimePaths,
 };
@@ -310,12 +311,17 @@ pub fn run_server() -> Result<()> {
     });
     let listener = bind_listener(&runtime.paths.server_socket_path)?;
     let events_listener = bind_listener(&runtime.paths.events_socket_path)?;
+    let frames_listener = bind_listener(&runtime.paths.frames_socket_path)?;
     {
         let snapshot_runtime = runtime.clone();
         start_event_server(runtime.events.clone(), events_listener, move || {
             snapshot_runtime.agents_snapshot()
         });
     }
+    // Frame streaming lives in a `hyprnav-capture` child: the daemon only
+    // brokers clients and fans its JPEGs out, so it needs no Wayland or JPEG
+    // crates of its own.
+    crate::frames::start(frames_listener);
     start_spawn_cleanup_thread(runtime.clone());
     start_stick_sync_thread(runtime.clone());
     start_hypr_event_thread(runtime.clone());
@@ -1033,6 +1039,8 @@ fn try_handle_request(runtime: &Arc<ServerRuntime>, request: Request) -> Result<
             pid,
             cwd,
             env,
+            thread_id,
+            thread_environment_id,
         } => {
             if agent_id.trim().is_empty() {
                 return Err(anyhow!("agent_id is required"));
@@ -1041,10 +1049,16 @@ fn try_handle_request(runtime: &Arc<ServerRuntime>, request: Request) -> Result<
                 .filter(|value| !value.trim().is_empty())
                 .unwrap_or_else(|| format!("agent {pid}"));
             let client = client.unwrap_or_else(|| "cua".to_owned());
-            // Re-registration (same id) keeps the slot.
-            if let Ok(agents) = runtime.agents.lock() {
-                if let Some(existing) = agents.get(&agent_id) {
-                    return Ok(serde_json::to_value(existing)?);
+            // Re-registration (same id) keeps the slot; thread attribution is refreshed.
+            if let Ok(mut agents) = runtime.agents.lock() {
+                if let Some(existing) = agents.get_mut(&agent_id) {
+                    if thread_id.is_some() {
+                        existing.thread_id = thread_id.clone();
+                    }
+                    if thread_environment_id.is_some() {
+                        existing.thread_environment_id = thread_environment_id.clone();
+                    }
+                    return Ok(serde_json::to_value(&*existing)?);
                 }
             }
             // Parent environment: explicit, else derived from cwd, else "agents".
@@ -1093,6 +1107,8 @@ fn try_handle_request(runtime: &Arc<ServerRuntime>, request: Request) -> Result<
                 current_target: None,
                 attached_windows: Vec::new(),
                 created_at_ms: now_ms(),
+                thread_id,
+                thread_environment_id,
             };
             runtime
                 .agents
@@ -2737,6 +2753,7 @@ mod tests {
                 grid_socket_path: runtime_dir.join("grid.sock"),
                 server_socket_path: runtime_dir.join("hyprnav.sock"),
                 events_socket_path: runtime_dir.join("events.sock"),
+                frames_socket_path: runtime_dir.join("frames.sock"),
                 hypr_event_socket_path: runtime_dir.join("hypr-events.sock"),
                 switch_log_path: runtime_dir.join("switch.log"),
                 state_root: root.clone(),

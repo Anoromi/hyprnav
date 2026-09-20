@@ -20,6 +20,7 @@ pub struct RuntimePaths {
     pub grid_socket_path: PathBuf,
     pub server_socket_path: PathBuf,
     pub events_socket_path: PathBuf,
+    pub frames_socket_path: PathBuf,
     pub hypr_event_socket_path: PathBuf,
     pub switch_log_path: PathBuf,
     pub state_root: PathBuf,
@@ -72,6 +73,12 @@ pub fn server_socket_path(runtime_dir: &Path, instance_signature: &str) -> PathB
 /// Sits beside the request socket so clients derive both from one directory.
 pub fn events_socket_path(runtime_dir: &Path, instance_signature: &str) -> PathBuf {
     runtime_directory(runtime_dir, instance_signature).join("events.sock")
+}
+
+/// Frame-streaming socket: clients ask for one window and read MJPEG back.
+/// Sits beside the request socket like `events.sock` does.
+pub fn frames_socket_path(runtime_dir: &Path, instance_signature: &str) -> PathBuf {
+    runtime_directory(runtime_dir, instance_signature).join("frames.sock")
 }
 
 pub fn switch_log_path(runtime_dir: &Path, instance_signature: &str) -> PathBuf {
@@ -146,6 +153,7 @@ pub fn resolve_runtime_paths() -> RuntimePaths {
         grid_socket_path: grid_socket_path(&runtime_root, &instance_signature),
         server_socket_path: server_socket_path(&runtime_root, &instance_signature),
         events_socket_path: events_socket_path(&runtime_root, &instance_signature),
+        frames_socket_path: frames_socket_path(&runtime_root, &instance_signature),
         hypr_event_socket_path: hyprland_event_socket_path(&runtime_root, &instance_signature),
         switch_log_path: switch_log_path(&runtime_root, &instance_signature),
         runtime_dir: runtime_directory(&runtime_root, &instance_signature),
@@ -264,6 +272,15 @@ mod tests {
         let server = server_socket_path(root, "sig");
         assert_eq!(events.parent(), server.parent());
         assert_eq!(events.file_name().unwrap(), "events.sock");
+    }
+
+    #[test]
+    fn frames_socket_sits_beside_the_request_socket() {
+        let root = Path::new("/run/user/1000");
+        let frames = frames_socket_path(root, "sig");
+        let server = server_socket_path(root, "sig");
+        assert_eq!(frames.parent(), server.parent());
+        assert_eq!(frames.file_name().unwrap(), "frames.sock");
     }
 
     #[test]

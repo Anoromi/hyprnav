@@ -6,6 +6,12 @@
   pkg-config,
   qt6,
   stdenv,
+  wayland,
+  wayland-scanner,
+  wayland-protocols,
+  hyprland-protocols,
+  wlr-protocols,
+  libjpeg_turbo,
 }:
 rustPlatform.buildRustPackage {
   pname = "hyprnav";
@@ -22,9 +28,15 @@ rustPlatform.buildRustPackage {
     cmake
     pkg-config
     qt6.wrapQtAppsHook
+    wayland-scanner
   ];
 
   buildInputs = [
+    wayland
+    wayland-protocols
+    hyprland-protocols
+    wlr-protocols
+    libjpeg_turbo
     kdePackages."layer-shell-qt"
     (lib.getDev kdePackages."layer-shell-qt")
     qt6.qtbase
@@ -83,6 +95,18 @@ rustPlatform.buildRustPackage {
     mkdir -p $out/share/applications
     install -m 0644 ${./hyprnav.desktop} $out/share/applications/hyprnav.desktop
       install -Dm755 ../scripts/hyprnav-share-picker $out/bin/hyprnav-share-picker
+
+    # hyprnav-capture: the C helper that pairs Hyprland window addresses with
+    # ext-foreign-toplevel identifiers and streams JPEG frames of single
+    # windows. Its protocol glue is generated here; nothing generated is in
+    # the tree. It is also installed under its identification-only name.
+    make -C tools/capture \
+      WAYLAND_SCANNER=${wayland-scanner}/bin/wayland-scanner \
+      WAYLAND_PROTOCOLS_DIR=${wayland-protocols}/share/wayland-protocols \
+      HYPRLAND_PROTOCOLS_DIR=${hyprland-protocols}/share/hyprland-protocols \
+      WLR_PROTOCOLS_DIR=${wlr-protocols}/share/wlr-protocols
+    install -Dm755 tools/capture/hyprnav-capture $out/bin/hyprnav-capture
+    ln -sf hyprnav-capture $out/bin/hyprnav-toplevel-map
   '';
 
   meta = with lib; {

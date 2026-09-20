@@ -157,6 +157,11 @@ pub enum Command {
     )]
     Events(EventsArgs),
     #[command(
+        about = "Stream one window as MJPEG on stdout.",
+        long_about = "Stream one window as MJPEG on stdout.\n\nThe daemon captures the window with grim and writes a multipart/x-mixed-replace stream (boundary `frame`, one JPEG per part) on a socket beside the request socket. Every client watching the same window shares one capture loop, and a client that cannot keep up drops frames rather than delaying anyone. The stream ends when the window goes away.\n\n  hyprnav frames 0x55ea1ad9c6d0 --fps 10 | ffplay -f mpjpeg -"
+    )]
+    Frames(FramesArgs),
+    #[command(
         about = "Screencast helpers for a dialog-free window share.",
         long_about = "Screencast helpers for a dialog-free window share.\n\n`screencast request <address>` records which Hyprland window the next screen-share request should pick. `hyprnav-share-picker`, configured as xdg-desktop-portal-hyprland's custom picker, answers the next portal request with that window instead of opening a dialog, then falls back to the stock picker."
     )]
@@ -210,6 +215,21 @@ pub struct EventsArgs {
 }
 
 #[derive(Debug, Args)]
+pub struct FramesArgs {
+    /// Hyprland window address (0x...), as printed by `hyprctl clients`.
+    pub address: String,
+    /// Frames per second, 1..15.
+    #[arg(long, default_value_t = crate::frames::DEFAULT_FPS)]
+    pub fps: u32,
+    /// JPEG quality, 30..90.
+    #[arg(long, default_value_t = crate::frames::DEFAULT_QUALITY)]
+    pub quality: u32,
+    /// Longest edge of the streamed image; the capture is scaled down to it.
+    #[arg(long = "max-width", default_value_t = crate::frames::DEFAULT_WIDTH)]
+    pub max_width: u32,
+}
+
+#[derive(Debug, Args)]
 pub struct AgentRegisterArgs {
     #[arg(long)]
     pub id: String,
@@ -224,6 +244,12 @@ pub struct AgentRegisterArgs {
     pub cwd: Option<String>,
     #[arg(long)]
     pub env: Option<String>,
+    /// Opaque thread id from the host app.
+    #[arg(long = "thread-id")]
+    pub thread_id: Option<String>,
+    /// Opaque thread environment id from the host app.
+    #[arg(long = "thread-environment-id")]
+    pub thread_environment_id: Option<String>,
 }
 
 #[derive(Debug, Args)]

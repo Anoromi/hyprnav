@@ -44,6 +44,12 @@ pub struct AgentSnapshot {
     /// Every window address the agent has acted on.
     pub attached_windows: Vec<String>,
     pub created_at_ms: u64,
+    /// Opaque thread id from the host app (T3 Code), null when unknown.
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    /// Opaque thread environment id from the host app, null when unknown.
+    #[serde(default)]
+    pub thread_environment_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -366,6 +372,12 @@ pub enum Request {
         pid: u32,
         cwd: Option<String>,
         env: Option<String>,
+        /// Opaque thread id from the host app.
+        #[serde(default)]
+        thread_id: Option<String>,
+        /// Opaque thread environment id from the host app.
+        #[serde(default)]
+        thread_environment_id: Option<String>,
     },
     /// Heartbeat after an action; `target` is a Hyprland window address.
     AgentBeat {

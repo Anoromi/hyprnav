@@ -258,6 +258,37 @@ fn main() -> anyhow::Result<()> {
             ensure_server_running()?;
             stream_events(args.once)
         }
+        Command::Frames(args) => {
+            ensure_server_running()?;
+            let paths = resolve_runtime_paths();
+            let address = hyprnav::frames::normalize_address(&args.address)
+                .ok_or_else(|| anyhow::anyhow!("address must look like 0x1234"))?;
+            let request = hyprnav::frames::StreamRequest {
+                fps: args
+                    .fps
+                    .clamp(hyprnav::frames::MIN_FPS, hyprnav::frames::MAX_FPS),
+                quality: args
+                    .quality
+                    .clamp(hyprnav::frames::MIN_QUALITY, hyprnav::frames::MAX_QUALITY),
+                max_width: args
+                    .max_width
+                    .clamp(hyprnav::frames::MIN_WIDTH, hyprnav::frames::MAX_WIDTH),
+            };
+            let mut stdout = io::stdout().lock();
+            match hyprnav::frames::stream_frames(
+                &paths.frames_socket_path,
+                &address,
+                request,
+                &mut stdout,
+            ) {
+                // A closed pipe (`| head`) is a normal way to stop watching.
+                Err(error) => match error.downcast_ref::<std::io::Error>() {
+                    Some(io_error) if io_error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+                    _ => Err(error),
+                },
+                ok => ok,
+            }
+        }
         Command::Agent(command) => {
             use hyprnav::cli::AgentCommand;
             ensure_server_running()?;
@@ -269,6 +300,8 @@ fn main() -> anyhow::Result<()> {
                     pid: args.pid.unwrap_or_else(|| unsafe { libc::getppid() } as u32),
                     cwd: args.cwd.or_else(|| std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned())),
                     env: args.env,
+                    thread_id: args.thread_id,
+                    thread_environment_id: args.thread_environment_id,
                 })),
                 AgentCommand::Beat(args) => print_json(send::<Value>(Request::AgentBeat {
                     agent_id: args.id,

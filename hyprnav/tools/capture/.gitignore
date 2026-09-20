@@ -1,0 +1,5 @@
+# wayland-scanner output and build artefacts
+*-client-protocol.h
+*-protocol.c
+*.o
+hyprnav-capture
