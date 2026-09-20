@@ -321,7 +321,11 @@ pub fn run_server() -> Result<()> {
     // Frame streaming lives in a `hyprnav-capture` child: the daemon only
     // brokers clients and fans its JPEGs out, so it needs no Wayland or JPEG
     // crates of its own.
-    crate::frames::start(frames_listener, runtime.paths.instance_signature.clone());
+    crate::frames::start(
+        frames_listener,
+        runtime.paths.instance_signature.clone(),
+        &runtime.paths.spawn_socket_path,
+    );
     start_spawn_cleanup_thread(runtime.clone());
     start_stick_sync_thread(runtime.clone());
     start_hypr_event_thread(runtime.clone());

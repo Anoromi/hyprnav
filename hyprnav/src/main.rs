@@ -21,6 +21,7 @@ use hyprnav::ui_session::{
     send_switcher_cancel_command, send_switcher_ping_command, send_switcher_step_command,
     start_grid_session_listener, start_switcher_session_listener,
 };
+use anyhow::Context;
 use serde_json::Value;
 use std::fs;
 use std::io::Read;
@@ -263,25 +264,42 @@ fn main() -> anyhow::Result<()> {
             let paths = resolve_runtime_paths();
             let address = hyprnav::frames::normalize_address(&args.address)
                 .ok_or_else(|| anyhow::anyhow!("address must look like 0x1234"))?;
-            let request = hyprnav::frames::StreamRequest {
-                fps: args
-                    .fps
-                    .clamp(hyprnav::frames::MIN_FPS, hyprnav::frames::MAX_FPS),
-                quality: args
-                    .quality
-                    .clamp(hyprnav::frames::MIN_QUALITY, hyprnav::frames::MAX_QUALITY),
-                max_width: args
-                    .max_width
-                    .clamp(hyprnav::frames::MIN_WIDTH, hyprnav::frames::MAX_WIDTH),
+            let codec = hyprnav::video::Codec::parse(&args.codec)
+                .ok_or_else(|| anyhow::anyhow!("unknown codec {}", args.codec))?;
+            let request = hyprnav::frames::ClientRequest {
+                address,
+                codecs: vec![codec],
+                stream: hyprnav::frames::StreamRequest {
+                    fps: args
+                        .fps
+                        .clamp(hyprnav::frames::MIN_FPS, hyprnav::frames::MAX_FPS),
+                    quality: args
+                        .quality
+                        .clamp(hyprnav::frames::MIN_QUALITY, hyprnav::frames::MAX_QUALITY),
+                    max_width: args
+                        .max_width
+                        .clamp(hyprnav::frames::MIN_WIDTH, hyprnav::frames::MAX_WIDTH),
+                },
+                follow_transient: args.follow.as_deref() == Some("transient"),
             };
-            let mut stdout = io::stdout().lock();
-            match hyprnav::frames::stream_frames(
-                &paths.frames_socket_path,
-                &address,
-                request,
-                &mut stdout,
-            ) {
-                // A closed pipe (`| head`) is a normal way to stop watching.
+            let result = if args.ivf {
+                // IVF needs to seek back and patch its header, so it needs a file.
+                let path = args.output.clone().ok_or_else(|| {
+                    anyhow::anyhow!("--ivf writes a seekable file; pass -o PATH")
+                })?;
+                let mut file = std::fs::File::create(&path)
+                    .with_context(|| format!("creating {}", path.display()))?;
+                hyprnav::frames::stream_to_ivf(&paths.frames_socket_path, &request, &mut file)
+            } else if let Some(path) = args.output.clone() {
+                let mut file = std::fs::File::create(&path)
+                    .with_context(|| format!("creating {}", path.display()))?;
+                hyprnav::frames::stream_frames(&paths.frames_socket_path, &request, &mut file)
+            } else {
+                let mut stdout = io::stdout().lock();
+                hyprnav::frames::stream_frames(&paths.frames_socket_path, &request, &mut stdout)
+            };
+            match result {
+                // A closed pipe (`| head`) or a Ctrl-C is a normal way to stop.
                 Err(error) => match error.downcast_ref::<std::io::Error>() {
                     Some(io_error) if io_error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
                     _ => Err(error),

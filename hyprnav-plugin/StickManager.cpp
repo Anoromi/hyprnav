@@ -453,6 +453,17 @@ void CStickManager::handleClientLine(int fd, const std::string& line) {
             m_frameWatches.erase(*address);
         }
         sendResult(fd, std::format("{{\"watched\":{}}}", m_frameWatches.size()));
+        if (on) {
+            // A dialog that is already open when the watch starts would
+            // otherwise never be announced: map events are in the past.
+            for (const auto& window : Desktop::windowState()->windows()) {
+                if (!window)
+                    continue;
+                const PHLWINDOW parent = window->m_isX11 ? window->x11Parent() : window->parent();
+                if (parent && reinterpret_cast<uintptr_t>(parent.get()) == *address)
+                    noteTransient(window, true);
+            }
+        }
         return;
     }
 

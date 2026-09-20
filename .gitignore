@@ -50,3 +50,6 @@ hyprnav/.daemon.log
 hyprnav/.grid-server.log
 hyprnav/.qmlls.ini
 .qt-merged-dev/
+
+# nix-shell scratch: the merged Qt prefix build.rs needs
+hyprnav/.qt-merged/

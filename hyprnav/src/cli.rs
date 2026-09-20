@@ -157,8 +157,8 @@ pub enum Command {
     )]
     Events(EventsArgs),
     #[command(
-        about = "Stream one window as MJPEG on stdout.",
-        long_about = "Stream one window as MJPEG on stdout.\n\nThe daemon captures the window with grim and writes a multipart/x-mixed-replace stream (boundary `frame`, one JPEG per part) on a socket beside the request socket. Every client watching the same window shares one capture loop, and a client that cannot keep up drops frames rather than delaying anyone. The stream ends when the window goes away.\n\n  hyprnav frames 0x55ea1ad9c6d0 --fps 10 | ffplay -f mpjpeg -"
+        about = "Stream one window as video or MJPEG.",
+        long_about = "Stream one window as video or MJPEG.\n\nWith --codec av1 or h264 the daemon captures the window whenever the compositor says it changed, encodes it on the GPU, and writes a stream of HNVF records (24-byte header, one record per frame) whose first record carries the codec string and the GOP cache. With --codec mjpeg it writes today's multipart/x-mixed-replace body instead. Every client that agrees on window, codec and width shares one capture and one encoder.\n\n  hyprnav frames 0x55ea1ad9c6d0 --codec av1 --ivf -o /tmp/w.ivf\n  hyprnav frames 0x55ea1ad9c6d0 --codec mjpeg --fps 10 | ffplay -f mpjpeg -"
     )]
     Frames(FramesArgs),
     #[command(
@@ -218,15 +218,27 @@ pub struct EventsArgs {
 pub struct FramesArgs {
     /// Hyprland window address (0x...), as printed by `hyprctl clients`.
     pub address: String,
+    /// av1 and h264 write HNVF records; mjpeg writes the multipart body.
+    #[arg(long, default_value = "mjpeg", value_parser = ["av1", "h264", "mjpeg"])]
+    pub codec: String,
     /// Frames per second, 1..15.
     #[arg(long, default_value_t = crate::frames::DEFAULT_FPS)]
     pub fps: u32,
-    /// JPEG quality, 30..90.
+    /// JPEG quality, 30..90. MJPEG only.
     #[arg(long, default_value_t = crate::frames::DEFAULT_QUALITY)]
     pub quality: u32,
     /// Longest edge of the streamed image; the capture is scaled down to it.
     #[arg(long = "max-width", default_value_t = crate::frames::DEFAULT_WIDTH)]
     pub max_width: u32,
+    /// `transient`: follow the target's dialog while one is open.
+    #[arg(long, value_parser = ["target", "transient"])]
+    pub follow: Option<String>,
+    /// Write to this file instead of stdout.
+    #[arg(short = 'o', long)]
+    pub output: Option<std::path::PathBuf>,
+    /// Unwrap the records into an IVF file for ffprobe/ffplay. Needs -o.
+    #[arg(long)]
+    pub ivf: bool,
 }
 
 #[derive(Debug, Args)]

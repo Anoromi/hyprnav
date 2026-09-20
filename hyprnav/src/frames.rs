@@ -40,6 +40,11 @@
 //! latest-frame slot, so a slow reader drops frames instead of queueing them
 //! or stalling anyone else.
 
+use crate::encoder::{self, EncoderChoice};
+use crate::frames_config::FramesConfig;
+use crate::pipeline::{Pipeline, PipelineKey, VideoClient, VideoRequest};
+use crate::plugin_link::{DamageSink, PluginLink};
+use crate::video::Codec;
 use serde_json::json;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -67,7 +72,7 @@ pub const BOUNDARY: &str = "frame";
 /// A frame bigger than this is treated as a desynchronised helper stream.
 const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 
-/// What a client asked for, after clamping.
+/// The MJPEG capture parameters a client asked for, after clamping.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StreamRequest {
     pub fps: u32,
@@ -85,15 +90,56 @@ impl Default for StreamRequest {
     }
 }
 
+/// The whole opening line, for both formats.
+///
+/// ```text
+/// {"address":"0x…","codecs":["av1","h264","mjpeg"],"max_width":640,
+///  "max_fps":8,"follow":"transient"}
+/// ```
+///
+/// `"format":"av1"` is accepted as shorthand for a one-element `codecs`, and
+/// `fps` as an alias of `max_fps`. An absent `codecs` means MJPEG, which is
+/// what every client that predates the video path sends.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClientRequest {
+    pub address: String,
+    pub codecs: Vec<Codec>,
+    pub stream: StreamRequest,
+    pub follow_transient: bool,
+}
+
+impl ClientRequest {
+    pub fn video(&self) -> VideoRequest {
+        VideoRequest { max_fps: self.stream.fps, follow_transient: self.follow_transient }
+    }
+}
+
 /// Parse the client's opening line. `None` means "no usable address".
-pub fn parse_request(line: &str) -> Option<(String, StreamRequest)> {
+pub fn parse_request(line: &str) -> Option<ClientRequest> {
     let value: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
     let address = normalize_address(value.get("address")?.as_str()?)?;
     let number = |key: &str| value.get(key).and_then(|v| v.as_u64()).map(|v| v as u32);
-    Some((
+    let mut codecs: Vec<Codec> = value
+        .get("codecs")
+        .and_then(|v| v.as_array())
+        .map(|list| list.iter().filter_map(|v| v.as_str()).filter_map(Codec::parse).collect())
+        .unwrap_or_default();
+    if codecs.is_empty() {
+        codecs = value
+            .get("format")
+            .and_then(|v| v.as_str())
+            .and_then(Codec::parse)
+            .map(|codec| vec![codec])
+            .unwrap_or_else(|| vec![Codec::Mjpeg]);
+    }
+    Some(ClientRequest {
         address,
-        StreamRequest {
-            fps: number("fps").unwrap_or(DEFAULT_FPS).clamp(MIN_FPS, MAX_FPS),
+        codecs,
+        stream: StreamRequest {
+            fps: number("max_fps")
+                .or_else(|| number("fps"))
+                .unwrap_or(DEFAULT_FPS)
+                .clamp(MIN_FPS, MAX_FPS),
             quality: number("quality")
                 .unwrap_or(DEFAULT_QUALITY)
                 .clamp(MIN_QUALITY, MAX_QUALITY),
@@ -101,7 +147,8 @@ pub fn parse_request(line: &str) -> Option<(String, StreamRequest)> {
                 .unwrap_or(DEFAULT_WIDTH)
                 .clamp(MIN_WIDTH, MAX_WIDTH),
         },
-    ))
+        follow_transient: value.get("follow").and_then(|v| v.as_str()) == Some("transient"),
+    })
 }
 
 /// `address:0xAB` and `0xAB` both become `0xab`; anything else is rejected.
@@ -454,6 +501,14 @@ pub struct FrameHub {
     next_client_id: AtomicU64,
     /// Hyprland instance to drive `render_unfocused` on; `None` in tests.
     instance: Option<String>,
+    config: FramesConfig,
+    /// What this machine turned out to be able to encode, in the order the
+    /// config prefers. Empty until the startup probe finishes.
+    encoders: Mutex<Vec<EncoderChoice>>,
+    /// Set once, after construction: the link needs the hub as its sink.
+    plugin: std::sync::OnceLock<Arc<PluginLink>>,
+    helper_program: String,
+    pipelines: Mutex<HashMap<PipelineKey, Arc<Pipeline>>>,
 }
 
 impl FrameHub {
@@ -463,7 +518,46 @@ impl FrameHub {
             streams: Mutex::new(HashMap::new()),
             next_client_id: AtomicU64::new(0),
             instance: None,
+            config: FramesConfig::default(),
+            encoders: Mutex::new(Vec::new()),
+            plugin: std::sync::OnceLock::new(),
+            helper_program: CaptureHelper::default_program(),
+            pipelines: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// The daemon's constructor: a config, a helper to spawn per pipeline, and
+    /// an instance to drive `render_unfocused` on.
+    pub fn with_config(
+        commands: Arc<dyn CommandSink>,
+        instance: String,
+        config: FramesConfig,
+        helper_program: String,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            commands,
+            streams: Mutex::new(HashMap::new()),
+            next_client_id: AtomicU64::new(0),
+            instance: Some(instance),
+            config,
+            encoders: Mutex::new(Vec::new()),
+            plugin: std::sync::OnceLock::new(),
+            helper_program,
+            pipelines: Mutex::new(HashMap::new()),
+        })
+    }
+
+    pub fn attach_plugin(&self, link: Arc<PluginLink>) {
+        let _ = self.plugin.set(link);
+    }
+
+    fn plugin(&self) -> Option<&Arc<PluginLink>> {
+        self.plugin.get()
+    }
+
+    /// True when captures must be driven by a timer rather than by damage.
+    fn paced(&self) -> bool {
+        self.config.force_fallback || !self.plugin().map(|link| link.available()).unwrap_or(false)
     }
 
     pub fn with_instance(commands: Arc<dyn CommandSink>, instance: String) -> Arc<Self> {
@@ -472,6 +566,11 @@ impl FrameHub {
             streams: Mutex::new(HashMap::new()),
             next_client_id: AtomicU64::new(0),
             instance: Some(instance),
+            config: FramesConfig::default(),
+            encoders: Mutex::new(Vec::new()),
+            plugin: std::sync::OnceLock::new(),
+            helper_program: CaptureHelper::default_program(),
+            pipelines: Mutex::new(HashMap::new()),
         })
     }
 
@@ -621,6 +720,136 @@ impl FrameHub {
         }
     }
 
+    // ----------------------------------------------------------- video
+
+    /// Run the encoder probe once, in the background: `auto` costs a few
+    /// hundred milliseconds of null encodes and must not delay startup.
+    pub fn probe_encoders(self: &Arc<Self>) {
+        let hub = self.clone();
+        thread::Builder::new()
+            .name("hyprnav-frames-probe".to_owned())
+            .spawn(move || {
+                let found = encoder::probe(&hub.config);
+                debug!(
+                    encoders = found
+                        .iter()
+                        .map(|choice| format!(
+                            "{}{}",
+                            choice.codec.name(),
+                            if choice.vaapi { "/vaapi" } else { "/sw" }
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    "frame encoders probed"
+                );
+                if let Ok(mut encoders) = hub.encoders.lock() {
+                    *encoders = found;
+                }
+            })
+            .ok();
+    }
+
+    /// The first codec the client wants that the config allows and this
+    /// machine can actually encode.
+    fn choose_encoder(&self, wanted: &[Codec]) -> Option<EncoderChoice> {
+        let encoders = self.encoders.lock().ok()?;
+        wanted.iter().find_map(|codec| {
+            encoders.iter().copied().find(|choice| choice.codec == *codec)
+        })
+    }
+
+    pub fn pipeline_count(&self) -> usize {
+        self.pipelines.lock().map(|pipelines| pipelines.len()).unwrap_or(0)
+    }
+
+    /// Join, or start, the pipeline for this request.
+    fn join_video(
+        self: &Arc<Self>,
+        request: &ClientRequest,
+    ) -> Result<(PipelineKey, Arc<Pipeline>, Arc<VideoClient>), &'static str> {
+        if self.commands.identifier(&request.address).is_none() && self.commands.primed() {
+            return Err("unknown_window");
+        }
+        let choice = self.choose_encoder(&request.codecs).ok_or("no_codec")?;
+        let key = PipelineKey {
+            address: request.address.clone(),
+            codec: choice.codec,
+            width: request.stream.max_width,
+        };
+        let mut pipelines = self.pipelines.lock().map_err(|_| "busy")?;
+        pipelines.retain(|_, pipeline| !pipeline.is_stopping());
+        if let Some(pipeline) = pipelines.get(&key) {
+            let client = pipeline.join();
+            return Ok((key, pipeline.clone(), client));
+        }
+        if pipelines.len() >= self.config.max_pipelines {
+            // Over budget: offer the nearest existing pipeline for this window
+            // if the client said it would accept that codec, else refuse.
+            let nearest = pipelines
+                .iter()
+                .find(|(other, _)| {
+                    other.address == request.address && request.codecs.contains(&other.codec)
+                })
+                .map(|(other, pipeline)| (other.clone(), pipeline.clone()));
+            let Some((other_key, pipeline)) = nearest else { return Err("busy") };
+            let client = pipeline.join();
+            return Ok((other_key, pipeline, client));
+        }
+        let paced = self.paced();
+        let pipeline = Pipeline::start(
+            key.clone(),
+            choice,
+            request.video(),
+            self.config.clone(),
+            &self.helper_program,
+            paced,
+        )
+        .map_err(|_| "capture_failed")?;
+        pipelines.insert(key.clone(), pipeline.clone());
+        drop(pipelines);
+        self.set_render_unfocused(&request.address, true);
+        if !paced {
+            // 1000/max_fps is the coalescing window the plugin applies.
+            let interval = (1000 / request.stream.fps.max(1)).max(1);
+            if let Some(link) = self.plugin() {
+                link.watch(&request.address, interval);
+            }
+        }
+        let client = pipeline.join();
+        Ok((key, pipeline, client))
+    }
+
+    fn leave_video(&self, key: &PipelineKey, client_id: u64) {
+        let gone = {
+            let Ok(mut pipelines) = self.pipelines.lock() else { return };
+            let Some(pipeline) = pipelines.get(key) else { return };
+            if !pipeline.leave(client_id) {
+                return;
+            }
+            pipelines.remove(key)
+        };
+        let Some(pipeline) = gone else { return };
+        let source = pipeline.source();
+        pipeline.stop();
+        if let Some(link) = self.plugin() {
+            link.unwatch(&key.address);
+            if source != key.address {
+                link.unwatch(&source);
+            }
+        }
+        self.set_render_unfocused(&key.address, false);
+        if source != key.address {
+            self.set_render_unfocused(&source, false);
+        }
+    }
+
+    fn for_each_pipeline<F: FnMut(&Arc<Pipeline>)>(&self, mut body: F) {
+        let Ok(pipelines) = self.pipelines.lock() else { return };
+        for pipeline in pipelines.values() {
+            body(pipeline);
+        }
+    }
+
     /// Serve one connected client: read its request line, then write frames.
     pub fn serve(self: &Arc<Self>, stream: UnixStream) {
         let hub = self.clone();
@@ -642,11 +871,15 @@ impl FrameHub {
         let mut writer = stream;
         let _ = writer.set_read_timeout(None);
 
-        let Some((address, request)) = parse_request(&line) else {
+        let Some(request) = parse_request(&line) else {
             writer.write_all(b"{\"error\":\"unknown_window\"}\n")?;
             return Ok(());
         };
-        let Some(client) = self.join(&address, request) else {
+        if request.codecs.iter().any(|codec| codec.is_video()) {
+            return self.serve_video(reader, writer, request);
+        }
+        let address = request.address.clone();
+        let Some(client) = self.join(&address, request.stream) else {
             writer.write_all(b"{\"error\":\"unknown_window\"}\n")?;
             return Ok(());
         };
@@ -681,6 +914,100 @@ impl FrameHub {
         self.leave(&address, client.id);
         client.close();
         Ok(())
+    }
+
+    /// The record stream: a CONFIG record, the GOP cache, then live frames.
+    fn serve_video(
+        self: &Arc<Self>,
+        reader: BufReader<UnixStream>,
+        mut writer: UnixStream,
+        request: ClientRequest,
+    ) -> std::io::Result<()> {
+        let (key, _pipeline, client) = match self.join_video(&request) {
+            Ok(joined) => joined,
+            Err(reason) => {
+                writer.write_all(format!("{{\"error\":\"{reason}\"}}\n").as_bytes())?;
+                return Ok(());
+            }
+        };
+
+        // A still window sends nothing for ten seconds at a time, so a client
+        // that hangs up has to be noticed by reading, not by a failing write.
+        {
+            let hub = self.clone();
+            let client = client.clone();
+            let key = key.clone();
+            let mut reader = reader;
+            thread::Builder::new()
+                .name("hyprnav-frames-hangup".to_owned())
+                .spawn(move || {
+                    let mut sink = [0u8; 256];
+                    while let Ok(read) = reader.get_mut().read(&mut sink) {
+                        if read == 0 {
+                            break;
+                        }
+                    }
+                    hub.leave_video(&key, client.id);
+                    client.close();
+                })
+                .ok();
+        }
+
+        while let Some(record) = client.next() {
+            if writer.write_all(&record).is_err() || writer.flush().is_err() {
+                break;
+            }
+        }
+        self.leave_video(&key, client.id);
+        client.close();
+        Ok(())
+    }
+}
+
+impl DamageSink for FrameHub {
+    fn on_window_damaged(&self, address: &str) {
+        self.for_each_pipeline(|pipeline| pipeline.on_damage(address));
+    }
+
+    /// A dialog opened under a watched window: `follow=transient` pipelines
+    /// switch to it without restarting the encoder unless the size changed.
+    fn on_transient_mapped(&self, address: &str, parent: &str) {
+        let mut follow = Vec::new();
+        self.for_each_pipeline(|pipeline| {
+            if pipeline.follows_transient() && pipeline.key.address == parent {
+                follow.push((pipeline.clone(), pipeline.key.codec));
+            }
+        });
+        if follow.is_empty() {
+            return;
+        }
+        if let Some(link) = self.plugin() {
+            // The dialog needs its own damage reports now.
+            link.watch(address, 125);
+        }
+        self.set_render_unfocused(address, true);
+        for (pipeline, _) in follow {
+            pipeline.retarget(address);
+        }
+    }
+
+    fn on_transient_unmapped(&self, address: &str) {
+        let mut back = Vec::new();
+        self.for_each_pipeline(|pipeline| {
+            if pipeline.follows_transient() && pipeline.source() == address {
+                back.push(pipeline.clone());
+            }
+        });
+        if back.is_empty() {
+            return;
+        }
+        if let Some(link) = self.plugin() {
+            link.unwatch(address);
+        }
+        for pipeline in back {
+            let home = pipeline.key.address.clone();
+            pipeline.retarget(&home);
+        }
     }
 }
 
@@ -726,31 +1053,55 @@ pub fn start_frame_server(hub: Arc<FrameHub>, listener: UnixListener) {
 }
 
 /// Spawn the helper and the accept loop; returns the hub for the daemon.
-pub fn start(listener: UnixListener, instance: String) -> Arc<FrameHub> {
-    let helper = CaptureHelper::new(CaptureHelper::default_program());
-    let hub = FrameHub::with_instance(helper.clone(), instance);
+pub fn start(
+    listener: UnixListener,
+    instance: String,
+    spawn_socket: &std::path::Path,
+) -> Arc<FrameHub> {
+    let config = FramesConfig::default_path()
+        .map(|path| FramesConfig::load(&path))
+        .unwrap_or_default();
+    let program = CaptureHelper::default_program();
+    let helper = CaptureHelper::new(program.clone());
+    let hub = FrameHub::with_config(helper.clone(), instance, config.clone(), program);
     helper.spawn(hub.clone());
+    if config.force_fallback {
+        debug!("frames: force_fallback is set, captures will be paced");
+        hub.attach_plugin(PluginLink::disabled());
+    } else {
+        hub.attach_plugin(PluginLink::start(spawn_socket, hub.clone()));
+    }
+    hub.probe_encoders();
     start_frame_server(hub.clone(), listener);
     hub
+}
+
+/// Connect and send the opening line.
+fn open_stream(socket: &std::path::Path, request: &ClientRequest) -> anyhow::Result<UnixStream> {
+    let mut stream = UnixStream::connect(socket)
+        .map_err(|error| anyhow::anyhow!("connecting to {}: {error}", socket.display()))?;
+    let mut line = json!({
+        "address": request.address,
+        "codecs": request.codecs.iter().map(|codec| codec.name()).collect::<Vec<_>>(),
+        "max_fps": request.stream.fps,
+        "quality": request.stream.quality,
+        "max_width": request.stream.max_width,
+    });
+    if request.follow_transient {
+        line["follow"] = json!("transient");
+    }
+    stream.write_all(format!("{line}\n").as_bytes())?;
+    stream.flush()?;
+    Ok(stream)
 }
 
 /// Client side of `frames.sock`: send the request line, copy the stream out.
 pub fn stream_frames<W: Write>(
     socket: &std::path::Path,
-    address: &str,
-    request: StreamRequest,
+    request: &ClientRequest,
     out: &mut W,
 ) -> anyhow::Result<()> {
-    let mut stream = UnixStream::connect(socket)
-        .map_err(|error| anyhow::anyhow!("connecting to {}: {error}", socket.display()))?;
-    let line = json!({
-        "address": address,
-        "fps": request.fps,
-        "quality": request.quality,
-        "max_width": request.max_width,
-    });
-    stream.write_all(format!("{line}\n").as_bytes())?;
-    stream.flush()?;
+    let mut stream = open_stream(socket, request)?;
     let mut buffer = vec![0u8; 64 * 1024];
     loop {
         let read = stream.read(&mut buffer)?;
@@ -760,6 +1111,73 @@ pub fn stream_frames<W: Write>(
         out.write_all(&buffer[..read])?;
         out.flush()?;
     }
+}
+
+/// Same, but unwrap the records into an IVF file `ffprobe` and `ffplay` read.
+///
+/// The CONFIG record carries no picture, so it is dropped; everything else
+/// becomes one IVF frame. The file header is patched with the real geometry
+/// and frame count at the end, when the output is seekable.
+pub fn stream_to_ivf(
+    socket: &std::path::Path,
+    request: &ClientRequest,
+    out: &mut std::fs::File,
+) -> anyhow::Result<()> {
+    use crate::video::{RecordHeader, FLAG_CONFIG, FLAG_KEEPALIVE, HEADER_BYTES};
+    let codec = request.codecs.first().copied().unwrap_or(Codec::Av1);
+    let fourcc: &[u8; 4] = match codec {
+        Codec::H264 => b"H264",
+        _ => b"AV01",
+    };
+    let mut stream = open_stream(socket, request)?;
+    out.write_all(&crate::video::ivf_header(fourcc, 0, 0, request.stream.fps, 0))?;
+
+    let mut pending = Vec::new();
+    let mut chunk = vec![0u8; 64 * 1024];
+    let mut frames = 0u64;
+    let (mut width, mut height) = (0u16, 0u16);
+    loop {
+        let read = stream.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        pending.extend_from_slice(&chunk[..read]);
+        loop {
+            let Some(header) = RecordHeader::parse(&pending) else {
+                if pending.len() >= HEADER_BYTES {
+                    return Err(anyhow::anyhow!("frames stream is not HNVF records"));
+                }
+                break;
+            };
+            if pending.len() < HEADER_BYTES + header.len {
+                break;
+            }
+            let payload = pending[HEADER_BYTES..HEADER_BYTES + header.len].to_vec();
+            pending.drain(..HEADER_BYTES + header.len);
+            if header.flags & (FLAG_CONFIG | FLAG_KEEPALIVE) != 0 {
+                continue;
+            }
+            if header.width > 0 {
+                width = header.width;
+                height = header.height;
+            }
+            out.write_all(&crate::video::ivf_frame(frames, &payload))?;
+            frames += 1;
+        }
+    }
+    out.flush()?;
+    use std::io::Seek;
+    if out.seek(std::io::SeekFrom::Start(0)).is_ok() {
+        out.write_all(&crate::video::ivf_header(
+            fourcc,
+            width,
+            height,
+            request.stream.fps,
+            frames.min(u32::MAX as u64) as u32,
+        ))?;
+        out.flush()?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -819,19 +1237,40 @@ mod tests {
 
     #[test]
     fn request_defaults_and_clamps_every_field() {
-        let (address, request) = parse_request("{\"address\":\"0xAB\"}").unwrap();
-        assert_eq!(address, "0xab");
-        assert_eq!(request, StreamRequest::default());
+        let request = parse_request("{\"address\":\"0xAB\"}").unwrap();
+        assert_eq!(request.address, "0xab");
+        assert_eq!(request.stream, StreamRequest::default());
+        assert_eq!(request.codecs, vec![Codec::Mjpeg], "old clients still get JPEG");
+        assert!(!request.follow_transient);
 
-        let (_, request) =
+        let request =
             parse_request("{\"address\":\"0xab\",\"fps\":99,\"quality\":5,\"max_width\":2}")
                 .unwrap();
-        assert_eq!(request.fps, MAX_FPS);
-        assert_eq!(request.quality, MIN_QUALITY);
-        assert_eq!(request.max_width, MIN_WIDTH);
+        assert_eq!(request.stream.fps, MAX_FPS);
+        assert_eq!(request.stream.quality, MIN_QUALITY);
+        assert_eq!(request.stream.max_width, MIN_WIDTH);
 
         assert!(parse_request("{\"fps\":8}").is_none());
         assert!(parse_request("not json").is_none());
+    }
+
+    /// The line the browser client sends, and the CLI shorthand.
+    #[test]
+    fn a_video_request_carries_codecs_max_fps_and_follow() {
+        let request = parse_request(
+            "{\"address\":\"0x1\",\"codecs\":[\"vp9\",\"av1\",\"h264\",\"mjpeg\"],\
+             \"max_width\":960,\"max_fps\":12,\"follow\":\"transient\"}",
+        )
+        .unwrap();
+        // vp9 is not a codec this daemon knows; it is dropped, not fatal.
+        assert_eq!(request.codecs, vec![Codec::Av1, Codec::H264, Codec::Mjpeg]);
+        assert_eq!(request.stream.max_width, 960);
+        assert_eq!(request.stream.fps, 12);
+        assert!(request.follow_transient);
+
+        let shorthand = parse_request("{\"address\":\"0x1\",\"format\":\"av1\"}").unwrap();
+        assert_eq!(shorthand.codecs, vec![Codec::Av1]);
+        assert!(!shorthand.follow_transient);
     }
 
     #[test]
