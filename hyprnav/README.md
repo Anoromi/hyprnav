@@ -449,6 +449,15 @@ or with `hyprnav slot remove --env X --slot S|--name N`. `hyprnav slot temps`
 lists them with owner and empty timer. Grid cells carry `temporary`,
 `unnumbered`, `owner` and `empty_for_ms`.
 
+A temporary slot belongs to the environment that created it and shows in one
+place only: after the numbered frames of that environment's own grid row.
+Numbered slots are still inherited down the environment chain, so a child row
+shows its ancestors' digits; temporary ones are not, so a child never displays
+its parent's scratch frame. They are also left out of the MRU switcher
+snapshot, so Alt-Tab never lands on one. The index threshold is the rule:
+`slot_index >= 1000` means temporary, and `slot temp` is the only thing that
+allocates there.
+
 ## Sticks
 
 `hyprnav spawn` pins the spawned process tree to its workspace: later

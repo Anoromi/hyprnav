@@ -1698,6 +1698,15 @@ fn build_switcher_snapshot(runtime: &ServerRuntime, reverse: bool) -> Result<Swi
             Ok(item)
         })
         .collect::<Result<Vec<_>>>()?;
+    // Temporary workspaces stay out of the MRU switcher: they belong to their
+    // environment's grid row and nowhere else, so Alt-Tab never lands on one.
+    // Filtering here (before the initial selection is computed) keeps the
+    // indexes the shell cycles through in step with the cards it draws; the
+    // shell drops temp cards too, as belt and braces.
+    let descriptors = descriptors
+        .into_iter()
+        .filter(|item| item.slot_index < TEMP_SLOT_START)
+        .collect::<Vec<_>>();
     let initial_index = initial_selection_index(
         &descriptors
             .iter()
@@ -1758,6 +1767,9 @@ fn build_switcher_snapshot(runtime: &ServerRuntime, reverse: bool) -> Result<Swi
         .collect();
     // Browser slots share a physical workspace but retain separate env/slot identities.
     for cell in build_grid_snapshot(runtime, None)?.items {
+        if cell.slot_index >= TEMP_SLOT_START {
+            continue;
+        }
         if runtime
             .store
             .browser_target(&cell.environment_id, cell.slot_index)?
@@ -2278,7 +2290,12 @@ fn resolve_slot_effective_from_bindings<'a>(
     env_id: &str,
     slot_index: i32,
 ) -> Option<crate::db::SlotResolutionRecord> {
-    let chain = environment_chain(env_id);
+    let chain = if slot_index >= TEMP_SLOT_START {
+        // Temporary slots are owned outright: never walk up to an ancestor.
+        vec![env_id.to_owned()]
+    } else {
+        environment_chain(env_id)
+    };
     let mut binding_environment_id = None;
     let mut binding_kind = None;
     let mut workspace_id = None;
@@ -2356,12 +2373,25 @@ fn live_display_label(
     fallback.to_owned()
 }
 
+/// Slot indexes that make up one environment's row.
+///
+/// Numbered slots (`slot_index < TEMP_SLOT_START`) are inherited down the
+/// environment chain, so a child row shows its ancestors' numbered slots.
+/// Temporary slots are not: a temp belongs to the environment that created it
+/// and appears only in that environment's row. The index threshold is the
+/// source of truth here — `create_temp_slot` always allocates at or above
+/// `TEMP_SLOT_START` and nothing else does, so it agrees with the `temporary`
+/// column the snapshot's `temporary` field reads.
 fn slot_indexes_for_environment(env_id: &str, bindings: &[SlotBindingRecord]) -> Vec<i32> {
     let env_ids = environment_chain(env_id);
     let hierarchical = env_ids.len() > 1;
     let mut slot_indexes = bindings
         .iter()
         .filter(|binding| {
+            if binding.env_id != env_id && binding.slot_index >= TEMP_SLOT_START {
+                // An ancestor's temporary slot is never inherited.
+                return false;
+            }
             if hierarchical {
                 env_ids.iter().any(|candidate| candidate == &binding.env_id)
             } else {
@@ -3004,6 +3034,106 @@ mod tests {
             slot_indexes_for_environment("/tmp/x.y.z", &bindings),
             Vec::<i32>::new()
         );
+    }
+
+    #[test]
+    fn slot_indexes_for_environment_exclude_ancestor_temporary_slots() {
+        let bindings = vec![
+            binding("x", 1, 5),
+            binding("x", TEMP_SLOT_START, 90),
+            binding("x.y", 2, 6),
+            binding("x.y", TEMP_SLOT_START, 91),
+            binding("x.y", TEMP_SLOT_START + 1, 92),
+        ];
+
+        // The parent keeps its own temp, and never sees the child's.
+        assert_eq!(
+            slot_indexes_for_environment("x", &bindings),
+            vec![1, TEMP_SLOT_START]
+        );
+        // The child inherits the numbered ancestor slot but not the temp, and
+        // its own temps sort last.
+        assert_eq!(
+            slot_indexes_for_environment("x.y", &bindings),
+            vec![1, 2, TEMP_SLOT_START, TEMP_SLOT_START + 1]
+        );
+        // A grandchild with no temps of its own shows numbered slots only.
+        assert_eq!(slot_indexes_for_environment("x.y.z", &bindings), vec![1, 2]);
+    }
+
+    #[test]
+    fn resolve_slot_effective_from_bindings_does_not_inherit_temporary_slots() {
+        let bindings = vec![binding("x", TEMP_SLOT_START, 90)];
+        let binding_index = bindings
+            .iter()
+            .map(|binding| ((binding.env_id.as_str(), binding.slot_index), binding))
+            .collect::<HashMap<_, _>>();
+
+        assert!(
+            resolve_slot_effective_from_bindings(&binding_index, "x", TEMP_SLOT_START).is_some()
+        );
+        assert!(
+            resolve_slot_effective_from_bindings(&binding_index, "x.y", TEMP_SLOT_START).is_none()
+        );
+    }
+
+    #[test]
+    fn grid_snapshot_keeps_own_temp_last_and_drops_it_from_the_child_row() {
+        let snapshot = build_grid_snapshot_from_data(
+            vec![environment("x", "Parent"), environment("x.y", "Child")],
+            vec![
+                binding("x", 1, 11),
+                binding("x", TEMP_SLOT_START, 90),
+                binding("x.y", 2, 22),
+                binding("x.y", TEMP_SLOT_START, 91),
+            ],
+            vec![
+                card(11, "x-1", false),
+                card(90, "x-temp", false),
+                card(22, "xy-2", true),
+                card(91, "xy-temp", false),
+            ],
+            22,
+            None,
+            Some("x.y"),
+        );
+
+        let row = |index: i32| {
+            snapshot
+                .items
+                .iter()
+                .filter(|item| item.row_index == index)
+                .collect::<Vec<_>>()
+        };
+
+        // The current environment sorts first.
+        let child = row(0);
+        assert_eq!(child[0].environment_id, "x.y");
+        assert_eq!(
+            child
+                .iter()
+                .map(|item| item.slot_index)
+                .collect::<Vec<_>>(),
+            vec![1, 2, TEMP_SLOT_START]
+        );
+        // Slot 1 is inherited from the parent; the parent's temp is not here.
+        assert!(child[0].inherited);
+        assert_eq!(child[0].physical_workspace_id, 11);
+        assert!(!child[2].inherited);
+        assert!(child[2].unnumbered);
+        assert_eq!(child[2].physical_workspace_id, 91);
+
+        let parent = row(1);
+        assert_eq!(parent[0].environment_id, "x");
+        assert_eq!(
+            parent
+                .iter()
+                .map(|item| item.slot_index)
+                .collect::<Vec<_>>(),
+            vec![1, TEMP_SLOT_START]
+        );
+        assert!(parent[1].unnumbered);
+        assert_eq!(parent[1].physical_workspace_id, 90);
     }
 
     #[test]
