@@ -53,6 +53,7 @@ const GOP_CACHE_LIMIT: usize = 32;
 /// the priming burst is what gets the first picture out. It is bounded, and a
 /// window that really is still stops producing after it.
 const PRIME_BURST: u32 = 3;
+const RETARGET_RETRIES: u8 = 30;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct PipelineKey {
@@ -137,6 +138,7 @@ struct Inner {
     last_capture: Instant,
     /// Captures still allowed without a damage report; see PRIME_BURST.
     primes_left: u32,
+    retries_left: u8,
 }
 
 pub struct Pipeline {
@@ -148,6 +150,7 @@ pub struct Pipeline {
     config: FramesConfig,
     started: Instant,
     stopping: AtomicBool,
+    restart_encoder: AtomicBool,
     /// How many frames the helper has actually produced: the number the
     /// "a still window costs nothing" claim lives or dies by.
     captures: AtomicU64,
@@ -205,6 +208,7 @@ impl Pipeline {
             config,
             started: Instant::now(),
             stopping: AtomicBool::new(false),
+            restart_encoder: AtomicBool::new(false),
             captures: AtomicU64::new(0),
             next_client: AtomicU64::new(0),
             inner: Mutex::new(Inner {
@@ -216,6 +220,7 @@ impl Pipeline {
                 last_record: Instant::now(),
                 last_capture: Instant::now(),
                 primes_left: PRIME_BURST,
+                retries_left: RETARGET_RETRIES,
             }),
         });
 
@@ -240,14 +245,7 @@ impl Pipeline {
             });
         }
 
-        pipeline.command(json!({
-            "op": "start",
-            "addr": key.address,
-            "max_width": key.width,
-            "max_fps": request.max_fps,
-            "mode": "raw",
-            "paced": if paced { 1 } else { 0 },
-        }));
+        pipeline.start_capture(&key.address);
         Ok(pipeline)
     }
 
@@ -352,8 +350,8 @@ impl Pipeline {
         }
     }
 
-    /// Point the capture at `address`. The encoder is left alone; if the new
-    /// window is a different size the pump restarts it on the next frame.
+    /// Point the capture at `address` and start a fresh decoder sequence once
+    /// the new window produces a frame.
     pub fn retarget(&self, address: &str) {
         let previous = {
             let Ok(mut inner) = self.inner.lock() else { return };
@@ -364,8 +362,15 @@ impl Pipeline {
         };
         if let Ok(mut inner) = self.inner.lock() {
             inner.primes_left = PRIME_BURST;
+            inner.retries_left = RETARGET_RETRIES;
         }
+        self.restart_encoder.store(true, Ordering::Release);
         self.command(json!({"op": "stop", "addr": previous}));
+        self.start_capture(address);
+        debug!(from = %previous, to = %address, "frames pipeline followed a transient");
+    }
+
+    fn start_capture(&self, address: &str) {
         self.command(json!({
             "op": "start",
             "addr": address,
@@ -374,7 +379,6 @@ impl Pipeline {
             "mode": "raw",
             "paced": if self.paced { 1 } else { 0 },
         }));
-        debug!(from = %previous, to = %address, "frames pipeline followed a transient");
     }
 
     fn command(&self, value: serde_json::Value) {
@@ -401,6 +405,12 @@ impl Pipeline {
             let number = |key: &str| value.get(key).and_then(|v| v.as_u64()).unwrap_or(0);
             match value.get("ev").and_then(|v| v.as_str()).unwrap_or_default() {
                 "raw" => {
+                    let address = value.get("addr").and_then(|v| v.as_str()).unwrap_or_default();
+                    if let Ok(mut inner) = self.inner.lock() {
+                        if address == inner.source {
+                            inner.retries_left = RETARGET_RETRIES;
+                        }
+                    }
                     let count = self.captures.fetch_add(1, Ordering::Relaxed) + 1;
                     debug!(
                         count,
@@ -410,6 +420,7 @@ impl Pipeline {
                         "captured a raw frame"
                     );
                     let header = RawHeader {
+                        address: address.to_owned(),
                         len: number("len") as usize,
                         width: number("w") as u32,
                         height: number("h") as u32,
@@ -427,8 +438,33 @@ impl Pipeline {
                 "close" | "capture_failed" => {
                     let gone = value.get("addr").and_then(|v| v.as_str()).unwrap_or_default();
                     if gone == self.source() {
-                        warn!(address = gone, "frames capture ended");
-                        break;
+                        let reason = value.get("reason").and_then(|v| v.as_str()).unwrap_or_default();
+                        let retryable = matches!(
+                            reason,
+                            "unknown_window" | "no_source" | "no_session" | "capture_failed" | "frame_failed"
+                        );
+                        let retry = if retryable {
+                            self.inner.lock().ok().map(|mut inner| {
+                                if inner.retries_left == 0 {
+                                    false
+                                } else {
+                                    inner.retries_left -= 1;
+                                    true
+                                }
+                            }).unwrap_or(false)
+                        } else {
+                            false
+                        };
+                        if retry {
+                            debug!(address = gone, reason, "retrying frames capture");
+                            thread::sleep(Duration::from_millis(100));
+                            if !self.is_stopping() && gone == self.source() {
+                                self.start_capture(gone);
+                            }
+                        } else {
+                            warn!(address = gone, reason, "frames capture ended");
+                            break;
+                        }
                     }
                 }
                 _ => {}
@@ -474,7 +510,11 @@ impl Pipeline {
             if raw.read_exact(&mut buffer).is_err() {
                 break;
             }
-            if encoder.as_ref().map(|running| !running.matches(&header)).unwrap_or(true) {
+            if header.address != self.source() {
+                continue;
+            }
+            let changed_source = self.restart_encoder.swap(false, Ordering::AcqRel);
+            if changed_source || encoder.as_ref().map(|running| !running.matches(&header)).unwrap_or(true) {
                 if let Some(previous) = encoder.take() {
                     previous.stop();
                 }
@@ -666,6 +706,7 @@ fn burst_of(gop: &GopCache) -> Vec<Arc<Vec<u8>>> {
 
 #[derive(Clone, Debug)]
 struct RawHeader {
+    address: String,
     len: usize,
     width: u32,
     height: u32,
