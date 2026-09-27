@@ -380,14 +380,25 @@ pub enum Request {
     },
     LockSet {
         env: String,
+        /// Free-form tag naming the caller (`t3code`, `hyprnav-shell`), echoed
+        /// in the `locked` event this request causes. Logs and loop guards only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<String>,
     },
-    LockClear,
+    LockClear {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<String>,
+    },
     WorkspaceGoto {
         env: Option<String>,
         slot: i32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<String>,
     },
     WorkspaceGotoPhysical {
         workspace_id: i32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<String>,
     },
     WorkspaceRun {
         env: Option<String>,
@@ -476,6 +487,8 @@ pub enum Request {
     BatchMutate {
         atomic: bool,
         operations: Vec<BatchMutationRequest>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<String>,
     },
 }
 
@@ -570,8 +583,13 @@ mod tests {
         .unwrap();
 
         match request {
-            Request::BatchMutate { atomic, operations } => {
+            Request::BatchMutate {
+                atomic,
+                operations,
+                origin,
+            } => {
                 assert!(atomic);
+                assert_eq!(origin, None);
                 assert_eq!(operations.len(), 2);
                 assert!(matches!(
                     operations[0],
@@ -580,6 +598,26 @@ mod tests {
                 assert!(matches!(operations[1], BatchMutationRequest::LockClear));
             }
             other => panic!("expected batch mutate request, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn origin_is_optional_and_round_trips() {
+        let request = read_request(r#"{"op":"lock_clear"}"#).unwrap();
+        assert!(matches!(request, Request::LockClear { origin: None }));
+        assert_eq!(
+            serde_json::to_string(&Request::LockClear { origin: None }).unwrap(),
+            r#"{"op":"lock_clear"}"#
+        );
+        let request = read_request(
+            r#"{"op":"workspace_goto","env":"p.x","slot":2,"origin":"hyprnav-shell"}"#,
+        )
+        .unwrap();
+        match request {
+            Request::WorkspaceGoto { origin, .. } => {
+                assert_eq!(origin.as_deref(), Some("hyprnav-shell"))
+            }
+            other => panic!("expected workspace goto, got {other:?}"),
         }
     }
 

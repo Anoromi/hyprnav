@@ -552,6 +552,7 @@ impl qobject::Controller {
                         .send_request::<serde_json::Value>(Request::WorkspaceGoto {
                             env: Some(environment_id.clone()),
                             slot: slot_index,
+                            origin: None,
                         })
                 {
                     warn!(
@@ -603,11 +604,15 @@ impl qobject::Controller {
                 );
                 let item = &self.rust().items[current_index.max(0) as usize];
                 let request = if item.environment_id.is_empty() {
-                    Request::WorkspaceGotoPhysical { workspace_id }
+                    Request::WorkspaceGotoPhysical {
+                        workspace_id,
+                        origin: None,
+                    }
                 } else {
                     Request::WorkspaceGoto {
                         env: Some(item.environment_id.clone()),
                         slot: item.slot_index,
+                        origin: None,
                     }
                 };
                 if let Err(error) = self.as_ref().send_request::<serde_json::Value>(request) {

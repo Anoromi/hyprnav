@@ -1,4 +1,4 @@
-//! Push notifications for agent and slot state.
+//! Push notifications for agent, slot and lock state.
 //!
 //! The daemon owns a second Unix socket beside the request socket
 //! (`events.sock`). Any number of clients may connect; the daemon only ever
@@ -9,10 +9,24 @@
 //! {"event":"hello","ts_ms":…,"version":1}
 //! {"event":"agents","ts_ms":…,"agents":[…]}
 //! {"event":"slots","ts_ms":…}
+//! {"event":"locked","ts_ms":…,"seq":42,
+//!  "locked_environment_id":"p.….t.B"|null,"previous_environment_id":"p.….t.A"|null,
+//!  "cause":"snapshot|lock_set|lock_clear|workspace_goto|workspace_goto_physical|focus|env_delete|batch_mutate",
+//!  "origin":"t3code"|null,
+//!  "environment":{"title":…|null,"cwd":…|null,"chain":["p.…","p.….w.…","p.….t.B"]}|null}
 //! ```
 //!
 //! On connect a subscriber receives `hello`, then a full `agents` event, then
-//! a `slots` event, so it never has to poll for an initial state.
+//! a `slots` event, then the current lock as `locked` with
+//! `cause:"snapshot"` and `previous_environment_id:null`, so it never has to
+//! poll for an initial state.
+//!
+//! `locked` is sent immediately, never coalesced, and only when the locked
+//! environment actually changes; setting the same lock twice is silent. `seq`
+//! increases by one per change (the snapshot repeats the latest `seq`), so a
+//! client can drop stale lines. `origin` is the requester's free-form tag
+//! (`hyprnav --origin <tag>`, or `"origin"` on the request), null for the
+//! Hyprland focus watcher. `environment` is null when nothing is locked.
 //!
 //! Mutations only flip a dirty flag and wake the broadcaster thread; the
 //! broadcaster waits [`COALESCE_MS`] before it snapshots and fans out, so a
@@ -59,6 +73,8 @@ struct BusState {
     agents_dirty: bool,
     slots_dirty: bool,
     next_id: u64,
+    /// Number of lock changes seen; the `seq` of the latest `locked` event.
+    lock_seq: u64,
     stop: bool,
 }
 
@@ -136,6 +152,51 @@ impl EventBus {
         self.inner.wake.notify_all();
     }
 
+    /// Announce that the locked environment changed. Unlike `agents` and
+    /// `slots` this fans out at once: every change matters to followers.
+    /// `environment` is only evaluated when someone is listening.
+    pub fn lock_changed(
+        &self,
+        locked: Option<&str>,
+        previous: Option<&str>,
+        cause: &str,
+        origin: Option<&str>,
+        environment: impl FnOnce() -> serde_json::Value,
+    ) {
+        if self.subscriber_count() == 0 {
+            if let Ok(mut state) = self.inner.state.lock() {
+                state.lock_seq += 1;
+            }
+            return;
+        }
+        let environment = environment();
+        let Ok(mut state) = self.inner.state.lock() else {
+            return;
+        };
+        state.lock_seq += 1;
+        let line = locked_line(state.lock_seq, locked, previous, cause, origin, environment);
+        Self::fan_out_locked(&mut state, line);
+    }
+
+    fn lock_seq(&self) -> u64 {
+        self.inner
+            .state
+            .lock()
+            .map(|state| state.lock_seq)
+            .unwrap_or(0)
+    }
+
+    /// A raw receiver on the bus, for tests that watch what gets emitted.
+    #[cfg(test)]
+    pub(crate) fn test_subscribe(&self) -> std::sync::mpsc::Receiver<Arc<String>> {
+        let (tx, rx) = sync_channel::<Arc<String>>(SUBSCRIBER_QUEUE);
+        let mut state = self.inner.state.lock().unwrap();
+        state.next_id += 1;
+        let id = state.next_id;
+        state.subscribers.push(Subscriber { id, tx });
+        rx
+    }
+
     pub fn subscriber_count(&self) -> usize {
         self.inner
             .state
@@ -191,6 +252,10 @@ impl EventBus {
         let Ok(mut state) = self.inner.state.lock() else {
             return;
         };
+        Self::fan_out_locked(&mut state, line);
+    }
+
+    fn fan_out_locked(state: &mut BusState, line: Arc<String>) {
         let mut wedged = Vec::new();
         for subscriber in &state.subscribers {
             match subscriber.tx.try_send(line.clone()) {
@@ -254,6 +319,26 @@ pub fn slots_line() -> Arc<String> {
     }))
 }
 
+pub fn locked_line(
+    seq: u64,
+    locked: Option<&str>,
+    previous: Option<&str>,
+    cause: &str,
+    origin: Option<&str>,
+    environment: serde_json::Value,
+) -> Arc<String> {
+    line(json!({
+        "event": "locked",
+        "ts_ms": now_ms(),
+        "seq": seq,
+        "locked_environment_id": locked,
+        "previous_environment_id": previous,
+        "cause": cause,
+        "origin": origin,
+        "environment": environment,
+    }))
+}
+
 fn line(value: serde_json::Value) -> Arc<String> {
     Arc::new(format!("{value}\n"))
 }
@@ -261,9 +346,16 @@ fn line(value: serde_json::Value) -> Arc<String> {
 /// Accept subscribers on `path` and fan events out to them.
 ///
 /// `agents_snapshot` returns the same JSON `agents_list` does.
-pub fn start_event_server<F>(bus: EventBus, listener: UnixListener, agents_snapshot: F)
-where
+/// `lock_snapshot` returns the locked environment id and its `environment`
+/// object, for the `locked` line of the connect burst.
+pub fn start_event_server<F, L>(
+    bus: EventBus,
+    listener: UnixListener,
+    agents_snapshot: F,
+    lock_snapshot: L,
+) where
     F: Fn() -> serde_json::Value + Send + Sync + 'static,
+    L: Fn() -> (Option<String>, serde_json::Value) + Send + 'static,
 {
     let snapshot = Arc::new(agents_snapshot);
 
@@ -276,10 +368,19 @@ where
                 for stream in listener.incoming() {
                     match stream {
                         Ok(stream) => {
+                            let (locked, environment) = lock_snapshot();
                             let initial = vec![
                                 hello_line(),
                                 agents_line(snapshot()),
                                 slots_line(),
+                                locked_line(
+                                    bus.lock_seq(),
+                                    locked.as_deref(),
+                                    None,
+                                    "snapshot",
+                                    None,
+                                    environment,
+                                ),
                             ];
                             bus.add_subscriber(stream, initial);
                         }
@@ -322,23 +423,29 @@ mod tests {
     }
 
     #[test]
-    fn subscriber_receives_hello_agents_slots_on_connect() {
+    fn subscriber_receives_hello_agents_slots_locked_on_connect() {
         let path = temp_socket("hello");
         let listener = UnixListener::bind(&path).unwrap();
         let bus = EventBus::new();
-        start_event_server(bus.clone(), listener, || json!([]));
+        start_event_server(bus.clone(), listener, || json!([]), || (None, json!(null)));
 
         let client = UnixStream::connect(&path).unwrap();
         let mut reader = BufReader::new(client);
         let mut names = Vec::new();
-        for _ in 0..3 {
+        let mut last = serde_json::Value::Null;
+        for _ in 0..4 {
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
             let value: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
             assert!(value["ts_ms"].as_u64().unwrap() > 0);
             names.push(value["event"].as_str().unwrap().to_owned());
+            last = value;
         }
-        assert_eq!(names, vec!["hello", "agents", "slots"]);
+        assert_eq!(names, vec!["hello", "agents", "slots", "locked"]);
+        assert_eq!(last["cause"], "snapshot");
+        assert_eq!(last["seq"], 0);
+        assert!(last["locked_environment_id"].is_null());
+        assert!(last["environment"].is_null());
         let _ = std::fs::remove_file(&path);
     }
 
@@ -347,11 +454,11 @@ mod tests {
         let path = temp_socket("coalesce");
         let listener = UnixListener::bind(&path).unwrap();
         let bus = EventBus::new();
-        start_event_server(bus.clone(), listener, || json!([]));
+        start_event_server(bus.clone(), listener, || json!([]), || (None, json!(null)));
 
         let client = UnixStream::connect(&path).unwrap();
         let mut reader = BufReader::new(client);
-        for _ in 0..3 {
+        for _ in 0..4 {
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
         }
@@ -418,6 +525,28 @@ mod tests {
         bus.inner.state.lock().unwrap().subscribers.clear();
         let seen = drainer.join().unwrap();
         assert!(seen >= SUBSCRIBER_QUEUE, "healthy subscriber lost events: {seen}");
+    }
+
+    #[test]
+    fn lock_changes_fan_out_immediately_with_increasing_seq() {
+        let bus = EventBus::new();
+        // Without subscribers only the counter moves; the environment is not built.
+        bus.lock_changed(Some("a"), None, "lock_set", None, || unreachable!());
+        let rx = bus.test_subscribe();
+        bus.lock_changed(
+            Some("b"),
+            Some("a"),
+            "focus",
+            Some("t3code"),
+            || json!({"title":"B"}),
+        );
+        let value: serde_json::Value = serde_json::from_str(rx.try_recv().unwrap().trim()).unwrap();
+        assert_eq!(value["event"], "locked");
+        assert_eq!(value["seq"], 2);
+        assert_eq!(value["locked_environment_id"], "b");
+        assert_eq!(value["previous_environment_id"], "a");
+        assert_eq!(value["origin"], "t3code");
+        assert_eq!(value["environment"]["title"], "B");
     }
 
     #[test]

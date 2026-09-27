@@ -167,11 +167,14 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Lock(LockArgs { env_id }) => {
             ensure_server_running()?;
-            print_json(send::<Value>(Request::LockSet { env: env_id }))
+            print_json(send::<Value>(Request::LockSet {
+                env: env_id,
+                origin: cli.origin,
+            }))
         }
         Command::Unlock => {
             ensure_server_running()?;
-            print_json(send::<Value>(Request::LockClear))
+            print_json(send::<Value>(Request::LockClear { origin: cli.origin }))
         }
         Command::Env(command) => {
             ensure_server_running()?;
@@ -241,6 +244,7 @@ fn main() -> anyhow::Result<()> {
             print_json(send::<Value>(Request::WorkspaceGoto {
                 env: args.env,
                 slot: args.slot,
+                origin: cli.origin,
             }))
         }
         Command::Run(args) => {
@@ -379,7 +383,7 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Batch(args) => {
             ensure_server_running()?;
-            handle_batch(args)
+            handle_batch(args, cli.origin)
         }
         Command::SpawnInternal(args) => {
             ensure_server_running()?;
@@ -535,7 +539,7 @@ fn handle_spawn(args: SpawnArgs) -> anyhow::Result<()> {
     std::process::exit(exit_status_code(status));
 }
 
-fn handle_batch(args: BatchArgs) -> anyhow::Result<()> {
+fn handle_batch(args: BatchArgs, origin: Option<String>) -> anyhow::Result<()> {
     let payload = read_batch_payload(args)?;
     if payload.operations.is_empty() {
         return Err(anyhow::anyhow!("batch requires at least one operation"));
@@ -543,6 +547,7 @@ fn handle_batch(args: BatchArgs) -> anyhow::Result<()> {
     print_json(send::<Value>(Request::BatchMutate {
         atomic: payload.atomic,
         operations: payload.operations,
+        origin,
     }))
 }
 
@@ -596,19 +601,32 @@ fn stream_events(once: bool) -> anyhow::Result<()> {
                 paths.events_socket_path.display()
             )
         })?;
-    let reader = std::io::BufReader::new(stream);
+    let mut reader = std::io::BufReader::new(stream);
     let mut stdout = io::stdout();
     let mut seen = 0usize;
-    for line in reader.lines() {
-        let line = line?;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            // `--once` past the third line: an older daemon sends no `locked`.
+            Err(_) if once && seen >= 3 => break,
+            Err(error) => return Err(error.into()),
+        }
         if line.trim().is_empty() {
             continue;
         }
-        writeln!(stdout, "{line}")?;
+        write!(stdout, "{line}")?;
         stdout.flush()?;
         seen += 1;
-        if once && seen >= 3 {
+        if once && seen >= 4 {
             break;
+        }
+        if once && seen == 3 {
+            reader
+                .get_ref()
+                .set_read_timeout(Some(Duration::from_millis(300)))?;
         }
     }
     Ok(())

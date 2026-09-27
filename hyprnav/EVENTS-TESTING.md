@@ -14,7 +14,7 @@ live session. The daemon under test was the nix dev build
 | Test | What it pins down |
 |---|---|
 | `runtime_paths::events_socket_sits_beside_the_request_socket` | `events.sock` lives in the same directory as `hyprnav.sock` |
-| `events::subscriber_receives_hello_agents_slots_on_connect` | connect burst is `hello`, `agents`, `slots`, each with a `ts_ms` |
+| `events::subscriber_receives_hello_agents_slots_locked_on_connect` | connect burst is `hello`, `agents`, `slots`, `locked` (the last one added 2026-09-27), each with a `ts_ms` |
 | `events::bursts_are_coalesced_into_one_event` | 200 `agents_changed()` calls yield one event, and no second one within 300 ms |
 | `events::wedged_subscriber_is_dropped_and_healthy_one_survives` | a subscriber that never drains is dropped, fan-out never blocks, the healthy one keeps every line |
 | `events::marking_without_subscribers_does_not_queue_work` | with nobody listening the dirty flags are not kept, so no wakeups accumulate |
@@ -27,6 +27,8 @@ $ hyprnav events --once
 {"agents":[],"event":"agents","ts_ms":1789874935366}
 {"event":"slots","ts_ms":1789874935366}
 ```
+
+Since 2026-09-27 a fourth line follows (see "Lock events" below).
 
 ## Agent and slot events
 
@@ -89,3 +91,59 @@ the pre-existing 2 s temporary-slot reaper, untouched by this work.
   keeps its one-connection-at-a-time behaviour.
 - The shell reconnects: it was started while `events.sock` was missing and
   picked the socket up on its own once the daemon was restarted.
+
+## Lock events
+
+Added 2026-09-27 for T3's thread follower (`T3-THREAD-SYNC-PLAN.md` §3.1).
+Additive: `hello.version` stays 1, clients that ignore unknown events are
+unaffected. Schema:
+
+```
+{"event":"locked","ts_ms":…,"seq":42,
+ "locked_environment_id":"p.….w.….t.thr_B" | null,
+ "previous_environment_id":"p.….w.….t.thr_A" | null,
+ "cause":"snapshot|lock_set|lock_clear|workspace_goto|workspace_goto_physical|focus|env_delete|batch_mutate",
+ "origin":"t3code" | "hyprnav-shell" | null,
+ "environment":{"title":…|null,"cwd":…|null,"chain":["p.…","p.….w.…","p.….w.….t.thr_B"]} | null}
+```
+
+- Sent at once (not coalesced), and only when the locked environment actually
+  changes. Locking the locked env again is silent.
+- The connect burst ends with the current lock, `cause:"snapshot"`,
+  `previous_environment_id:null`, and the latest `seq` (0 before any change).
+- `seq` goes up by one per change since daemon start.
+- `origin` is the requester's tag: `hyprnav --origin <tag> lock|unlock|goto|batch`,
+  or `"origin"` on `lock_set`, `lock_clear`, `workspace_goto`,
+  `workspace_goto_physical`, `batch_mutate`. Null for the Hyprland focus
+  watcher (`cause:"focus"`) and `env_delete`.
+- `environment.title` is the locked env's own title, `cwd` the nearest stored
+  source path up its chain (a thread inherits its worktree's), `chain` the
+  existing environments on the chain, root first (as in the grid).
+- The daemon reads the lock before and after only the requests that can move
+  it (the causes above), and in the focus watcher only when a workspace has a
+  unique owner. Focus on an ambiguous workspace (a frame bound by several
+  worktrees) leaves the lock alone and emits nothing.
+- Side fix: re-ensuring an environment without a cwd (as `lock_set` and
+  `slot_assign` do) now keeps its stored source path instead of clearing it.
+
+Unit tests (`cargo test`, 106 passed):
+
+| Test | What it pins down |
+|---|---|
+| `events::subscriber_receives_hello_agents_slots_locked_on_connect` | 4-line burst, `locked` snapshot with `seq` 0 |
+| `events::lock_changes_fan_out_immediately_with_increasing_seq` | immediate fan-out, `seq` counts changes even with nobody listening, the environment is not built then |
+| `server::locked_event_follows_every_lock_change_and_only_changes` | `workspace_goto` on a thread row's shared frame emits `cause:"workspace_goto"` with `origin` round-tripped; the same goto again, and focus on an ambiguous workspace, emit nothing; focus on a thread's own frame emits `cause:"focus"`; `env_delete` of the locked env emits a null lock; a repeated `lock_set` emits once |
+| `protocol::origin_is_optional_and_round_trips` | requests without `origin` still decode, and serialize without it |
+
+A real line from that test:
+
+```
+{"cause":"workspace_goto","environment":{"chain":["p.x.w","p.x.w.b.t"],"cwd":"/home/me/wt","title":"Other"},"event":"locked","locked_environment_id":"p.x.w.b.t","origin":"hyprnav-shell","previous_environment_id":null,"seq":1,"ts_ms":1790507142192}
+```
+
+Scratch daemon (own `XDG_RUNTIME_DIR`/`XDG_STATE_HOME`, fake instance
+signature), `hyprnav events` while running `--origin t3code lock p.x.w` twice,
+`--origin cli unlock`, `lock p.x.w`: three `locked` lines (seq 1, 2, 3; the
+repeated lock is silent), and a later `events --once` ended with the
+`snapshot` line at seq 3. `events --once` now prints four lines and waits
+at most 300 ms for the fourth, so it still works against an older daemon.

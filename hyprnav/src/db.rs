@@ -420,6 +420,32 @@ impl StateStore {
         self.list_local_bindings_with_connection(&connection)
     }
 
+    /// The existing environments on `env_id`'s parent chain, root first,
+    /// `env_id` itself last if it exists.
+    pub fn environment_levels(&self, env_id: &str) -> Result<Vec<EnvironmentRecord>> {
+        let connection = self.open()?;
+        let mut statement = connection.prepare(
+            "SELECT env_id, display_id, source_path, title, last_focused_at
+             FROM environments WHERE env_id = ?1",
+        )?;
+        let mut levels = Vec::new();
+        for id in environment_chain(env_id).iter().rev() {
+            let record = statement
+                .query_row(params![id], |row| {
+                    Ok(EnvironmentRecord {
+                        env_id: row.get(0)?,
+                        display_id: row.get(1)?,
+                        source_path: row.get(2)?,
+                        title: row.get(3)?,
+                        last_focused_at: row.get(4)?,
+                    })
+                })
+                .optional()?;
+            levels.extend(record);
+        }
+        Ok(levels)
+    }
+
     pub fn list_environments(&self) -> Result<Vec<EnvironmentRecord>> {
         let connection = self.open()?;
         self.list_environments_with_connection(&connection)
@@ -677,7 +703,7 @@ impl StateStore {
              ON CONFLICT(env_id) DO UPDATE SET
                display_id = excluded.display_id,
                title = COALESCE(excluded.title, environments.title),
-               source_path = excluded.source_path,
+               source_path = COALESCE(excluded.source_path, environments.source_path),
                updated_at = excluded.updated_at",
             params![env_id, display_id, title, source_path, client_id, now],
         )?;

@@ -314,9 +314,17 @@ pub fn run_server() -> Result<()> {
     let frames_listener = bind_listener(&runtime.paths.frames_socket_path)?;
     {
         let snapshot_runtime = runtime.clone();
-        start_event_server(runtime.events.clone(), events_listener, move || {
-            snapshot_runtime.agents_snapshot()
-        });
+        let lock_runtime = runtime.clone();
+        start_event_server(
+            runtime.events.clone(),
+            events_listener,
+            move || snapshot_runtime.agents_snapshot(),
+            move || {
+                let locked = lock_runtime.store.locked_environment().ok().flatten();
+                let environment = lock_environment_json(&lock_runtime.store, locked.as_deref());
+                (locked, environment)
+            },
+        );
     }
     // Frame streaming lives in a `hyprnav-capture` child: the daemon only
     // brokers clients and fans its JPEGs out, so it needs no Wayland or JPEG
@@ -369,23 +377,7 @@ fn start_hypr_event_thread(runtime: Arc<ServerRuntime>) {
                                     && next_workspace_id != previous_workspace_id
                                 {
                                     previous_workspace_id = next_workspace_id;
-                                    if let Ok(Some(environment_id)) =
-                                        resolve_focus_environment_for_physical_workspace(
-                                            &runtime.store,
-                                            next_workspace_id,
-                                        )
-                                    {
-                                        match runtime.store.record_environment_focus(&environment_id)
-                                        {
-                                            // Row order in the grid follows
-                                            // focus, so this is a slot change.
-                                            Ok(()) => runtime.events.slots_changed(),
-                                            Err(error) => warn!(
-                                                "failed to record environment focus for {}: {error}",
-                                                environment_id
-                                            ),
-                                        }
-                                    }
+                                    record_workspace_focus(&runtime, next_workspace_id);
                                 }
                             }
                             Err(error) => {
@@ -401,6 +393,73 @@ fn start_hypr_event_thread(runtime: Arc<ServerRuntime>) {
             thread::sleep(Duration::from_secs(1));
         }
     });
+}
+
+/// Hyprland focused `workspace_id`: move the lock to its concrete owner, if it
+/// has exactly one. Ambiguous or unbound workspaces leave the lock alone.
+fn record_workspace_focus(runtime: &ServerRuntime, workspace_id: i32) {
+    let Ok(Some(environment_id)) =
+        resolve_focus_environment_for_physical_workspace(&runtime.store, workspace_id)
+    else {
+        return;
+    };
+    let previous = runtime.store.locked_environment();
+    match runtime.store.record_environment_focus(&environment_id) {
+        Ok(()) => {
+            if let Ok(previous) = previous {
+                if previous.as_deref() != Some(environment_id.as_str()) {
+                    announce_lock_change(
+                        runtime,
+                        Some(&environment_id),
+                        previous.as_deref(),
+                        "focus",
+                        None,
+                    );
+                }
+            }
+            // Row order in the grid follows focus, so this is a slot change.
+            runtime.events.slots_changed();
+        }
+        Err(error) => warn!(
+            "failed to record environment focus for {}: {error}",
+            environment_id
+        ),
+    }
+}
+
+fn announce_lock_change(
+    runtime: &ServerRuntime,
+    locked: Option<&str>,
+    previous: Option<&str>,
+    cause: &str,
+    origin: Option<&str>,
+) {
+    runtime
+        .events
+        .lock_changed(locked, previous, cause, origin, || {
+            lock_environment_json(&runtime.store, locked)
+        });
+}
+
+/// The `environment` object of a `locked` event; null when nothing is locked.
+/// `title` is the environment's own, `cwd` the nearest source path up its
+/// chain (a thread env has none, its worktree does), `chain` the existing
+/// levels root first, as in the grid.
+fn lock_environment_json(store: &StateStore, locked: Option<&str>) -> serde_json::Value {
+    let Some(env_id) = locked else {
+        return serde_json::Value::Null;
+    };
+    let levels = store.environment_levels(env_id).unwrap_or_default();
+    let title = levels
+        .last()
+        .filter(|level| level.env_id == env_id)
+        .and_then(|level| level.title.as_deref());
+    let cwd = levels
+        .iter()
+        .rev()
+        .find_map(|level| level.source_path.as_deref());
+    let chain: Vec<&str> = levels.iter().map(|level| level.env_id.as_str()).collect();
+    json!({"title": title, "cwd": cwd, "chain": chain})
 }
 
 fn bind_listener(path: &Path) -> Result<UnixListener> {
@@ -596,11 +655,32 @@ fn handle_stream(stream: UnixStream, runtime: Arc<ServerRuntime>) {
     }
 }
 
-fn handle_request(runtime: &Arc<ServerRuntime>, request: Request) -> Response<serde_json::Value> {
+fn handle_request(
+    runtime: &Arc<ServerRuntime>,
+    mut request: Request,
+) -> Response<serde_json::Value> {
     // Classify before the request is consumed: every mutating op announces
     // itself on the event bus once it succeeded, so subscribers never poll.
     let effects = request_effects(&request);
-    match try_handle_request(runtime, request) {
+    // Lock watch: only the ops that can move the lock pay for a read before
+    // and after. Checked on failure too, a request may fail after moving it.
+    let lock_watch = lock_cause(&mut request)
+        .map(|(cause, origin)| (cause, origin, runtime.store.locked_environment()));
+    let result = try_handle_request(runtime, request);
+    if let Some((cause, origin, Ok(previous))) = lock_watch {
+        if let Ok(locked) = runtime.store.locked_environment() {
+            if locked != previous {
+                announce_lock_change(
+                    runtime,
+                    locked.as_deref(),
+                    previous.as_deref(),
+                    cause,
+                    origin.as_deref(),
+                );
+            }
+        }
+    }
+    match result {
         Ok(value) => {
             match effects {
                 RequestEffects { agents: true, slots: true } => runtime.events.both_changed(),
@@ -611,6 +691,22 @@ fn handle_request(runtime: &Arc<ServerRuntime>, request: Request) -> Response<se
             Response::ok(value)
         }
         Err(error) => Response::error("request_failed", error.to_string()),
+    }
+}
+
+/// For requests that can move the lock: the `locked` event cause, and the
+/// request's `origin` tag (taken out, the handlers do not need it).
+fn lock_cause(request: &mut Request) -> Option<(&'static str, Option<String>)> {
+    match request {
+        Request::LockSet { origin, .. } => Some(("lock_set", origin.take())),
+        Request::LockClear { origin } => Some(("lock_clear", origin.take())),
+        Request::WorkspaceGoto { origin, .. } => Some(("workspace_goto", origin.take())),
+        Request::WorkspaceGotoPhysical { origin, .. } => {
+            Some(("workspace_goto_physical", origin.take()))
+        }
+        Request::BatchMutate { origin, .. } => Some(("batch_mutate", origin.take())),
+        Request::EnvDelete { .. } => Some(("env_delete", None)),
+        _ => None,
     }
 }
 
@@ -650,7 +746,7 @@ fn request_effects(request: &Request) -> RequestEffects {
         | Request::SlotTempCreate { .. }
         | Request::SlotRemove { .. }
         | Request::LockSet { .. }
-        | Request::LockClear
+        | Request::LockClear { .. }
         | Request::BrowserSlotSet { .. }
         | Request::BrowserSlotClear { .. }
         | Request::WorkspaceGoto { .. }
@@ -776,10 +872,12 @@ fn try_handle_request(runtime: &Arc<ServerRuntime>, request: Request) -> Result<
                 serde_json::to_value(runtime.store.browser_target(&resolved_env, slot)?)?;
             Ok(result)
         }
-        Request::LockSet { env } => {
+        Request::LockSet { env, .. } => {
             apply_mutation_request(runtime, BatchMutationRequest::LockSet { env })
         }
-        Request::LockClear => apply_mutation_request(runtime, BatchMutationRequest::LockClear),
+        Request::LockClear { .. } => {
+            apply_mutation_request(runtime, BatchMutationRequest::LockClear)
+        }
         Request::BrowserSlotSet { env, slot, target } => {
             ensure_positive_slot(slot)?;
             let env = resolve_required_environment(env.as_deref(), &runtime.store)?;
@@ -794,7 +892,7 @@ fn try_handle_request(runtime: &Arc<ServerRuntime>, request: Request) -> Result<
             runtime.store.set_browser_target(&env, slot, None)?;
             Ok(json!({"environment_id":env, "slot_index":slot}))
         }
-        Request::WorkspaceGoto { env, slot } => {
+        Request::WorkspaceGoto { env, slot, .. } => {
             ensure_positive_slot(slot)?;
             let resolved_env = resolve_required_environment(env.as_deref(), &runtime.store)?;
             let record = runtime
@@ -845,7 +943,7 @@ fn try_handle_request(runtime: &Arc<ServerRuntime>, request: Request) -> Result<
                 launch,
             })?)
         }
-        Request::WorkspaceGotoPhysical { workspace_id } => {
+        Request::WorkspaceGotoPhysical { workspace_id, .. } => {
             debug!(workspace_id, "physical workspace goto requested");
             append_switch_log(
                 "server.goto.physical",
@@ -1307,7 +1405,9 @@ fn try_handle_request(runtime: &Arc<ServerRuntime>, request: Request) -> Result<
             let snapshot = build_grid_snapshot(runtime, cwd.as_deref())?;
             Ok(serde_json::to_value(snapshot)?)
         }
-        Request::BatchMutate { atomic, operations } => {
+        Request::BatchMutate {
+            atomic, operations, ..
+        } => {
             if !atomic {
                 return Err(anyhow!("best-effort batch mode is not implemented"));
             }
@@ -2690,6 +2790,12 @@ fn goto_workspace(paths: &RuntimePaths, workspace_id: i32) -> Result<()> {
         return Err(anyhow!("workspace id must be positive"));
     }
 
+    // Unit tests run with a fake instance and must never reach a compositor.
+    #[cfg(test)]
+    if paths.instance_signature == "test" {
+        return Ok(());
+    }
+
     debug!(workspace_id, "dispatching workspace goto");
     append_switch_log(
         "server.hyprctl.goto",
@@ -3799,6 +3905,7 @@ mod tests {
 
         let request = Request::BatchMutate {
             atomic: true,
+            origin: None,
             operations: vec![
                 BatchMutationRequest::EnvEnsure {
                     env: Some("demo".to_owned()),
@@ -3863,6 +3970,7 @@ mod tests {
             &runtime,
             Request::BatchMutate {
                 atomic: true,
+                origin: None,
                 operations: vec![
                     BatchMutationRequest::EnvEnsure {
                         env: Some("demo".to_owned()),
@@ -3913,6 +4021,7 @@ mod tests {
             &runtime,
             Request::BatchMutate {
                 atomic: false,
+                origin: None,
                 operations: vec![BatchMutationRequest::LockClear],
             },
         )
@@ -3921,6 +4030,127 @@ mod tests {
         assert!(error
             .to_string()
             .contains("best-effort batch mode is not implemented"));
+        cleanup(&path);
+    }
+
+    fn env_op(env: &str, title: Option<&str>, cwd: Option<&str>) -> BatchMutationRequest {
+        BatchMutationRequest::EnvEnsure {
+            env: Some(env.to_owned()),
+            cwd: cwd.map(ToOwned::to_owned),
+            client: None,
+            title: title.map(ToOwned::to_owned),
+        }
+    }
+
+    fn fixed_op(env: &str, slot: i32, workspace_id: i32) -> BatchMutationRequest {
+        BatchMutationRequest::SlotAssign {
+            env: Some(env.to_owned()),
+            slot,
+            assignment_mode: SlotAssignmentMode::Fixed { workspace_id },
+            client: None,
+            cwd: None,
+            launch_argv: None,
+            display_name: None,
+        }
+    }
+
+    fn next_locked(rx: &std::sync::mpsc::Receiver<Arc<String>>) -> serde_json::Value {
+        let line = rx.try_recv().expect("expected a locked event");
+        println!("{}", line.trim());
+        serde_json::from_str(line.trim()).unwrap()
+    }
+
+    #[test]
+    fn locked_event_follows_every_lock_change_and_only_changes() {
+        let (runtime, path) = test_runtime("locked-event");
+        let setup = handle_request(
+            &runtime,
+            Request::BatchMutate {
+                atomic: true,
+                origin: None,
+                operations: vec![
+                    // Workspace 12 is bound by two worktrees: ambiguous.
+                    env_op("p.x.w", Some("Worktree"), Some("/home/me/wt")),
+                    env_op("p.x.w.a.t", Some("Design"), None),
+                    env_op("p.x.w.b.t", Some("Other"), None),
+                    // Re-ensuring an env without a cwd keeps the stored one.
+                    fixed_op("p.x.w", 2, 12),
+                    fixed_op("p.y.w", 2, 12),
+                    fixed_op("p.x.w.a.t", 8, 18),
+                ],
+            },
+        );
+        assert!(setup.ok, "{:?}", setup.error);
+        let rx = runtime.events.test_subscribe();
+
+        // Grid cell on B's row: the shared frame locks the row's leaf.
+        let goto = || Request::WorkspaceGoto {
+            env: Some("p.x.w.b.t".to_owned()),
+            slot: 2,
+            origin: Some("hyprnav-shell".to_owned()),
+        };
+        assert!(handle_request(&runtime, goto()).ok);
+        let event = next_locked(&rx);
+        assert_eq!(event["event"], "locked");
+        assert_eq!(event["cause"], "workspace_goto");
+        assert_eq!(event["origin"], "hyprnav-shell");
+        assert_eq!(event["locked_environment_id"], "p.x.w.b.t");
+        assert!(event["previous_environment_id"].is_null());
+        assert_eq!(event["environment"]["title"], "Other");
+        // Existing levels only, root first; the thread inherits the worktree cwd.
+        assert_eq!(event["environment"]["chain"], json!(["p.x.w", "p.x.w.b.t"]));
+        assert_eq!(event["environment"]["cwd"], "/home/me/wt");
+        let seq = event["seq"].as_u64().unwrap();
+
+        // Same lock again: silent.
+        assert!(handle_request(&runtime, goto()).ok);
+        assert!(rx.try_recv().is_err());
+
+        // Hyprland focus on an ambiguous workspace leaves the lock alone.
+        record_workspace_focus(&runtime, 12);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            runtime.store.locked_environment().unwrap().as_deref(),
+            Some("p.x.w.b.t")
+        );
+
+        // Focus on A's own frame moves the lock to A.
+        record_workspace_focus(&runtime, 18);
+        let event = next_locked(&rx);
+        assert_eq!(event["cause"], "focus");
+        assert!(event["origin"].is_null());
+        assert_eq!(event["locked_environment_id"], "p.x.w.a.t");
+        assert_eq!(event["previous_environment_id"], "p.x.w.b.t");
+        assert_eq!(event["seq"].as_u64().unwrap(), seq + 1);
+
+        // Deleting the locked environment clears the lock.
+        assert!(
+            handle_request(
+                &runtime,
+                Request::EnvDelete {
+                    env: "p.x.w.a.t".to_owned()
+                }
+            )
+            .ok
+        );
+        let event = next_locked(&rx);
+        assert_eq!(event["cause"], "env_delete");
+        assert!(event["locked_environment_id"].is_null());
+        assert!(event["environment"].is_null());
+
+        // A worktree lock carries its cwd; locking it twice emits once.
+        let lock = || Request::LockSet {
+            env: "p.x.w".to_owned(),
+            origin: Some("t3code".to_owned()),
+        };
+        assert!(handle_request(&runtime, lock()).ok);
+        let event = next_locked(&rx);
+        assert_eq!(event["cause"], "lock_set");
+        assert_eq!(event["origin"], "t3code");
+        assert_eq!(event["environment"]["cwd"], "/home/me/wt");
+        assert!(handle_request(&runtime, lock()).ok);
+        assert!(rx.try_recv().is_err());
+
         cleanup(&path);
     }
 }

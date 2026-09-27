@@ -45,6 +45,7 @@ Examples:
   hyprnav slot assign --env demo --slot 3 --managed --launch -- ghostty
   hyprnav slot command set --env demo --slot 1 -- ghostty --class work
   hyprnav lock demo
+  hyprnav --origin t3code lock demo
   hyprnav goto --slot 2
   hyprnav run --slot 2 -- ghostty
   hyprnav spawn rand -- ghostty
@@ -63,6 +64,11 @@ pub struct Cli {
     /// Command to run. If omitted, `daemon` is assumed.
     #[command(subcommand)]
     pub command: Option<Command>,
+    /// Tag the request with the caller's name (e.g. `t3code`). Used by `lock`,
+    /// `unlock`, `goto` and `batch`; echoed as `origin` in the `locked` event
+    /// they cause, so a subscriber can ignore its own lock changes.
+    #[arg(long, global = true, value_name = "TAG")]
+    pub origin: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -102,12 +108,12 @@ pub enum Command {
     Status(StatusArgs),
     #[command(
         about = "Persistently lock the default environment.",
-        long_about = "Persistently lock the default environment.\n\nAfter locking, commands like `goto --slot`, `run --slot`, and `slot resolve` can omit --env and resolve against the locked environment."
+        long_about = "Persistently lock the default environment.\n\nAfter locking, commands like `goto --slot`, `run --slot`, and `slot resolve` can omit --env and resolve against the locked environment. Pass the global `--origin <tag>` to name the caller in the resulting `locked` event."
     )]
     Lock(LockArgs),
     #[command(
         about = "Clear the persistent environment lock.",
-        long_about = "Clear the persistent environment lock."
+        long_about = "Clear the persistent environment lock. Pass the global `--origin <tag>` to name the caller in the resulting `locked` event."
     )]
     Unlock,
     #[command(
@@ -130,7 +136,7 @@ pub enum Command {
     Slot(SlotCommand),
     #[command(
         about = "Navigate to the physical workspace bound to a slot.",
-        long_about = "Navigate to the physical workspace bound to a slot.\n\nRequires either --env or a global lock."
+        long_about = "Navigate to the physical workspace bound to a slot.\n\nRequires either --env or a global lock. Pass the global `--origin <tag>` to name the caller in the resulting `locked` event."
     )]
     Goto(ResolveArgs),
     #[command(
@@ -153,7 +159,7 @@ pub enum Command {
     Agent(AgentCommand),
     #[command(
         about = "Stream agent and slot change events as JSON lines.",
-        long_about = "Stream agent and slot change events as JSON lines.\n\nThe daemon pushes one JSON object per line on a dedicated socket beside the request socket. On connect it sends `hello`, a full `agents` list and a `slots` marker, then an `agents` event whenever any agent changes and a `slots` event whenever anything that would change `ui_snapshot_grid` changes. Bursts are coalesced to roughly one event per 50 ms. Clients re-request the grid snapshot when they see `slots`."
+        long_about = "Stream agent and slot change events as JSON lines.\n\nThe daemon pushes one JSON object per line on a dedicated socket beside the request socket. On connect it sends `hello`, a full `agents` list, a `slots` marker and the current lock as a `locked` event (`cause:\"snapshot\"`), then an `agents` event whenever any agent changes and a `slots` event whenever anything that would change `ui_snapshot_grid` changes. Bursts are coalesced to roughly one event per 50 ms. Clients re-request the grid snapshot when they see `slots`. `locked` is sent immediately, once per actual change of the locked environment, with `seq`, `locked_environment_id`, `previous_environment_id`, `cause` (lock_set, lock_clear, workspace_goto, workspace_goto_physical, focus, env_delete, batch_mutate), `origin` (the requester's --origin tag or null) and `environment` {title, cwd, chain}."
     )]
     Events(EventsArgs),
     #[command(
@@ -175,7 +181,7 @@ pub enum Command {
     Stick(StickCommand),
     #[command(
         about = "Apply many environment/slot/lock mutations in one daemon request.",
-        long_about = "Apply many environment/slot/lock mutations in one daemon request.\n\nThe payload is read from JSON via --file or --stdin. Only state mutation operations are supported in this first version."
+        long_about = "Apply many environment/slot/lock mutations in one daemon request.\n\nThe payload is read from JSON via --file or --stdin. Only state mutation operations are supported in this first version. Pass the global `--origin <tag>` to name the caller in the resulting `locked` event."
     )]
     Batch(BatchArgs),
     #[command(name = "spawn-internal", hide = true)]
@@ -209,7 +215,7 @@ pub enum AgentCommand {
 
 #[derive(Debug, Args)]
 pub struct EventsArgs {
-    /// Print the connect burst (hello, agents, slots) and exit.
+    /// Print the connect burst (hello, agents, slots, locked) and exit.
     #[arg(long)]
     pub once: bool,
 }
@@ -722,6 +728,7 @@ pub fn parse_args() -> Cli {
     if cli.command.is_none() {
         Cli {
             command: Some(Command::Daemon),
+            origin: cli.origin,
         }
     } else {
         cli
