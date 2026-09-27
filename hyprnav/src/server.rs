@@ -7,7 +7,7 @@ use crate::db::{
 const TEMP_SLOT_GRACE_SECS: i64 = 30;
 use crate::protocol::{
     read_request, write_response, AgentSnapshot, BatchMutationOperationResult, BatchMutationRequest,
-    BatchMutationResponse, GridCellSnapshot, GridSnapshot, NavigationLaunchResult,
+    BatchMutationResponse, GridCellSnapshot, GridChainLevel, GridSnapshot, NavigationLaunchResult,
     NavigationLaunchSkippedReason, Request, Response, SlotAssignmentMode, SlotResolution,
     SpawnPrepared, SpawnStarted, StatusSnapshot, SwitcherSnapshot, WorkspaceCardSnapshot,
     WorkspaceNavigationResult,
@@ -2130,17 +2130,13 @@ fn build_grid_snapshot(runtime: &ServerRuntime, cwd: Option<&str>) -> Result<Gri
         .map(resolve_environment_from_cwd)
         .transpose()?
         .filter(|value| !value.is_empty());
-    let mut rows = runtime.store.list_environments()?;
-    sort_grid_rows(
-        &mut rows,
+    let local_bindings = runtime.store.list_local_bindings()?;
+    let rows = plan_grid_rows(
+        runtime.store.list_environments()?,
+        &local_bindings,
         locked_env_id.as_deref(),
         current_env_id.as_deref(),
     );
-    let local_bindings = runtime.store.list_local_bindings()?;
-    let binding_index = local_bindings
-        .iter()
-        .map(|binding| ((binding.env_id.as_str(), binding.slot_index), binding))
-        .collect::<HashMap<_, _>>();
 
     let stuck_workspaces = runtime
         .store
@@ -2175,37 +2171,20 @@ fn build_grid_snapshot(runtime: &ServerRuntime, cwd: Option<&str>) -> Result<Gri
     let mut max_column_count = 0;
     let mut row_count = 0;
 
-    for environment in rows {
-        let slot_indexes = slot_indexes_for_environment(&environment.env_id, &local_bindings);
+    for row in &rows {
         let mut row_items = Vec::new();
 
-        for (column_index, slot_index) in slot_indexes.into_iter().enumerate() {
-            let Some(record) = resolve_slot_effective_from_bindings(
-                &binding_index,
-                &environment.env_id,
-                slot_index,
-            ) else {
-                continue;
-            };
-
+        for (column_index, slot) in row.slots.iter().enumerate() {
+            let record = &slot.record;
             let workspace_id = record.workspace_id;
             let card = cards_by_workspace.get(&workspace_id);
             let browser_target = runtime
                 .store
-                .browser_target(&environment.env_id, record.slot_index)?;
+                .browser_target(&row.leaf.env_id, record.slot_index)?;
             let active = workspace_id == current_workspace_id && browser_target.is_none();
+            let temp = temp_meta.get(&(record.binding_environment_id.clone(), record.slot_index));
 
             row_items.push(GridCellSnapshot {
-                environment_id: environment.env_id.clone(),
-                environment_display_id: environment.display_id.clone(),
-                environment_title: environment.title.clone().unwrap_or_default(),
-                binding_environment_id: Some(record.binding_environment_id.clone()),
-                command_environment_id: record.command_environment_id.clone(),
-                slot_index: record.slot_index,
-                slot_display_name: record.display_name.clone().unwrap_or_default(),
-                physical_workspace_id: workspace_id,
-                binding_kind: record.binding_kind.as_str().to_owned(),
-                inherited: record.binding_environment_id != environment.env_id,
                 workspace_name: browser_target
                     .as_ref()
                     .map(|target| {
@@ -2214,7 +2193,7 @@ fn build_grid_snapshot(runtime: &ServerRuntime, cwd: Option<&str>) -> Result<Gri
                             .clone()
                             .unwrap_or_else(|| target.workspace.clone())
                     })
-                    .unwrap_or_else(|| workspace_display_label(card, &record, workspace_id)),
+                    .unwrap_or_else(|| workspace_display_label(card, record, workspace_id)),
                 subtitle: browser_target
                     .as_ref()
                     .map(|target| format!("{} · {}", target.name, target.workspace))
@@ -2223,21 +2202,14 @@ fn build_grid_snapshot(runtime: &ServerRuntime, cwd: Option<&str>) -> Result<Gri
                 app_class: card.map(|item| item.app_class.clone()).unwrap_or_default(),
                 window_count: card.map(|item| item.window_count).unwrap_or(0),
                 active,
-                environment_locked: locked_env_id.as_deref() == Some(environment.env_id.as_str()),
                 stuck: stuck_workspaces.contains(&workspace_id),
-                temporary: temp_meta.contains_key(&(record.binding_environment_id.clone(), record.slot_index)),
-                unnumbered: record.slot_index >= TEMP_SLOT_START,
-                owner: temp_meta
-                    .get(&(record.binding_environment_id.clone(), record.slot_index))
-                    .and_then(|meta| meta.owner.clone()),
-                empty_for_ms: temp_meta
-                    .get(&(record.binding_environment_id.clone(), record.slot_index))
+                temporary: temp.is_some(),
+                owner: temp.and_then(|meta| meta.owner.clone()),
+                empty_for_ms: temp
                     .and_then(|meta| meta.empty_since)
                     .map(|since| ((now_unix - since).max(0) as u64) * 1000),
                 agent: agents_by_workspace.get(&workspace_id).cloned(),
-                show_environment_label: column_index == 0,
-                row_index: row_count,
-                column_index: column_index as i32,
+                ..grid_cell_from_plan(row, slot, row_count, column_index)
             });
         }
 
@@ -2271,18 +2243,221 @@ fn build_grid_snapshot(runtime: &ServerRuntime, cwd: Option<&str>) -> Result<Gri
     })
 }
 
-fn sort_grid_rows(
-    rows: &mut [EnvironmentRecord],
+/// Row order: the row holding the lock, then the row you are in, then by
+/// recent focus. A row holds the lock or the cwd when that environment is
+/// anywhere on its chain.
+fn compare_grid_rows(
+    left: &EnvironmentRecord,
+    right: &EnvironmentRecord,
     locked_env_id: Option<&str>,
     current_env_id: Option<&str>,
-) {
-    rows.sort_by(|left, right| {
-        row_sort_key(&left.env_id, locked_env_id, current_env_id)
-            .cmp(&row_sort_key(&right.env_id, locked_env_id, current_env_id))
-            .then_with(|| right.last_focused_at.cmp(&left.last_focused_at))
-            .then_with(|| left.display_id.cmp(&right.display_id))
-            .then_with(|| left.env_id.cmp(&right.env_id))
+) -> std::cmp::Ordering {
+    row_sort_key(&left.env_id, locked_env_id, current_env_id)
+        .cmp(&row_sort_key(&right.env_id, locked_env_id, current_env_id))
+        .then_with(|| right.last_focused_at.cmp(&left.last_focused_at))
+        .then_with(|| left.display_id.cmp(&right.display_id))
+        .then_with(|| left.env_id.cmp(&right.env_id))
+}
+
+/// One slot of a planned grid row.
+struct PlannedSlot {
+    record: crate::db::SlotResolutionRecord,
+    /// Label of the environment that binds the slot.
+    owner_label: String,
+}
+
+/// One grid row: a leaf environment and every slot it resolves.
+struct GridRowPlan {
+    leaf: EnvironmentRecord,
+    title: String,
+    chain: Vec<GridChainLevel>,
+    locked_environment_id: Option<String>,
+    slots: Vec<PlannedSlot>,
+}
+
+/// What to call an environment: its title, else the last component of its
+/// cwd, else nothing.
+fn environment_label(env: &EnvironmentRecord) -> String {
+    if let Some(title) = env
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+    {
+        return title.to_owned();
+    }
+    env.source_path
+        .as_deref()
+        .map(|path| path.trim_end_matches('/'))
+        .and_then(|path| Path::new(path).file_name())
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_default()
+}
+
+/// The grid's rows: one per leaf of the environment tree.
+///
+/// Environment ids are prefix chains (`p.x` → `p.x.w` → `p.x.w.a.t`) and a
+/// child resolves slots through its ancestors, so an ancestor's frames are
+/// the same workspaces every descendant shows. Showing every environment as
+/// its own row repeats those frames once per level. Instead:
+///
+/// - A candidate is an environment with a binding of its own, or the locked
+///   or current environment, that resolves at least one slot.
+/// - A candidate is a row unless another candidate descends from it. An
+///   ancestor with no live descendant is its own row; so is one that owns a
+///   temporary slot, since a temp shows only in its owner's row.
+/// - A row's cells are its numbered slots resolved through the chain plus its
+///   own temps, in slot order. A cell bound by an ancestor is `shared`.
+/// - The title is the deepest titled level of the chain, else the deepest
+///   cwd name, else the leaf's id.
+fn plan_grid_rows(
+    environments: Vec<EnvironmentRecord>,
+    local_bindings: &[SlotBindingRecord],
+    locked_env_id: Option<&str>,
+    current_env_id: Option<&str>,
+) -> Vec<GridRowPlan> {
+    let binding_index = local_bindings
+        .iter()
+        .map(|binding| ((binding.env_id.as_str(), binding.slot_index), binding))
+        .collect::<HashMap<_, _>>();
+    let by_id = environments
+        .iter()
+        .map(|env| (env.env_id.as_str(), env))
+        .collect::<HashMap<_, _>>();
+    let bound = local_bindings
+        .iter()
+        .map(|binding| binding.env_id.as_str())
+        .collect::<HashSet<_>>();
+    let temp_owners = local_bindings
+        .iter()
+        .filter(|binding| binding.slot_index >= TEMP_SLOT_START)
+        .map(|binding| binding.env_id.as_str())
+        .collect::<HashSet<_>>();
+
+    let mut candidates = Vec::new();
+    for env in &environments {
+        let id = env.env_id.as_str();
+        if !(bound.contains(id) || locked_env_id == Some(id) || current_env_id == Some(id)) {
+            continue;
+        }
+        let records = slot_indexes_for_environment(id, local_bindings)
+            .into_iter()
+            .filter_map(|slot_index| {
+                resolve_slot_effective_from_bindings(&binding_index, id, slot_index)
+            })
+            .collect::<Vec<_>>();
+        if !records.is_empty() {
+            candidates.push((env.clone(), records));
+        }
+    }
+
+    let candidate_chains = candidates
+        .iter()
+        .map(|(env, _)| environment_chain(&env.env_id))
+        .collect::<Vec<_>>();
+    let has_live_descendant = |id: &str| {
+        candidate_chains
+            .iter()
+            .any(|chain| chain.len() > 1 && chain[1..].iter().any(|ancestor| ancestor == id))
+    };
+    candidates.retain(|(env, _)| {
+        temp_owners.contains(env.env_id.as_str()) || !has_live_descendant(&env.env_id)
     });
+    candidates.sort_by(|(left, _), (right, _)| {
+        compare_grid_rows(left, right, locked_env_id, current_env_id)
+    });
+
+    candidates
+        .into_iter()
+        .map(|(leaf, records)| {
+            let full_chain = environment_chain(&leaf.env_id);
+            let chain = full_chain
+                .iter()
+                .rev()
+                .filter_map(|id| by_id.get(id.as_str()))
+                .map(|env| GridChainLevel {
+                    id: env.env_id.clone(),
+                    title: env.title.clone().unwrap_or_default().trim().to_owned(),
+                    label: environment_label(env),
+                    locked: locked_env_id == Some(env.env_id.as_str()),
+                })
+                .collect::<Vec<_>>();
+            let locked_environment_id = locked_env_id
+                .filter(|locked| full_chain.iter().any(|id| id == locked))
+                .map(ToOwned::to_owned);
+            let title = chain
+                .iter()
+                .rev()
+                .find(|level| !level.title.is_empty())
+                .or_else(|| chain.iter().rev().find(|level| !level.label.is_empty()))
+                .map(|level| level.label.clone())
+                .or_else(|| Some(leaf.display_id.clone()).filter(|id| !id.is_empty()))
+                .unwrap_or_else(|| leaf.env_id.clone());
+            let slots = records
+                .into_iter()
+                .map(|record| PlannedSlot {
+                    owner_label: by_id
+                        .get(record.binding_environment_id.as_str())
+                        .map(|env| environment_label(env))
+                        .unwrap_or_default(),
+                    record,
+                })
+                .collect();
+            GridRowPlan {
+                leaf,
+                title,
+                chain,
+                locked_environment_id,
+                slots,
+            }
+        })
+        .collect()
+}
+
+/// A cell with the row and slot fields filled in and the live ones (windows,
+/// focus, temp timers, agents) left empty for the caller.
+fn grid_cell_from_plan(
+    row: &GridRowPlan,
+    slot: &PlannedSlot,
+    row_index: i32,
+    column_index: usize,
+) -> GridCellSnapshot {
+    let record = &slot.record;
+    let shared = record.binding_environment_id != row.leaf.env_id;
+    GridCellSnapshot {
+        environment_id: row.leaf.env_id.clone(),
+        environment_display_id: row.leaf.display_id.clone(),
+        environment_title: row.title.clone(),
+        binding_environment_id: Some(record.binding_environment_id.clone()),
+        command_environment_id: record.command_environment_id.clone(),
+        slot_index: record.slot_index,
+        slot_display_name: record.display_name.clone().unwrap_or_default(),
+        physical_workspace_id: record.workspace_id,
+        binding_kind: record.binding_kind.as_str().to_owned(),
+        inherited: shared,
+        owner_environment_id: record.binding_environment_id.clone(),
+        owner_title: slot.owner_label.clone(),
+        shared,
+        environment_chain: row.chain.clone(),
+        locked_environment_id: row.locked_environment_id.clone(),
+        workspace_name: format!("Workspace {}", record.workspace_id),
+        subtitle: format!("Workspace {}", record.workspace_id),
+        app_class: String::new(),
+        window_count: 0,
+        active: false,
+        environment_locked: row.locked_environment_id.is_some(),
+        stuck: false,
+        temporary: false,
+        unnumbered: record.slot_index >= TEMP_SLOT_START,
+        owner: None,
+        empty_for_ms: None,
+        agent: None,
+        show_environment_label: column_index == 0,
+        row_index,
+        column_index: column_index as i32,
+    }
 }
 
 fn resolve_slot_effective_from_bindings<'a>(
@@ -2407,15 +2582,15 @@ fn slot_indexes_for_environment(env_id: &str, bindings: &[SlotBindingRecord]) ->
 }
 
 fn row_sort_key(env_id: &str, locked_env_id: Option<&str>, current_env_id: Option<&str>) -> i32 {
-    let rank = if locked_env_id == Some(env_id) {
+    let chain = environment_chain(env_id);
+    let on_chain = |target: Option<&str>| target.is_some_and(|target| chain.iter().any(|id| id == target));
+    if on_chain(locked_env_id) {
         0
-    } else if current_env_id == Some(env_id) {
+    } else if on_chain(current_env_id) {
         1
     } else {
         2
-    };
-
-    rank
+    }
 }
 
 fn current_workspace_cards(runtime: &ServerRuntime) -> Result<Vec<WorkspaceCardData>> {
@@ -2828,7 +3003,7 @@ mod tests {
     }
 
     fn build_grid_snapshot_from_data(
-        mut environments: Vec<EnvironmentRecord>,
+        environments: Vec<EnvironmentRecord>,
         local_bindings: Vec<SlotBindingRecord>,
         workspace_cards: Vec<WorkspaceCardSnapshot>,
         current_workspace_id: i32,
@@ -2839,45 +3014,21 @@ mod tests {
             .into_iter()
             .map(|card| (card.workspace_id, card))
             .collect::<HashMap<_, _>>();
-        let binding_index = local_bindings
-            .iter()
-            .map(|binding| ((binding.env_id.as_str(), binding.slot_index), binding))
-            .collect::<HashMap<_, _>>();
 
         let mut items = Vec::new();
         let mut max_column_count = 0;
         let mut row_count = 0;
 
-        sort_grid_rows(&mut environments, locked_env_id, current_env_id);
-
-        for environment in environments {
-            let slot_indexes = slot_indexes_for_environment(&environment.env_id, &local_bindings);
+        let rows = plan_grid_rows(environments, &local_bindings, locked_env_id, current_env_id);
+        for row in &rows {
             let mut row_items = Vec::new();
 
-            for (column_index, slot_index) in slot_indexes.into_iter().enumerate() {
-                let Some(record) = resolve_slot_effective_from_bindings(
-                    &binding_index,
-                    &environment.env_id,
-                    slot_index,
-                ) else {
-                    continue;
-                };
-
+            for (column_index, slot) in row.slots.iter().enumerate() {
+                let record = &slot.record;
                 let workspace_id = record.workspace_id;
                 let card = cards_by_workspace.get(&workspace_id);
-                let active = workspace_id == current_workspace_id;
 
                 row_items.push(GridCellSnapshot {
-                    environment_id: environment.env_id.clone(),
-                    environment_display_id: environment.display_id.clone(),
-                    environment_title: environment.title.clone().unwrap_or_default(),
-                    binding_environment_id: Some(record.binding_environment_id.clone()),
-                    command_environment_id: record.command_environment_id.clone(),
-                    slot_index: record.slot_index,
-                    slot_display_name: record.display_name.clone().unwrap_or_default(),
-                    physical_workspace_id: workspace_id,
-                    binding_kind: record.binding_kind.as_str().to_owned(),
-                    inherited: record.binding_environment_id != environment.env_id,
                     workspace_name: live_display_label(
                         card.map(|item| item.subtitle.as_str()).unwrap_or_default(),
                         card.map(|item| item.app_class.as_str()).unwrap_or_default(),
@@ -2889,17 +3040,8 @@ mod tests {
                         .unwrap_or_else(|| format!("Workspace {}", workspace_id)),
                     app_class: card.map(|item| item.app_class.clone()).unwrap_or_default(),
                     window_count: card.map(|item| item.window_count).unwrap_or(0),
-                    active,
-                    environment_locked: locked_env_id == Some(environment.env_id.as_str()),
-                    stuck: false,
-                    temporary: false,
-                    unnumbered: record.slot_index >= TEMP_SLOT_START,
-                    owner: None,
-                    empty_for_ms: None,
-                    agent: None,
-                    show_environment_label: column_index == 0,
-                    row_index: row_count,
-                    column_index: column_index as i32,
+                    active: workspace_id == current_workspace_id,
+                    ..grid_cell_from_plan(row, slot, row_count, column_index)
                 });
             }
 
@@ -3136,6 +3278,261 @@ mod tests {
         assert_eq!(parent[1].physical_workspace_id, 90);
     }
 
+    fn titled(env_id: &str, title: Option<&str>, cwd: Option<&str>, focused: i64) -> EnvironmentRecord {
+        EnvironmentRecord {
+            env_id: env_id.to_owned(),
+            display_id: env_id.to_owned(),
+            title: title.map(ToOwned::to_owned),
+            source_path: cwd.map(ToOwned::to_owned),
+            last_focused_at: focused,
+        }
+    }
+
+    fn rows_of(snapshot: &GridSnapshot) -> Vec<Vec<&GridCellSnapshot>> {
+        (0..snapshot.row_count)
+            .map(|index| {
+                snapshot
+                    .items
+                    .iter()
+                    .filter(|item| item.row_index == index)
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn slots_of(row: &[&GridCellSnapshot]) -> Vec<(i32, bool)> {
+        row.iter().map(|cell| (cell.slot_index, cell.shared)).collect()
+    }
+
+    #[test]
+    fn grid_merges_a_chain_of_three_into_one_row() {
+        let snapshot = build_grid_snapshot_from_data(
+            vec![
+                titled("p.x", Some("Proj"), None, 0),
+                titled("p.x.w", None, None, 0),
+                titled("p.x.w.a.t", Some("Design"), None, 0),
+            ],
+            vec![
+                binding("p.x", 1, 11),
+                binding("p.x.w", 2, 12),
+                binding("p.x.w", 3, 13),
+                binding("p.x.w.a.t", 5, 15),
+                binding("p.x.w.a.t", 8, 18),
+            ],
+            vec![],
+            15,
+            None,
+            None,
+        );
+        let rows = rows_of(&snapshot);
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(
+            slots_of(row),
+            vec![(1, true), (2, true), (3, true), (5, false), (8, false)]
+        );
+        assert!(row.iter().all(|cell| cell.environment_id == "p.x.w.a.t"));
+        assert_eq!(row[0].owner_environment_id, "p.x");
+        assert_eq!(row[0].owner_title, "Proj");
+        assert_eq!(row[1].owner_environment_id, "p.x.w");
+        assert_eq!(row[4].owner_environment_id, "p.x.w.a.t");
+        assert!(row[0].inherited && !row[4].inherited);
+        assert_eq!(row[0].environment_title, "Design");
+        assert_eq!(
+            row[0]
+                .environment_chain
+                .iter()
+                .map(|level| level.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["p.x", "p.x.w", "p.x.w.a.t"]
+        );
+    }
+
+    #[test]
+    fn grid_gives_each_thread_under_a_worktree_its_own_row_with_the_shared_frames() {
+        let snapshot = build_grid_snapshot_from_data(
+            vec![
+                titled("p.x", Some("Proj"), None, 0),
+                titled("p.x.w", None, None, 0),
+                titled("p.x.w.a.t", Some("Design"), None, 2),
+                titled("p.x.w.b.t", Some("Other"), None, 1),
+            ],
+            vec![
+                binding("p.x.w", 1, 11),
+                binding("p.x.w", 2, 12),
+                binding("p.x.w", 3, 13),
+                binding("p.x.w.a.t", 5, 15),
+                binding("p.x.w.a.t", 8, 18),
+                binding("p.x.w.b.t", 4, 14),
+            ],
+            vec![],
+            0,
+            None,
+            None,
+        );
+        let rows = rows_of(&snapshot);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][0].environment_title, "Design");
+        assert_eq!(
+            slots_of(&rows[0]),
+            vec![(1, true), (2, true), (3, true), (5, false), (8, false)]
+        );
+        assert_eq!(rows[1][0].environment_title, "Other");
+        assert_eq!(
+            slots_of(&rows[1]),
+            vec![(1, true), (2, true), (3, true), (4, false)]
+        );
+        // The worktree has no row of its own.
+        assert!(snapshot.items.iter().all(|cell| cell.environment_id != "p.x.w"));
+    }
+
+    #[test]
+    fn grid_keeps_an_orphan_worktree_as_its_own_row() {
+        let snapshot = build_grid_snapshot_from_data(
+            vec![
+                titled("p.x", Some("Proj"), None, 0),
+                titled("p.x.w", None, Some("/home/u/src/feature-branch/"), 0),
+                // A thread with no frames of its own is not a row.
+                titled("p.x.w.a.t", Some("Idle thread"), None, 5),
+            ],
+            vec![binding("p.x.w", 1, 11), binding("p.x.w", 2, 12)],
+            vec![],
+            0,
+            None,
+            None,
+        );
+        let rows = rows_of(&snapshot);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].environment_id, "p.x.w");
+        assert_eq!(slots_of(&rows[0]), vec![(1, false), (2, false)]);
+        // Deepest titled level wins over the worktree's own cwd name.
+        assert_eq!(rows[0][0].environment_title, "Proj");
+        assert_eq!(rows[0][0].environment_chain[1].label, "feature-branch");
+    }
+
+    #[test]
+    fn grid_row_title_falls_back_to_cwd_then_id() {
+        let snapshot = build_grid_snapshot_from_data(
+            vec![
+                titled("q", None, Some("/srv/checkout"), 0),
+                titled("r.s", None, None, 0),
+            ],
+            vec![binding("q", 1, 11), binding("r.s", 1, 21)],
+            vec![],
+            0,
+            None,
+            None,
+        );
+        let titles = rows_of(&snapshot)
+            .iter()
+            .map(|row| row[0].environment_title.clone())
+            .collect::<Vec<_>>();
+        assert!(titles.contains(&"checkout".to_owned()));
+        assert!(titles.contains(&"r.s".to_owned()));
+    }
+
+    #[test]
+    fn grid_row_title_picks_the_deepest_titled_level() {
+        let snapshot = build_grid_snapshot_from_data(
+            vec![
+                titled("p.x", Some("Proj"), None, 0),
+                titled("p.x.w", Some("main"), None, 0),
+                titled("p.x.w.a.t", None, None, 0),
+            ],
+            vec![binding("p.x", 1, 11), binding("p.x.w.a.t", 5, 15)],
+            vec![],
+            0,
+            None,
+            None,
+        );
+        let rows = rows_of(&snapshot);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].environment_title, "main");
+    }
+
+    #[test]
+    fn grid_excludes_an_ancestor_temp_from_the_merged_row() {
+        let snapshot = build_grid_snapshot_from_data(
+            vec![titled("p.x.w", None, None, 0), titled("p.x.w.a.t", Some("T"), None, 5)],
+            vec![
+                binding("p.x.w", 1, 11),
+                binding("p.x.w", TEMP_SLOT_START, 90),
+                binding("p.x.w.a.t", 5, 15),
+                binding("p.x.w.a.t", TEMP_SLOT_START + 1, 91),
+            ],
+            vec![],
+            0,
+            None,
+            None,
+        );
+        let rows = rows_of(&snapshot);
+        let thread = rows
+            .iter()
+            .find(|row| row[0].environment_id == "p.x.w.a.t")
+            .expect("thread row");
+        assert_eq!(
+            slots_of(thread),
+            vec![(1, true), (5, false), (TEMP_SLOT_START + 1, false)]
+        );
+        assert!(thread.iter().all(|cell| cell.physical_workspace_id != 90));
+        // The worktree owns a temp, so it keeps its own row to show it.
+        let worktree = rows
+            .iter()
+            .find(|row| row[0].environment_id == "p.x.w")
+            .expect("worktree row");
+        assert_eq!(slots_of(worktree), vec![(1, false), (TEMP_SLOT_START, false)]);
+    }
+
+    #[test]
+    fn grid_marks_every_row_under_a_locked_ancestor_and_sorts_them_first() {
+        let snapshot = build_grid_snapshot_from_data(
+            vec![
+                titled("z", Some("Zed"), None, 100),
+                titled("p.x.w", None, None, 0),
+                titled("p.x.w.a.t", Some("A"), None, 1),
+                titled("p.x.w.b.t", Some("B"), None, 2),
+            ],
+            vec![
+                binding("z", 1, 31),
+                binding("p.x.w", 1, 11),
+                binding("p.x.w.a.t", 5, 15),
+                binding("p.x.w.b.t", 4, 14),
+            ],
+            vec![],
+            0,
+            Some("p.x.w"),
+            None,
+        );
+        let rows = rows_of(&snapshot);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row[0].environment_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["p.x.w.b.t", "p.x.w.a.t", "z"]
+        );
+        assert!(rows[0][0].environment_locked && rows[1][0].environment_locked);
+        assert_eq!(rows[0][0].locked_environment_id.as_deref(), Some("p.x.w"));
+        assert!(!rows[2][0].environment_locked);
+        assert!(rows[0][0].environment_chain[0].locked);
+    }
+
+    #[test]
+    fn grid_gives_a_locked_thread_without_frames_its_row() {
+        let snapshot = build_grid_snapshot_from_data(
+            vec![titled("p.x.w", None, None, 0), titled("p.x.w.a.t", Some("A"), None, 0)],
+            vec![binding("p.x.w", 1, 11)],
+            vec![],
+            0,
+            Some("p.x.w.a.t"),
+            None,
+        );
+        let rows = rows_of(&snapshot);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].environment_id, "p.x.w.a.t");
+        assert_eq!(rows[0][0].environment_title, "A");
+        assert_eq!(slots_of(&rows[0]), vec![(1, true)]);
+    }
+
     #[test]
     fn resolve_slot_effective_from_bindings_prefers_nearest_command_and_binding_sources() {
         let bindings = vec![
@@ -3263,19 +3660,29 @@ mod tests {
         let mut task = environment("project.task", "Task");
         task.last_focused_at = 10;
 
+        let mut other = environment("other", "Other");
+        other.last_focused_at = 30;
+
         let snapshot = build_grid_snapshot_from_data(
-            vec![task, project],
-            vec![binding("project", 1, 5), inherit_binding("project.task", 1)],
+            vec![other, task, project],
+            vec![
+                binding("project", 1, 5),
+                inherit_binding("project.task", 1),
+                binding("other", 1, 7),
+            ],
             vec![card(5, "project", true)],
             5,
             Some("project.task"),
             Some("project.task"),
         );
 
+        // The parent merges into the task's row; the locked row still sorts
+        // above the more recently focused one.
         assert_eq!(snapshot.row_count, 2);
         assert_eq!(snapshot.initial_index, 0);
         assert_eq!(snapshot.items[0].environment_id, "project.task");
-        assert_eq!(snapshot.items[1].environment_id, "project");
+        assert!(snapshot.items[0].shared);
+        assert_eq!(snapshot.items[1].environment_id, "other");
         assert!(snapshot.items[0].environment_locked);
     }
 

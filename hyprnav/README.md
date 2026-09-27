@@ -164,8 +164,38 @@ hyprnav grid
 
 Opens the environment grid overlay.
 
-The grid shows one row per environment and the currently mapped slots for each
-environment.
+The grid shows one row per leaf environment. Environment ids are prefix
+chains (`p.x` project, `p.x.w` worktree, `p.x.w.a.t` thread) and a child
+resolves numbered slots through its ancestors, so an ancestor's frames are
+the same workspaces in every descendant. The grid does not repeat them as
+rows of their own:
+
+- A row candidate is an environment with a binding of its own, or the locked
+  or current environment, that resolves at least one slot.
+- A candidate is a row unless another candidate descends from it. An ancestor
+  with no live descendant is its own row, and so is an ancestor that owns a
+  temporary slot (a temp shows only in its owner's row).
+- A row's cells are its numbered slots resolved through the chain plus its own
+  temporaries, in slot order. Two threads under one worktree are two rows,
+  each showing the worktree's frames.
+- Row order is unchanged: the row whose chain holds the lock, then the row
+  whose chain holds `--cwd`, then recent focus.
+
+Snapshot fields (`ui_snapshot_grid`), per cell:
+
+- `environment_id`: the row's leaf. `environment_title`: the deepest titled
+  level of the chain, else the deepest cwd name, else the leaf id.
+- `environment_chain`: `[{id, title, label, locked}]` root to leaf. `label` is
+  the title, else the last component of the level's cwd, else empty; never a
+  raw id.
+- `environment_locked`: some level of the chain is locked;
+  `locked_environment_id` names it.
+- `owner_environment_id` (also `binding_environment_id`): the environment that
+  binds the slot; slot mutations (remove, rename, command) go there.
+  `owner_title` is its label. `shared` is true when the owner is an ancestor;
+  `inherited` is kept as an alias for older clients.
+- Going to a cell uses the leaf (`workspace_goto` with `environment_id`),
+  which resolves the same workspace and honours a leaf launch command.
 
 ### `status`
 
@@ -451,9 +481,10 @@ lists them with owner and empty timer. Grid cells carry `temporary`,
 
 A temporary slot belongs to the environment that created it and shows in one
 place only: after the numbered frames of that environment's own grid row.
-Numbered slots are still inherited down the environment chain, so a child row
-shows its ancestors' digits; temporary ones are not, so a child never displays
-its parent's scratch frame. They are also left out of the MRU switcher
+Numbered slots are still resolved down the environment chain, so a child row
+shows its ancestors' digits as shared frames; temporary ones are not, so a
+child never displays its parent's scratch frame. An ancestor that owns a
+temporary slot keeps a row of its own for it even when it has descendants. They are also left out of the MRU switcher
 snapshot, so Alt-Tab never lands on one. The index threshold is the rule:
 `slot_index >= 1000` means temporary, and `slot temp` is the only thing that
 allocates there.

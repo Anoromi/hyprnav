@@ -52,8 +52,27 @@ pub struct AgentSnapshot {
     pub thread_environment_id: Option<String>,
 }
 
+/// One level of a grid row's environment chain, root first.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct GridChainLevel {
+    pub id: String,
+    /// The level's own title; empty when it has none.
+    #[serde(default)]
+    pub title: String,
+    /// What to call the level: its title, else the last component of its
+    /// cwd, else empty. Never the raw id.
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub locked: bool,
+}
+
+/// One frame of the grid. A row is one leaf environment; its cells are every
+/// slot the leaf resolves through its ancestor chain, each tagged with the
+/// environment that actually binds it.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct GridCellSnapshot {
+    /// The row's leaf environment.
     pub environment_id: String,
     pub environment_display_id: String,
     pub environment_title: String,
@@ -63,12 +82,31 @@ pub struct GridCellSnapshot {
     pub slot_display_name: String,
     pub physical_workspace_id: i32,
     pub binding_kind: String,
+    /// Alias of `shared`, kept for older clients.
     pub inherited: bool,
+    /// The environment that binds this slot (the leaf or an ancestor).
+    /// Slot mutations go here.
+    #[serde(default)]
+    pub owner_environment_id: String,
+    /// Label of the owning environment (see `GridChainLevel::label`).
+    #[serde(default)]
+    pub owner_title: String,
+    /// The frame belongs to an ancestor and is the same workspace every
+    /// descendant row shows.
+    #[serde(default)]
+    pub shared: bool,
+    /// The row's chain, root to leaf, for the breadcrumb.
+    #[serde(default)]
+    pub environment_chain: Vec<GridChainLevel>,
+    /// The locked environment when it is on this row's chain.
+    #[serde(default)]
+    pub locked_environment_id: Option<String>,
     pub workspace_name: String,
     pub subtitle: String,
     pub app_class: String,
     pub window_count: i32,
     pub active: bool,
+    /// Some level of the row's chain is locked.
     pub environment_locked: bool,
     /// A spawned process tree is stuck to this workspace.
     #[serde(default)]
