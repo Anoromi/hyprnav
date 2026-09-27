@@ -122,7 +122,12 @@ unaffected. Schema:
 - The daemon reads the lock before and after only the requests that can move
   it (the causes above), and in the focus watcher only when a workspace has a
   unique owner. Focus on an ambiguous workspace (a frame bound by several
-  worktrees) leaves the lock alone and emits nothing.
+  worktrees) leaves the lock alone and emits nothing, and so does focus on a
+  frame the locked environment already reaches through its own or inherited
+  slots (a thread on its worktree's shared frame stays locked).
+- Lock-moving requests and the focus watcher share one mutex around
+  read-change-announce, so a goto and the Hyprland focus event it causes
+  announce one change, with the right `previous_environment_id`.
 - Side fix: re-ensuring an environment without a cwd (as `lock_set` and
   `slot_assign` do) now keeps its stored source path instead of clearing it.
 
@@ -132,7 +137,7 @@ Unit tests (`cargo test`, 106 passed):
 |---|---|
 | `events::subscriber_receives_hello_agents_slots_locked_on_connect` | 4-line burst, `locked` snapshot with `seq` 0 |
 | `events::lock_changes_fan_out_immediately_with_increasing_seq` | immediate fan-out, `seq` counts changes even with nobody listening, the environment is not built then |
-| `server::locked_event_follows_every_lock_change_and_only_changes` | `workspace_goto` on a thread row's shared frame emits `cause:"workspace_goto"` with `origin` round-tripped; the same goto again, and focus on an ambiguous workspace, emit nothing; focus on a thread's own frame emits `cause:"focus"`; `env_delete` of the locked env emits a null lock; a repeated `lock_set` emits once |
+| `server::locked_event_follows_every_lock_change_and_only_changes` | `workspace_goto` on a thread row's shared frame emits `cause:"workspace_goto"` with `origin` round-tripped; the same goto again, and focus on an ambiguous workspace or on a frame the locked thread inherits, emit nothing; focus on a thread's own frame emits `cause:"focus"`; `env_delete` of the locked env emits a null lock; a repeated `lock_set` emits once |
 | `protocol::origin_is_optional_and_round_trips` | requests without `origin` still decode, and serialize without it |
 
 A real line from that test:

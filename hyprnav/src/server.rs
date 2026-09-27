@@ -99,6 +99,10 @@ struct ServerRuntime {
     agents: Mutex<HashMap<String, AgentSnapshot>>,
     /// Push notifications for agent and slot state.
     events: EventBus,
+    /// Held across every read-change-announce of the lock (lock-moving
+    /// requests and Hyprland focus), so a goto and the focus event it causes
+    /// cannot both announce the same change, or announce a stale previous.
+    lock_watch: Mutex<()>,
 }
 
 impl ServerRuntime {
@@ -308,6 +312,7 @@ pub fn run_server() -> Result<()> {
         plugin_instance: Mutex::new(None),
         agents: Mutex::new(HashMap::new()),
         events: EventBus::new(),
+        lock_watch: Mutex::new(()),
     });
     let listener = bind_listener(&runtime.paths.server_socket_path)?;
     let events_listener = bind_listener(&runtime.paths.events_socket_path)?;
@@ -396,14 +401,28 @@ fn start_hypr_event_thread(runtime: Arc<ServerRuntime>) {
 }
 
 /// Hyprland focused `workspace_id`: move the lock to its concrete owner, if it
-/// has exactly one. Ambiguous or unbound workspaces leave the lock alone.
+/// has exactly one. Ambiguous or unbound workspaces leave the lock alone, and
+/// so does a workspace the locked environment already reaches through one of
+/// its own or inherited slots (a thread on its worktree's shared frame stays
+/// locked; the goto that got there has just locked it).
 fn record_workspace_focus(runtime: &ServerRuntime, workspace_id: i32) {
+    let _lock_guard = runtime
+        .lock_watch
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let Ok(Some(environment_id)) =
         resolve_focus_environment_for_physical_workspace(&runtime.store, workspace_id)
     else {
         return;
     };
     let previous = runtime.store.locked_environment();
+    if let Ok(Some(locked)) = previous.as_ref() {
+        if locked != &environment_id
+            && locked_environment_reaches_workspace(&runtime.store, locked, workspace_id)
+        {
+            return;
+        }
+    }
     match runtime.store.record_environment_focus(&environment_id) {
         Ok(()) => {
             if let Ok(previous) = previous {
@@ -425,6 +444,17 @@ fn record_workspace_focus(runtime: &ServerRuntime, workspace_id: i32) {
             environment_id
         ),
     }
+}
+
+/// Whether `locked` resolves one of its slots (own or inherited) to `workspace_id`.
+fn locked_environment_reaches_workspace(store: &StateStore, locked: &str, workspace_id: i32) -> bool {
+    let Ok(bindings) = store.list_local_bindings() else {
+        return false;
+    };
+    slot_indexes_for_environment(locked, &bindings)
+        .into_iter()
+        .filter_map(|slot_index| store.resolve_slot_effective(locked, slot_index).ok().flatten())
+        .any(|record| record.workspace_id == workspace_id)
 }
 
 fn announce_lock_change(
@@ -664,8 +694,12 @@ fn handle_request(
     let effects = request_effects(&request);
     // Lock watch: only the ops that can move the lock pay for a read before
     // and after. Checked on failure too, a request may fail after moving it.
-    let lock_watch = lock_cause(&mut request)
-        .map(|(cause, origin)| (cause, origin, runtime.store.locked_environment()));
+    let lock_cause = lock_cause(&mut request);
+    let _lock_guard = lock_cause
+        .is_some()
+        .then(|| runtime.lock_watch.lock().unwrap_or_else(|poisoned| poisoned.into_inner()));
+    let lock_watch =
+        lock_cause.map(|(cause, origin)| (cause, origin, runtime.store.locked_environment()));
     let result = try_handle_request(runtime, request);
     if let Some((cause, origin, Ok(previous))) = lock_watch {
         if let Ok(locked) = runtime.store.locked_environment() {
@@ -3080,6 +3114,7 @@ mod tests {
             plugin_instance: Mutex::new(None),
             agents: Mutex::new(HashMap::new()),
             events: EventBus::new(),
+            lock_watch: Mutex::new(()),
         });
 
         (runtime, db_path)
@@ -4077,6 +4112,8 @@ mod tests {
                     fixed_op("p.x.w", 2, 12),
                     fixed_op("p.y.w", 2, 12),
                     fixed_op("p.x.w.a.t", 8, 18),
+                    // The worktree's own frame, which its threads inherit.
+                    fixed_op("p.x.w", 1, 11),
                 ],
             },
         );
@@ -4108,6 +4145,14 @@ mod tests {
 
         // Hyprland focus on an ambiguous workspace leaves the lock alone.
         record_workspace_focus(&runtime, 12);
+        assert!(rx.try_recv().is_err());
+        assert_eq!(
+            runtime.store.locked_environment().unwrap().as_deref(),
+            Some("p.x.w.b.t")
+        );
+
+        // Focus on a frame B already reaches: the lock stays on B, silently.
+        record_workspace_focus(&runtime, 11);
         assert!(rx.try_recv().is_err());
         assert_eq!(
             runtime.store.locked_environment().unwrap().as_deref(),
