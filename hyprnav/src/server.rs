@@ -1435,9 +1435,10 @@ fn try_handle_request(runtime: &Arc<ServerRuntime>, request: Request) -> Result<
             );
             Ok(serde_json::to_value(snapshot)?)
         }
-        Request::UiSnapshotGrid { cwd } => {
+        Request::UiSnapshotGrid { cwd, compact } => {
             let snapshot = build_grid_snapshot(runtime, cwd.as_deref())?;
-            Ok(serde_json::to_value(snapshot)?)
+            let value = serde_json::to_value(snapshot)?;
+            Ok(if compact { compact_grid_snapshot(value) } else { value })
         }
         Request::BatchMutate {
             atomic, operations, ..
@@ -1451,6 +1452,48 @@ fn try_handle_request(runtime: &Arc<ServerRuntime>, request: Request) -> Result<
             handle_batch_mutate(runtime, operations)
         }
     }
+}
+
+/// Fields that describe a cell's row rather than the cell; the compact grid
+/// snapshot sends them once per row. With hundreds of rolls they were most
+/// of a multi-megabyte response.
+const GRID_ROW_FIELDS: [&str; 5] = [
+    "environment_id",
+    "environment_display_id",
+    "environment_title",
+    "environment_locked",
+    "environment_chain",
+];
+
+fn compact_grid_snapshot(mut value: serde_json::Value) -> serde_json::Value {
+    let Some(object) = value.as_object_mut() else {
+        return value;
+    };
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+    let mut locked_environment_id = serde_json::Value::Null;
+    if let Some(items) = object.get_mut("items").and_then(|items| items.as_array_mut()) {
+        for item in items.iter_mut() {
+            let Some(cell) = item.as_object_mut() else { continue };
+            if let Some(locked) = cell.remove("locked_environment_id") {
+                locked_environment_id = locked;
+            }
+            let row_index = cell.get("row_index").cloned().unwrap_or(serde_json::Value::Null);
+            let mut row = serde_json::Map::new();
+            for field in GRID_ROW_FIELDS {
+                if let Some(value) = cell.remove(field) {
+                    row.insert(field.to_owned(), value);
+                }
+            }
+            // Cells of a row are contiguous; keep the first one's fields.
+            if rows.last().and_then(|last| last.get("row_index")) != Some(&row_index) {
+                row.insert("row_index".to_owned(), row_index);
+                rows.push(serde_json::Value::Object(row));
+            }
+        }
+    }
+    object.insert("rows".to_owned(), serde_json::Value::Array(rows));
+    object.insert("locked_environment_id".to_owned(), locked_environment_id);
+    value
 }
 
 fn apply_mutation_request(

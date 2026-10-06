@@ -844,7 +844,7 @@ impl qobject::Controller {
                     .map(|path| path.to_string_lossy().into_owned());
                 match self
                     .as_ref()
-                    .send_request::<GridSnapshot>(Request::UiSnapshotGrid { cwd })
+                    .send_request::<GridSnapshot>(Request::UiSnapshotGrid { cwd, compact: false })
                 {
                     Ok(snapshot) => {
                         self.as_mut()

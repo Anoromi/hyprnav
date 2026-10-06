@@ -483,6 +483,10 @@ pub enum Request {
     },
     UiSnapshotGrid {
         cwd: Option<String>,
+        /// Send each row's environment fields once in `rows` instead of on
+        /// every cell. Off by default so existing clients see the old shape.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        compact: bool,
     },
     BatchMutate {
         atomic: bool,
