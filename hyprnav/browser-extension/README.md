@@ -70,7 +70,8 @@ It adopts one matching tab or creates a tab. Names are stored with browser
 session metadata and extension storage. Multiple matching tabs are an error.
 A closed tab is reopened from the saved URL on the next navigation. A named tab
 that has moved to another origin is rejected, so it cannot silently retarget a
-page outside the registered app. Use a new name for a different app URL.
+page outside the registered app. `tab open` on an existing name may change its
+parameter or path on the same origin; use a new name for a different site.
 
 `tab goto` updates only the named parameter in the tab's current URL. Other
 query bytes, ordering, duplicate unrelated parameters, path, and fragment are

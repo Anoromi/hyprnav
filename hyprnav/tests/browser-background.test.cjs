@@ -60,6 +60,12 @@ for (const family of ['firefox', 'chromium']) {
       const reopened = await handle({ op: 'goto', name: 'demo', workspace: 'work' });
       assert.equal(reopened.workspace, 'work');
     }
+    // Same site: re-registering may switch the parameter under the same name.
+    await handle({ op: 'open', name: 'demo', url: 'https://example.com/app', param: 'checkout' });
+    const moved = await handle({ op: 'goto', name: 'demo', workspace: '/work/tree' });
+    assert.match(moved.url, /[?&]checkout=%2Fwork%2Ftree/);
+    // Another site still needs a new name.
+    await assert.rejects(handle({ op: 'open', name: 'demo', url: 'https://other.example/', param: 'checkout' }), /another site/);
   });
 }
 test('Chromium manifest key matches the native host extension ID', () => {

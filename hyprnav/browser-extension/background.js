@@ -86,8 +86,12 @@ async function handle(message) {
     const url = validText(message.url, 'URL');
     const param = validText(message.param, 'Parameter');
     workspaceUrl(url, param, ''); // Validate before creating or saving anything.
-    if (Object.hasOwn(configs, name) && (configs[name].url !== url || configs[name].param !== param)) {
-      throw new Error(`Tab ${name} is already configured with a different URL or parameter`);
+    // Re-registering a name may change its parameter or path within the same
+    // app (e.g. a new query parameter); pointing it at another origin would
+    // silently retarget a page, so that still needs a new name.
+    if (Object.hasOwn(configs, name) && (configs[name].url !== url || configs[name].param !== param)
+        && new URL(configs[name].url).origin !== new URL(url).origin) {
+      throw new Error(`Tab ${name} is already configured for another site; use a new name`);
     }
     const config = { url, param };
     let tab = await locate(name, config);
