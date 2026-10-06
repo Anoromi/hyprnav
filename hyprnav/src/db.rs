@@ -2,7 +2,7 @@ use crate::protocol::SlotAssignmentMode;
 use crate::runtime_paths::{ensure_parent_dir, legacy_state_root};
 use anyhow::{anyhow, Context, Result};
 use rusqlite::{params, types::Type, Connection, OptionalExtension};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,6 +14,11 @@ const MANAGED_WORKSPACE_START: i32 = 101;
 #[derive(Clone, Debug)]
 pub struct StateStore {
     path: PathBuf,
+    // Held open for the store's lifetime and never used. Most calls open a
+    // short-lived connection; without another one open, SQLite checkpoints
+    // the WAL and deletes it on every close, which made a single grid
+    // snapshot cost thousands of file writes and seconds of lock waits.
+    _keepalive: Option<std::sync::Arc<std::sync::Mutex<Connection>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -52,6 +57,35 @@ impl SlotBindingKind {
 
     pub fn is_concrete(self) -> bool {
         matches!(self, Self::Fixed | Self::Managed)
+    }
+}
+
+/// In-memory form of [`StateStore::browser_target`], same inheritance rules.
+pub struct BrowserTargetIndex {
+    targets: HashMap<(String, i32), String>,
+    concrete: HashSet<(String, i32)>,
+}
+
+impl BrowserTargetIndex {
+    pub fn is_empty(&self) -> bool {
+        self.targets.is_empty()
+    }
+
+    pub fn lookup(&self, env: &str, slot: i32) -> Result<Option<crate::browser::BrowserTarget>> {
+        if self.targets.is_empty() {
+            return Ok(None);
+        }
+        for ancestor in environment_chain(env) {
+            let key = (ancestor, slot);
+            if let Some(target) = self.targets.get(&key) {
+                return Ok(Some(serde_json::from_str(target)?));
+            }
+            // A concrete child slot stops inheritance, just like workspace resolution.
+            if self.concrete.contains(&key) {
+                break;
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -110,9 +144,10 @@ impl StateStore {
         let path = path.into();
         ensure_parent_dir(&path)?;
         migrate_legacy_state_db(&path)?;
-        let store = Self { path };
+        let mut store = Self { path, _keepalive: None };
         store.init()?;
         store.ensure_boot_scope()?;
+        store._keepalive = Some(std::sync::Arc::new(std::sync::Mutex::new(store.open()?)));
         Ok(store)
     }
 
@@ -556,6 +591,27 @@ impl StateStore {
             }
         }
         Ok(None)
+    }
+
+    /// Every browser target and concrete binding, read once, so a snapshot
+    /// can resolve thousands of slots without a connection and a chain of
+    /// queries per slot.
+    pub fn browser_target_index(
+        &self,
+        bindings: &[SlotBindingRecord],
+    ) -> Result<BrowserTargetIndex> {
+        let connection = self.open()?;
+        let mut statement =
+            connection.prepare("SELECT env_id, slot_index, target_json FROM browser_targets")?;
+        let targets = statement
+            .query_map([], |row| Ok(((row.get(0)?, row.get(1)?), row.get(2)?)))?
+            .collect::<rusqlite::Result<HashMap<(String, i32), String>>>()?;
+        let concrete = bindings
+            .iter()
+            .filter(|binding| binding.binding_kind.is_concrete())
+            .map(|binding| (binding.env_id.clone(), binding.slot_index))
+            .collect();
+        Ok(BrowserTargetIndex { targets, concrete })
     }
 
     fn init(&self) -> Result<()> {

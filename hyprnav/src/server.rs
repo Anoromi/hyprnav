@@ -1900,13 +1900,19 @@ fn build_switcher_snapshot(runtime: &ServerRuntime, reverse: bool) -> Result<Swi
         })
         .collect();
     // Browser slots share a physical workspace but retain separate env/slot identities.
-    for cell in build_grid_snapshot(runtime, None)?.items {
+    let browser_targets = runtime.store.browser_target_index(&local_bindings)?;
+    // Only browser slots come from the grid; without any, skip building it.
+    let grid_cells = if browser_targets.is_empty() {
+        Vec::new()
+    } else {
+        build_grid_snapshot(runtime, None)?.items
+    };
+    for cell in grid_cells {
         if cell.slot_index >= TEMP_SLOT_START {
             continue;
         }
-        if runtime
-            .store
-            .browser_target(&cell.environment_id, cell.slot_index)?
+        if browser_targets
+            .lookup(&cell.environment_id, cell.slot_index)?
             .is_none()
         {
             continue;
@@ -2265,6 +2271,7 @@ fn build_grid_snapshot(runtime: &ServerRuntime, cwd: Option<&str>) -> Result<Gri
         .transpose()?
         .filter(|value| !value.is_empty());
     let local_bindings = runtime.store.list_local_bindings()?;
+    let browser_targets = runtime.store.browser_target_index(&local_bindings)?;
     let rows = plan_grid_rows(
         runtime.store.list_environments()?,
         &local_bindings,
@@ -2312,9 +2319,7 @@ fn build_grid_snapshot(runtime: &ServerRuntime, cwd: Option<&str>) -> Result<Gri
             let record = &slot.record;
             let workspace_id = record.workspace_id;
             let card = cards_by_workspace.get(&workspace_id);
-            let browser_target = runtime
-                .store
-                .browser_target(&row.leaf.env_id, record.slot_index)?;
+            let browser_target = browser_targets.lookup(&row.leaf.env_id, record.slot_index)?;
             let active = workspace_id == current_workspace_id && browser_target.is_none();
             let temp = temp_meta.get(&(record.binding_environment_id.clone(), record.slot_index));
 
