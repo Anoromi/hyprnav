@@ -33,7 +33,7 @@ registration follows the existing local `hyprnav` wrapper across dev builds.
 Firefox and Chromium have separate bridges and can run simultaneously.
 Only one profile per browser family can own its bridge at a time. Private tabs are excluded.
 
-Demo: https://interactions-33e667f674b8cc14518350eea9255a5d.anoromi.com/?space=hyprnav-browser-demo
+Demo: set `HYPRNAV_DEMO_URL` to the page `scripts/browser-demo.sh` should open.
 
 Demo source:
 `/home/anoromi/code/experiments/interaction-platform/spaces/hyprnav-browser-demo/`
