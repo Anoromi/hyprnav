@@ -84,6 +84,8 @@ struct ClientInfo {
     #[serde(default)]
     mapped: bool,
     #[serde(default)]
+    pinned: bool,
+    #[serde(default)]
     workspace: WorkspaceRef,
 }
 
@@ -2855,11 +2857,19 @@ fn workspace_has_mapped_clients(paths: &RuntimePaths, workspace_id: i32) -> Resu
 fn mapped_workspace_ids(paths: &RuntimePaths) -> Result<HashSet<i32>> {
     let clients = run_hyprctl_json(paths, &["-j", "clients"])?;
     let clients = serde_json::from_slice::<Vec<ClientInfo>>(&clients).unwrap_or_default();
-    Ok(clients
+    Ok(occupied_workspace_ids(clients))
+}
+
+/// Workspaces that hold a mapped window. A pinned window shows on every
+/// workspace and Hyprland reports it on the active one, so it would make
+/// the workspace just focused for a slot look taken (Wispr Flow's status
+/// overlay is one); it does not occupy any workspace.
+fn occupied_workspace_ids(clients: Vec<ClientInfo>) -> HashSet<i32> {
+    clients
         .into_iter()
-        .filter(|client| client.mapped && client.workspace.id > 0)
+        .filter(|client| client.mapped && !client.pinned && client.workspace.id > 0)
         .map(|client| client.workspace.id)
-        .collect())
+        .collect()
 }
 
 fn goto_workspace(paths: &RuntimePaths, workspace_id: i32) -> Result<()> {
@@ -4245,5 +4255,18 @@ mod tests {
         assert!(rx.try_recv().is_err());
 
         cleanup(&path);
+    }
+
+    #[test]
+    fn pinned_windows_do_not_occupy_a_workspace() {
+        let clients: Vec<ClientInfo> = serde_json::from_value(json!([
+            // Wispr Flow's status overlay, reported on the active workspace.
+            {"mapped": true, "pinned": true, "workspace": {"id": 135}},
+            {"mapped": true, "pinned": false, "workspace": {"id": 2}},
+            {"mapped": false, "workspace": {"id": 7}},
+            {"mapped": true, "workspace": {"id": -98}},
+        ]))
+        .unwrap();
+        assert_eq!(occupied_workspace_ids(clients), HashSet::from([2]));
     }
 }
