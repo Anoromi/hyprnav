@@ -30,8 +30,20 @@ unsigned-extension setting already configured for Vicinae.
 The development extension must be loaded again after restarting the browser.
 A permanent distribution needs a signed Firefox extension. The native host
 registration follows the existing local `hyprnav` wrapper across dev builds.
-Firefox and Chromium have separate bridges and can run simultaneously.
-Only one profile per browser family can own its bridge at a time. Private tabs are excluded.
+Every running browser with the extension (Zen, Island, Chromium, …) has its own
+bridge, named after the browser's executable. Only one profile per browser can own
+its bridge at a time. Private tabs are excluded.
+
+## Primary browser
+
+The extension's toolbar popup has a **Primary browser for hyprnav** toggle and
+lists the connected browsers. Tab and slot navigation goes to the primary browser
+whenever it runs, whatever `--browser` says. Turning it on in one browser turns it
+off in the others; the choice is kept in `$XDG_STATE_HOME/hyprnav/browser.json`.
+Without a running primary, hyprnav uses a running browser of the requested
+family (any browser if none of that family runs) and prints which one it used.
+`tab open` also saves the tab's URL and parameter there, so a browser that becomes
+primary later can serve tabs opened in another.
 
 Demo: set `HYPRNAV_DEMO_URL` to the page `scripts/browser-demo.sh` should open.
 

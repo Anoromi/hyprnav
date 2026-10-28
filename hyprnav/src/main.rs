@@ -62,10 +62,7 @@ fn main() -> anyhow::Result<()> {
                     name,
                     url,
                     param,
-                } => print_json(browser::request(
-                    browser,
-                    json!({"op":"open", "name":name, "url":url, "param":param}),
-                )),
+                } => print_json(browser::open(browser, name, url, param)),
                 TabCommand::Goto {
                     browser,
                     name,

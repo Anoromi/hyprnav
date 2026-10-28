@@ -17,7 +17,10 @@ for (const family of ['firefox', 'chromium']) {
     });
     const api = {
       storage: { local: storage(local), session: storage(session) },
-      runtime: { connectNative: () => ({ onMessage: { addListener() {} }, onDisconnect: { addListener() {} } }) },
+      runtime: {
+        connectNative: () => ({ onMessage: { addListener() {} }, onDisconnect: { addListener() {} } }),
+        onMessage: { addListener() {} },
+      },
       tabs: {
         query: async () => [...tabs.values()],
         get: async id => ({ ...tabs.get(id) }),
@@ -66,6 +69,11 @@ for (const family of ['firefox', 'chromium']) {
     assert.match(moved.url, /[?&]checkout=%2Fwork%2Ftree/);
     // Another site still needs a new name.
     await assert.rejects(handle({ op: 'open', name: 'demo', url: 'https://other.example/', param: 'checkout' }), /another site/);
+    // A browser that never saw `tab open` serves the name from the config hyprnav sends.
+    await assert.rejects(handle({ op: 'goto', name: 'fresh', workspace: 'w' }), /Unknown tab fresh/);
+    const fresh = await handle({ op: 'goto', name: 'fresh', workspace: 'w', url: 'https://fresh.example/', param: 'checkout' });
+    assert.equal(fresh.url, 'https://fresh.example/?checkout=w');
+    assert.equal(JSON.stringify(local['hyprnav-tabs'].fresh), '{"url":"https://fresh.example/","param":"checkout"}');
   });
 }
 test('Chromium manifest key matches the native host extension ID', () => {

@@ -108,6 +108,15 @@ async function handle(message) {
   }
   if (message.op !== 'goto') throw new Error('Unknown browser operation');
   const value = validText(message.workspace, 'Workspace');
+  // hyprnav sends the config `tab open` saved, so a browser that became primary
+  // later still knows the tab.
+  if (message.url !== undefined) {
+    const sent = { url: validText(message.url, 'URL'), param: validText(message.param, 'Parameter') };
+    if (configs[name]?.url !== sent.url || configs[name]?.param !== sent.param) {
+      configs[name] = sent;
+      await browser.storage.local.set({ [CONFIG_KEY]: configs });
+    }
+  }
   if (!Object.hasOwn(configs, name)) throw new Error(`Unknown tab ${name}; use hyprnav tab open first`);
   const config = configs[name];
   let tab = await locate(name, config);
@@ -122,11 +131,34 @@ async function handle(message) {
   await browser.windows.update(tab.windowId, { focused: true });
   return { name, tab_id: tab.id, workspace: value, url: tab.url };
 }
+// Requests to the native host itself (the popup's status and primary toggle).
+const pending = new Map();
+let nextRef = 0;
+function askHost(message) {
+  connect();
+  const connection = port;
+  const ref = ++nextRef;
+  return new Promise((resolve, reject) => {
+    pending.set(ref, { resolve, reject });
+    connection.postMessage({ ...message, ref });
+  });
+}
+browser.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  askHost(message).then(result => sendResponse({ result }), error => sendResponse({ error: error.message }));
+  return true;
+});
 function connect() {
   if (port) return;
   const connection = browser.runtime.connectNative('hyprnav_browser');
   port = connection;
   connection.onMessage.addListener(message => {
+    if (message.ref !== undefined) {
+      const request = pending.get(message.ref);
+      pending.delete(message.ref);
+      if (message.error) request?.reject(new Error(message.error));
+      else request?.resolve(message.result);
+      return;
+    }
     queue = queue.catch(() => {}).then(async () => {
       let reply;
       try { reply = { id: message.id, result: await handle(message) }; }
@@ -136,7 +168,10 @@ function connect() {
   });
   connection.onDisconnect.addListener(() => {
     // Reading lastError acknowledges Chrome's native-host disconnect error.
-    void browser.runtime.lastError;
+    const error = new Error(browser.runtime.lastError?.message || connection.error?.message
+      || 'hyprnav native host disconnected');
+    for (const request of pending.values()) request.reject(error);
+    pending.clear();
     port = null;
     setTimeout(connect, 3000);
     if (browser.alarms) void browser.alarms.create('hyprnav-reconnect', { delayInMinutes: 1 });
